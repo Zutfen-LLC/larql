@@ -110,14 +110,14 @@ pub struct WalkArgs {
     pub verbose: bool,
 
     /// Generic backend selector. `--metal` remains a compatibility alias.
-    #[arg(long, default_value = "auto", value_name = "auto|cpu|metal|cuda|vulkan")]
+    #[arg(
+        long,
+        default_value = "auto",
+        value_name = "auto|cpu|metal|cuda|vulkan"
+    )]
     pub backend: String,
 
-    /// Run autoregressive generation through the Metal Q4K pipeline:
-    /// fused `full_pipeline_q4` prefill + `decode_token` KV-cached decode.
-    /// Works for pre-norm (Llama, Mistral) and post-norm + QK-norm
-    /// (Gemma 3, Gemma 4) architectures. Requires a Q4K vindex and a
-    /// build with `--features gpu` on an M-series Mac.
+    /// Compatibility alias for `--backend metal`.
     #[arg(long)]
     pub metal: bool,
 
@@ -460,23 +460,35 @@ fn run_with_vindex_weights(
     run_predict_inner(&weights, &tokenizer, args, index)
 }
 
-/// Build the Metal compute backend for `--metal`, or a clear error when the
-/// crate was built without the `gpu` feature (or off macOS). Split by `cfg`
-/// so the gpu-off build rejects through a normal `Result` — a diverging
-/// `let backend = { … return Err … }` binding would otherwise mark all
-/// downstream code unreachable and its locals unused in the gpu-off compile.
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-fn metal_backend_box() -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>>
-{
-    let b = larql_compute_metal::MetalBackend::new()
-        .ok_or("Metal backend unavailable — rebuild with `--features gpu` on an M-series Mac.")?;
-    Ok(Box::new(b))
+fn backend_supports_fused_q4_pipeline(backend: &dyn larql_compute::ComputeBackend) -> bool {
+    backend.supports(larql_compute::Capability::PrefillQ4)
+        && backend.supports(larql_compute::Capability::DecodeToken)
+        && backend.supports_quant(larql_compute::QuantFormat::Q4_K)
 }
 
-#[cfg(not(all(feature = "gpu", target_os = "macos")))]
-fn metal_backend_box() -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>>
-{
-    Err("`--metal` requires the `gpu` feature on macOS".into())
+fn q4_fast_backend_box(
+    args: &WalkArgs,
+) -> Result<Option<Box<dyn larql_compute::ComputeBackend>>, Box<dyn std::error::Error>> {
+    let kind = crate::commands::backend::backend_kind_from_args(&args.backend, args.metal)
+        .map_err(|e| format!("--backend: {e}"))?;
+    if matches!(kind, larql_inference::ComputeBackendKind::Cpu) {
+        return Ok(None);
+    }
+
+    let backend = crate::commands::backend::compute_backend_or_err(kind)?;
+    if backend_supports_fused_q4_pipeline(backend.as_ref()) {
+        return Ok(Some(backend));
+    }
+    if matches!(kind, larql_inference::ComputeBackendKind::Auto) {
+        return Ok(None);
+    }
+
+    Err(format!(
+        "selected backend `{kind}` does not advertise fused Q4_K prefill + \
+         KV-cached decode; use `--backend cpu` (or `--backend auto` for CPU \
+         fallback) until that backend has native Q4 kernels"
+    )
+    .into())
 }
 
 /// Predict against a Q4_K / Q6_K vindex: dequantise each layer's attn + FFN
@@ -535,51 +547,36 @@ fn run_predict_q4k(
     index.load_interleaved_kquant(vindex_path)?;
     let _ = index.load_lm_head_kquant(vindex_path);
 
-    // Metal Q4K path (`--metal`) routes autoregressive generation through the
-    // fused `full_pipeline_q4` prefill + `decode_token` KV-cached decode in
-    // `layer_graph::generate`. Works for pre-norm (Llama/Mistral) and
-    // post-norm + QK-norm (Gemma 3/4) architectures. CPU path below is the
-    // fallback for when the backend is absent or for diffing.
+    // Fused Q4K backends route autoregressive generation through
+    // `full_pipeline_q4` prefill + `decode_token` KV-cached decode in
+    // `layer_graph::generate`. Metal implements this today; CUDA/Vulkan
+    // scaffolds decline until native kernels land. CPU path below is the
+    // fallback for `--backend cpu` / unsupported `--backend auto`.
     let start = Instant::now();
+    let fast_backend = q4_fast_backend_box(args)?;
 
     // Autoregressive multi-token generation. For Q4K on CPU, we build
     // a per-layer CPU FfnBackend-compatible view and loop via the
-    // generic `generate_stream`. Metal shader autoregressive generation
-    // is a separate path (see `larql-inference/src/layer_graph/generate.rs`)
-    // and is wired to `--metal`; that path is KV-cached and much faster.
-    if args.max_tokens > 1 && !args.metal {
+    // generic `generate_stream`. Fused backend autoregressive generation
+    // is a separate path (see `larql-inference/src/layer_graph/generate.rs`);
+    // that path is KV-cached and much faster.
+    if args.max_tokens > 1 && fast_backend.is_none() {
         // CPU Q4K autoregressive: per-step, dequantise layer weights
         // just-in-time (`predict_kquant` does this internally) and loop.
-        // Not token-cached, so O(N²) but correct. For speed use --metal.
+        // Not token-cached, so O(N²) but correct.
         return run_q4k_generate_cpu(weights, tokenizer, &token_ids, args, &index);
     }
 
-    let result = if args.metal {
-        // `larql_compute::default_backend()` always returns CPU since
-        // the GPU-backend extraction (see its doc-comment). GPU
-        // selection is the caller's responsibility — mirror what
-        // `bench/local_runtime.rs::build_runtime` does and reach for
-        // `MetalBackend::new()` directly when `--metal` is set, so the
-        // fused Q4 prefill + KV-cached decode kernels actually fire
-        // here. The previous `default_backend()` call silently fell
-        // through to CPU's `generate_via_cpu_q4k` fallback which
-        // produces degenerate output ("ikea ikea ikea…"), masquerading
-        // as a Granite/Gemma forward-path regression.
-        let backend: Box<dyn larql_compute::ComputeBackend> = metal_backend_box()?;
-        if !backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
-            return Err("Metal backend doesn't report Q4_K support — \
-                 check `larql diag <vindex>` for backend capabilities."
-                .into());
-        }
+    let result = if let Some(backend) = fast_backend {
         vlog!(
             verbose,
-            "Backend: {} (Metal Q4K prefill + KV-cached decode)",
+            "Backend: {} (fused Q4K prefill + KV-cached decode)",
             backend.name()
         );
-        // --metal + --max-tokens > 1: route to the existing shader
+        // Fused backend + --max-tokens > 1: route to the existing
         // autoregressive generate() in `larql-inference/src/layer_graph`
-        // (GPU prefill + KV-cached decode). That function returns its
-        // own tokens list; we stream them and exit.
+        // (prefill + KV-cached decode). That function returns its own tokens
+        // list; we stream them and exit.
         if args.max_tokens > 1 {
             use std::io::Write;
             let cached_layers =

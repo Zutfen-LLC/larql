@@ -6,10 +6,11 @@ Resume the CUDA + Vulkan backend implementation for LARQL.
 
 ## Current Status (verified)
 
-Two sessions of work have landed:
+Three sessions of work have landed:
 
 - **Session 1** (original scaffolding): workspace/feature plumbing, explicit backend selection APIs, CUDA/Vulkan sibling crates as compileable scaffolds, partial CLI migration. Could not compile-verify (no Rust toolchain on PATH).
 - **Session 2** (verification + repair + finish CLI): brought up `cargo`/`rustc` (rustup, off-PATH), ran `cargo check`, fixed the one real compile breakage, finished the `shannon` CLI migration, and fixed three test/lint issues so the affected crates are green under `cargo test` and `cargo clippy -- -D warnings`.
+- **Session 3** (capability honesty + walk backend dispatch): reconciled CUDA/Vulkan scaffold capability reporting so delegated CPU/reference methods remain callable for parity tests but no longer advertise native `QuantMatVec`/`F32Gemv`/`F16Gemv`/`Q4_K` support. `walk`'s Q4 predict/generate path now constructs the requested backend generically and gates the fused fast path on `PrefillQ4 + DecodeToken + Q4_K`; `--backend auto` falls back to CPU when only scaffolds are present, while explicit CUDA/Vulkan fail loudly until native kernels land.
 
 **The new CUDA/Vulkan crates are still scaffold backends.** They delegate most compute/KV behavior to CPU/reference paths and contain no real accelerator kernels. What exists is the repo-wide control plane needed to start that work.
 
@@ -25,6 +26,15 @@ Green:
 - `cargo test -p larql-cli --bins` → 243 passed
 - `cargo test -p larql-compute-cuda` → 7 passed
 - `cargo test -p larql-compute-vulkan` → 6 passed
+
+Session 3 delta verified:
+
+- `cargo test -p larql-compute-cuda` → 7 passed
+- `cargo test -p larql-compute-vulkan` → 6 passed
+- `cargo test -p larql-cli --bins` → 243 passed
+- `cargo test -p larql-inference --lib` → 1243 passed, 4 ignored
+- `cargo check -p larql-cli --features cuda,vulkan` — green
+- `cargo clippy -p larql-cli --features cuda,vulkan -- -D warnings` — green
 
 Pre-existing environment issues (NOT caused by this work, NOT fixed):
 
@@ -156,8 +166,8 @@ What exists now is the repo-wide control plane needed to start that work without
 1. ~~compile + repair~~ DONE
 2. ~~CLI migration: `run`/`walk`/`bench`/`shannon` accept `--backend`~~ DONE. Remaining polish:
    - sweep for stale Metal-only help text/comments across the migrated commands
-   - `run`/`walk` runtime branches parse `--backend` generically but still construct Metal directly in a few places (parsing is generic, backend construction is not yet fully generalized)
-3. tighten capability reporting in CUDA/Vulkan scaffolds per the plan's Phase 7. Current tension: the CUDA test `supports_reports_mvp_capabilities` asserts `supports_quant(Q4_K) == true` and `DecodeToken == false`, but the Q4K path delegates to CPU. Reconcile this with the honesty rule ("advertise only what is really implemented end-to-end") before landing real kernels — either the impl should report `supports_quant(Q4_K) == false` while delegating, or the test should move to a "real kernel landed" milestone.
+   - `walk` Q4 predict/generate now constructs backends generically; `run` still has Metal-specific construction in remote FFN/MoE and `--experts` branches.
+3. ~~tighten capability reporting in CUDA/Vulkan scaffolds per the plan's Phase 7~~ DONE in Session 3. Delegated scaffold methods still exist for parity tests, but `supports(...)` and `supports_quant(...)` report false until native kernels land.
 4. replace delegated CUDA hot paths with real kernels (Phase 4):
    - `f32_gemv_topk1`
    - `f16_gemv_topk1`
@@ -203,6 +213,6 @@ What exists now is the repo-wide control plane needed to start that work without
 
 Phases 1-3 are done and verified green (workspace compiles, clippy clean, ~1499 tests pass across the affected crates).
 
-Phases 4-8 (real CUDA/Vulkan kernels, integration tests, CI) are not started — the scaffolds still delegate to CPU.
+Phases 4-5 and 8 (real CUDA/Vulkan kernels and hardware CI) are not started — the scaffolds still delegate to CPU. Phase 7's first honesty pass is done for the scaffolds.
 
 The next session should start at Phase 4: wire `cudarc` into `larql-compute-cuda` and replace the delegated hot paths with real device kernels, beginning with the Q4K decode bench path.

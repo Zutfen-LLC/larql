@@ -58,8 +58,12 @@ mod tests {
         let x = vec![0.01f32; weights.hidden_size];
         let rows = index.num_features(0);
 
-        let got = backend().q4k_matvec(gate, &x, rows, weights.hidden_size).unwrap();
-        let want = CpuBackend.q4k_matvec(gate, &x, rows, weights.hidden_size).unwrap();
+        let got = backend()
+            .q4k_matvec(gate, &x, rows, weights.hidden_size)
+            .unwrap();
+        let want = CpuBackend
+            .q4k_matvec(gate, &x, rows, weights.hidden_size)
+            .unwrap();
         assert_eq!(got, want);
     }
 
@@ -96,11 +100,10 @@ mod tests {
 
     #[test]
     fn f32_gemv_topk1_matches_manual_reference() {
-        let w = Array2::from_shape_vec((3, 4), vec![
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 2.0, 0.0, 0.0,
-            0.0, 0.0, 3.0, 0.0,
-        ])
+        let w = Array2::from_shape_vec(
+            (3, 4),
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0],
+        )
         .unwrap();
         let x = vec![0.5, 0.75, 1.0, -2.0];
         let got = backend().f32_gemv_topk1(w.view(), &x).unwrap();
@@ -109,13 +112,13 @@ mod tests {
     }
 
     #[test]
-    fn supports_reports_mvp_capabilities() {
+    fn supports_reports_scaffold_capabilities_honestly() {
         let backend = backend();
-        assert!(backend.supports(larql_compute::Capability::QuantMatVec));
-        assert!(backend.supports(larql_compute::Capability::F32Gemv));
-        assert!(backend.supports(larql_compute::Capability::F16Gemv));
+        assert!(!backend.supports(larql_compute::Capability::QuantMatVec));
+        assert!(!backend.supports(larql_compute::Capability::F32Gemv));
+        assert!(!backend.supports(larql_compute::Capability::F16Gemv));
         assert!(!backend.supports(larql_compute::Capability::DecodeToken));
-        assert!(backend.supports_quant(QuantFormat::Q4_K));
+        assert!(!backend.supports_quant(QuantFormat::Q4_K));
     }
 
     #[test]

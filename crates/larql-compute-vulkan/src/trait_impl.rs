@@ -146,7 +146,8 @@ impl QuantMatVec for VulkanBackend {
     }
 
     fn supports_quant(&self, format: larql_compute::QuantFormat) -> bool {
-        CPU.supports_quant(format)
+        let _ = format;
+        false
     }
 }
 
@@ -162,10 +163,8 @@ impl ComputeBackend for VulkanBackend {
     }
 
     fn supports(&self, cap: Capability) -> bool {
-        matches!(
-            cap,
-            Capability::F32Gemv | Capability::F16Gemv | Capability::QuantMatVec | Capability::Q4VecMat
-        )
+        let _ = cap;
+        false
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
