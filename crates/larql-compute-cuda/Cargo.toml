@@ -1,0 +1,19 @@
+[package]
+name = "larql-compute-cuda"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CUDA backend scaffold for LARQL. Implements the shared compute/KV traits while the kernel surface is brought up incrementally."
+keywords = ["cuda", "gpu", "quantization", "matmul"]
+categories = ["science"]
+
+[dependencies]
+larql-compute = { path = "../larql-compute" }
+larql-models = { path = "../larql-models" }
+ndarray = "0.16"
+half = "2"
+
+[dev-dependencies]
+larql-compute = { path = "../larql-compute", features = ["test-utils"] }
+larql-models = { path = "../larql-models", features = ["test-utils"] }

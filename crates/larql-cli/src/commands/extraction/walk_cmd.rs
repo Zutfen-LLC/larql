@@ -109,6 +109,10 @@ pub struct WalkArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Generic backend selector. `--metal` remains a compatibility alias.
+    #[arg(long, default_value = "auto", value_name = "auto|cpu|metal|cuda|vulkan")]
+    pub backend: String,
+
     /// Run autoregressive generation through the Metal Q4K pipeline:
     /// fused `full_pipeline_q4` prefill + `decode_token` KV-cached decode.
     /// Works for pre-norm (Llama, Mistral) and post-norm + QK-norm
@@ -167,6 +171,9 @@ macro_rules! vlog {
 }
 
 pub fn run(args: WalkArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = crate::commands::backend::backend_kind_from_args(&args.backend, args.metal)
+        .map_err(|e| format!("--backend: {e}"))?;
+
     let verbose = args.verbose;
     let load_start = Instant::now();
 

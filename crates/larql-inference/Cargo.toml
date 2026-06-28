@@ -17,9 +17,9 @@ categories = ["science"]
 # binaries that don't use it.
 larql-models = { path = "../larql-models", features = ["test-utils"] }
 larql-compute = { path = "../larql-compute" }
-# Apple-only sibling backend.  Optional + activated by the local
-# `gpu` feature; non-Mac builds skip the dep graph entirely.
 larql-compute-metal = { path = "../larql-compute-metal", optional = true }
+larql-compute-cuda = { path = "../larql-compute-cuda", optional = true }
+larql-compute-vulkan = { path = "../larql-compute-vulkan", optional = true }
 larql-core = { path = "../larql-core" }
 larql-vindex = { path = "../larql-vindex" }
 serde = { workspace = true }
@@ -93,12 +93,11 @@ blas-src = { version = "0.10", default-features = false }
 
 [features]
 default = []
-# Umbrella for GPU-backend support. Today this pulls in the
-# `larql-compute-metal` sibling crate; future Vulkan/CUDA backends compose
-# under the same flag without forcing a per-call-site feature matrix.
-# Cascades `larql-vindex/gpu` so its GPU-specific paths (bench harness,
-# hybrid decode glue) compile alongside ours.
-gpu = ["dep:larql-compute-metal", "larql-vindex/gpu"]
+metal = ["dep:larql-compute-metal", "larql-vindex/metal"]
+cuda = ["dep:larql-compute-cuda", "larql-vindex/cuda"]
+vulkan = ["dep:larql-compute-vulkan", "larql-vindex/vulkan"]
+gpu = ["metal"]
+gpu-all = ["metal", "cuda", "vulkan"]
 
 [[example]]
 name = "cpu_gpu_diag"

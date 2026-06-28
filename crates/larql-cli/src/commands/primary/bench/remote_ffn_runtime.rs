@@ -74,20 +74,14 @@ pub(super) fn run_remote_ffn_bench(
     // `--metal` opt-in in `run_with_remote_ffn` (run_cmd.rs:553): explicit
     // CLI flag, Metal-init failure falls back to CPU. Each concurrent
     // worker builds its own backend (this fn runs per spawned thread).
-    let backend: Box<dyn larql_compute::ComputeBackend> = if args.metal {
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        {
-            larql_compute_metal::metal_backend()
-                .map(|m| Box::new(m) as Box<dyn larql_compute::ComputeBackend>)
-                .unwrap_or_else(larql_compute::cpu_backend)
-        }
-        #[cfg(not(all(feature = "gpu", target_os = "macos")))]
-        {
-            return Err("`--metal` requires the `gpu` feature on macOS".into());
-        }
-    } else {
-        larql_compute::default_backend()
-    };
+    let requested =
+        crate::commands::backend::backend_kinds_from_args(&args.backends, args.cpu, args.metal)
+            .map_err(|e| format!("--backends: {e}"))?;
+    let primary_kind = crate::commands::backend::primary_backend_kind(
+        &requested,
+        larql_inference::ComputeBackendKind::Auto,
+    );
+    let backend = crate::commands::backend::compute_backend_or_err(primary_kind)?;
 
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let weights = larql_vindex::load_model_weights_kquant(vindex_path, &mut cb)

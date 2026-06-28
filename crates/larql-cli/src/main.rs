@@ -301,6 +301,7 @@ impl From<ChatArgs> for run_cmd::RunArgs {
             model: c.model,
             prompt: None,
             max_tokens: c.max_tokens,
+            backend: "auto".to_string(),
             top: 1,
             kv_cache: run_cmd::KvCacheKind::Standard,
             context_window: 0,

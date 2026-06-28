@@ -14,6 +14,8 @@ path = "src/main.rs"
 larql-core = { path = "../larql-core" }
 larql-compute = { path = "../larql-compute" }
 larql-compute-metal = { path = "../larql-compute-metal", optional = true }
+larql-compute-cuda = { path = "../larql-compute-cuda", optional = true }
+larql-compute-vulkan = { path = "../larql-compute-vulkan", optional = true }
 larql-inference = { path = "../larql-inference" }
 larql-kv = { path = "../larql-kv" }
 larql-models = { path = "../larql-models" }
@@ -40,12 +42,26 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 
 [features]
 default = ["gpu"]
-gpu = [
+metal = [
     "dep:larql-compute-metal",
-    "larql-inference/gpu",
-    "larql-kv/gpu",
-    "larql-vindex/gpu",
+    "larql-inference/metal",
+    "larql-kv/metal",
+    "larql-vindex/metal",
 ]
+cuda = [
+    "dep:larql-compute-cuda",
+    "larql-inference/cuda",
+    "larql-kv/cuda",
+    "larql-vindex/cuda",
+]
+vulkan = [
+    "dep:larql-compute-vulkan",
+    "larql-inference/vulkan",
+    "larql-kv/vulkan",
+    "larql-vindex/vulkan",
+]
+gpu = ["metal"]
+gpu-all = ["metal", "cuda", "vulkan"]
 
 [dev-dependencies]
 tempfile = "3"

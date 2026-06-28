@@ -22,8 +22,9 @@ pub struct BenchArgs {
     #[arg(long, default_value = "3")]
     pub warmup: usize,
 
-    /// Comma-separated backend list. Supported: `metal`, `cpu`.
-    #[arg(long, default_value = "metal")]
+    /// Comma-separated backend list. Supported: `auto`, `cpu`, `metal`,
+    /// `cuda`, `vulkan`.
+    #[arg(long, default_value = "auto")]
     pub backends: String,
 
     /// Shorthand for `--backends cpu`.
@@ -86,14 +87,7 @@ pub struct BenchArgs {
     #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
     pub ffn_dispatch: String,
 
-    /// Use the Metal GPU backend for the `--ffn` remote-FFN bench
-    /// (attention + the local decode loop run on Metal; FFN is remote).
-    /// Required for `--ffn` on this binary: the dense remote-FFN walk
-    /// dispatches through the GPU-only `decode_token_with_moe`, so
-    /// without `--metal` the bench falls back to the CPU
-    /// `default_backend()` whose remote-FFN path returns `None` during
-    /// prefill (post-GPU-extraction; mirrors `run --ffn --metal`,
-    /// see `run_cmd.rs:553`). No effect on the local (non-`--ffn`) path.
+    /// Compatibility alias for `--backends metal`.
     #[arg(long)]
     pub metal: bool,
 

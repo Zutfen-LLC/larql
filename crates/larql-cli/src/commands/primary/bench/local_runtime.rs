@@ -10,6 +10,7 @@ use super::local::{
     append_cpu_fallback_note, backend_name_for, format_early_stop_note, format_q4k_cache_log,
 };
 use super::row::{compute_percentiles, BenchRow};
+use larql_inference::ComputeBackendKind;
 
 /// Run the larql generate loop once with the selected backend.
 ///
@@ -18,7 +19,7 @@ use super::row::{compute_percentiles, BenchRow};
 pub(super) fn run_larql(
     vindex_path: &std::path::Path,
     args: &BenchArgs,
-    metal: bool,
+    backend_kind: ComputeBackendKind,
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
     use larql_inference::layer_graph::generate::generate;
     use larql_inference::layer_graph::CachedLayerGraph;
@@ -26,7 +27,7 @@ pub(super) fn run_larql(
     if args.verbose {
         eprintln!(
             "[bench] loading vindex for {}…",
-            if metal { "metal" } else { "cpu" }
+            backend_kind
         );
     }
 
@@ -55,28 +56,14 @@ pub(super) fn run_larql(
         larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
             .map_err(|e| format!("tokenize: {e}"))?;
 
-    let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        {
-            let b = larql_compute_metal::MetalBackend::new().ok_or(
-                "Metal backend unavailable — rebuild with `--features gpu` on an M-series Mac",
-            )?;
-            Box::new(b)
-        }
-        #[cfg(not(all(feature = "gpu", target_os = "macos")))]
-        {
-            return Err("Metal backend requires the `gpu` feature on macOS".into());
-        }
-    } else {
-        Box::new(larql_compute::CpuBackend)
-    };
+    let backend = crate::commands::backend::compute_backend_or_err(backend_kind)?;
 
     let cached_layers = CachedLayerGraph::from_residuals(Vec::new());
 
     // Pre-warm: one generate call to allocate the KV cache and populate the
     // Metal buffer caches. The prefill timer would otherwise include this
     // one-time allocation cost.
-    if metal {
+    if !matches!(backend_kind, ComputeBackendKind::Cpu) {
         let num_layers = weights.num_layers;
         let _ = generate(
             &mut weights,
@@ -119,7 +106,7 @@ pub(super) fn run_larql(
         let (slots, bytes) = index.kquant_ffn_cache_stats();
         eprintln!(
             "{}",
-            format_q4k_cache_log(backend_name_for(metal), slots, bytes)
+            format_q4k_cache_log(backend_name_for(backend_kind), slots, bytes)
         );
     }
 
@@ -133,9 +120,9 @@ pub(super) fn run_larql(
         (result.prefill_ms, avg, p50, p99, 1000.0 / avg)
     };
 
-    let backend_name = backend_name_for(metal);
+    let backend_name = backend_name_for(backend_kind);
     let mut note = format_early_stop_note(measured_n, args.tokens, wall_ms);
-    if !metal {
+    if matches!(backend_kind, ComputeBackendKind::Cpu) {
         let cached = larql_inference::vindex::supports_cached_decode(&weights);
         note = append_cpu_fallback_note(note, cached);
     }

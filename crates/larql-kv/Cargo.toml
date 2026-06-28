@@ -12,6 +12,8 @@ description = "Pluggable KV-cache engines for larql-inference (markov-rs, unlimi
 larql-inference = { path = "../larql-inference" }
 larql-compute = { path = "../larql-compute" }
 larql-compute-metal = { path = "../larql-compute-metal", optional = true }
+larql-compute-cuda = { path = "../larql-compute-cuda", optional = true }
+larql-compute-vulkan = { path = "../larql-compute-vulkan", optional = true }
 larql-vindex = { path = "../larql-vindex" }
 larql-boundary = { path = "../larql-boundary" }
 
@@ -45,7 +47,11 @@ blas-src = { version = "0.10", default-features = false }
 
 [features]
 default = []
-gpu = ["dep:larql-compute-metal", "larql-inference/gpu"]
+metal = ["dep:larql-compute-metal", "larql-inference/metal"]
+cuda = ["dep:larql-compute-cuda", "larql-inference/cuda"]
+vulkan = ["dep:larql-compute-vulkan", "larql-inference/vulkan"]
+gpu = ["metal"]
+gpu-all = ["metal", "cuda", "vulkan"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

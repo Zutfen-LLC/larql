@@ -87,6 +87,10 @@ pub struct RunArgs {
     #[arg(short = 'n', long = "max-tokens", default_value = "64")]
     pub max_tokens: usize,
 
+    /// Generic backend selector. `--metal` remains a compatibility alias.
+    #[arg(long, default_value = "auto", value_name = "auto|cpu|metal|cuda|vulkan")]
+    pub backend: String,
+
     /// KV cache strategy for autoregressive decode (legacy flag).
     ///
     ///   standard         — Full FP32 K/V, unbounded. Correct over any
@@ -284,6 +288,9 @@ pub struct RunArgs {
 }
 
 pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = crate::commands::backend::backend_kind_from_args(&args.backend, args.metal)
+        .map_err(|e| format!("--backend: {e}"))?;
+
     let vindex_path = cache::resolve_model(&args.model)?;
     if !vindex_path.is_dir() {
         return Err(format!(
@@ -320,7 +327,7 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.max_tokens,
             &args.ffn_dispatch,
             args.ffn_predispatch_iters,
-            args.metal,
+            wants_metal(&args),
         );
     }
 
@@ -345,7 +352,7 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.max_tokens,
             &args.moe_dispatch,
             args.moe_predispatch_iters,
-            args.metal,
+            wants_metal(&args),
             args.engine.as_deref(),
         );
     }
@@ -540,12 +547,21 @@ fn build_walk_args(
         compare: false,
         down_top_k: 5,
         verbose: args.verbose,
-        metal: args.metal,
+        backend: args.backend.clone(),
+        metal: wants_metal(args),
         ffn_remote: args.ffn.clone(),
         ffn_remote_timeout_secs: args.ffn_timeout_secs,
         ffn_dispatch: args.ffn_dispatch.clone(),
         ffn_predispatch_iters: args.ffn_predispatch_iters,
     }
+}
+
+fn wants_metal(args: &RunArgs) -> bool {
+    args.metal
+        || matches!(
+            crate::commands::backend::parse_backend_kind(&args.backend),
+            Ok(larql_inference::ComputeBackendKind::Metal)
+        )
 }
 
 /// `--moe-shards` dispatch path.
@@ -1288,7 +1304,9 @@ mod experts {
     /// Wraps the impure `default_backend()` call so [`pick_strategy`] stays pure.
     fn metal_ready_for_q4(want_metal: bool) -> bool {
         want_metal
-            && larql_compute::default_backend().supports_quant(::larql_compute::QuantFormat::Q4_K)
+            && larql_inference::compute_backend(larql_inference::ComputeBackendKind::Metal)
+                .map(|backend| backend.supports_quant(::larql_compute::QuantFormat::Q4_K))
+                .unwrap_or(false)
     }
 
     /// Pure strategy selector: given the vindex quant format and whether
@@ -1305,14 +1323,14 @@ mod experts {
     fn load_runtime(vindex_path: &Path, args: &RunArgs) -> Result<Runtime, BoxErr> {
         let mut cb = SilentLoadCallbacks;
         let cfg = larql_vindex::load_vindex_config(vindex_path)?;
-        let strategy = pick_strategy(cfg.quant, metal_ready_for_q4(args.metal));
+        let strategy = pick_strategy(cfg.quant, metal_ready_for_q4(wants_metal(args)));
 
         if args.verbose {
             eprintln!(
                 "strategy: {} (quant={:?}, metal_requested={})",
                 strategy.name(),
                 cfg.quant,
-                args.metal
+                wants_metal(args)
             );
         }
 
