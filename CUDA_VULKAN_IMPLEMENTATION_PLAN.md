@@ -422,59 +422,47 @@ MVP success criterion:
 
 ## Current Session Status
 
-As of the latest handoff (Session 4):
+As of the latest handoff (Session 5):
 
 - **Phase 1 (workspace + features): DONE** and verified — all feature subsets compile.
 - **Phase 2 (shared backend selection API): DONE** and verified — `ComputeBackendKind`, explicit factories, `Auto` policy, `BackendSelectionError`. The Metal arm was fixed to gate on `target_os = "macos"` (was breaking Linux + `--features metal`).
 - **Phase 3 (CLI + user-facing selection): DONE** for `run`/`walk`/`bench`/`shannon` — all accept `--backend <auto|cpu|metal|cuda|vulkan>`, `--metal` preserved as alias, routed through `crates/larql-cli/src/commands/backend.rs`. Remaining polish only: stale Metal-only help text/comments, and `run` still has Metal-specific construction in remote FFN/MoE and `--experts` branches.
-- **Phase 4 (CUDA crate MVP): STARTED, still early** — `larql-compute-cuda` now has:
+- **Phase 4 (CUDA crate MVP): UNDERWAY** — `larql-compute-cuda` now has:
   - `cudarc` wired with dynamic loading + NVRTC
-  - a new optional runtime/bootstrap layer (`src/backend/runtime.rs`)
+  - a runtime/bootstrap layer (`src/backend/runtime.rs`) that compiles a combined module of three entry points and loads all three functions
   - panic-safe fallback when probing CUDA on non-CUDA hosts (missing `libcuda` no longer aborts tests)
-  - a first native `q4k_matvec` launch path
-  Everything else in the CUDA crate still delegates dense/quant/KV/decode to CPU, and capability reporting intentionally remains conservative.
+  - three native k-quant kernels behind CPU fallback: `q4k_matvec` (Session 4), `q6k_matvec` + the amortised `q4k_matmul` (Session 5), each with runtime-gated parity tests
+  Everything else in the CUDA crate still delegates dense/KV/decode/prefill to CPU, and capability reporting intentionally remains conservative (`supports_quant`/`supports` still report false).
 - **Phase 5 (Vulkan crate MVP): NOT STARTED** — `larql-compute-vulkan` is a parallel scaffold. No `ash`/`shaderc`, no real kernels.
-- **Phase 6 (shared GPU conventions): PARTIAL** — kernel handle + dispatch geometry structs exist in both scaffolds but are not yet exercised by real kernels.
-- **Phase 7 (capability + fallback contract): RECONCILED FOR SCAFFOLDS** — delegated CPU/reference methods remain callable for parity tests, but CUDA/Vulkan scaffolds now report `supports(...) == false` for accelerator capabilities and `supports_quant(...) == false` until native kernels land. `walk`'s Q4 path probes `PrefillQ4 + DecodeToken + Q4_K`: `auto` falls back to CPU when only scaffolds are present, while explicit CUDA/Vulkan fail loudly.
+- **Phase 6 (shared GPU conventions): PARTIAL** — kernel handle + dispatch geometry structs exist in both scaffolds; CUDA now exercises them across three kernels, Vulkan still does not.
+- **Phase 7 (capability + fallback contract): RECONCILED FOR SCAFFOLDS** — delegated CPU/reference methods remain callable for parity tests, but CUDA/Vulkan scaffolds now report `supports(...) == false` for accelerator capabilities and `supports_quant(...) == false` until native kernels land. `walk`'s Q4 path probes `PrefillQ4 + DecodeToken + Q4_K`: `auto` falls back to CPU when only scaffolds are present, while explicit CUDA/Vulkan fail loudly. **CUDA still does not advertise despite three native kernels**, because prefill/decode (the gating capabilities) are not yet native.
 - **Phase 8 (CI jobs): NOT STARTED.**
 
-Verification snapshot (CachyOS / x86_64-linux, rustc 1.96.0):
+Verification snapshot (CachyOS / x86_64-linux, rustc 1.96.0, no CUDA hardware on host):
 
+- `cargo fmt --all -- --check` — clean
 - `cargo check --workspace --exclude larql-python` — green
 - `cargo check` on `metal`/`cuda`/`vulkan`/`cuda,vulkan`/`gpu-all` subsets — green
 - `cargo clippy --workspace --exclude larql-python --exclude larql-compute-metal -- -D warnings` — green
 - `cargo clippy -p larql-cli --features cuda,vulkan -- -D warnings` — green
-- `cargo test -p larql-inference --lib` → 1243 passed
-- `cargo test -p larql-cli --bins` → 243 passed
-- `cargo test -p larql-compute-cuda` → 7 passed
-- `cargo test -p larql-compute-vulkan` → 6 passed
-
-Session 3 delta:
-
-- `cargo test -p larql-compute-cuda` → 7 passed
-- `cargo test -p larql-compute-vulkan` → 6 passed
-- `cargo test -p larql-cli --bins` → 243 passed
 - `cargo test -p larql-inference --lib` → 1243 passed, 4 ignored
-- `cargo check -p larql-cli --features cuda,vulkan` — green
-- `cargo clippy -p larql-cli --features cuda,vulkan -- -D warnings` — green
+- `cargo test -p larql-cli --bins` → 243 passed
+- `cargo test -p larql-compute-cuda` → 11 passed (up from 9; +2 runtime-gated parity tests)
+- `cargo test -p larql-compute-vulkan` → 6 passed
 
-Session 4 delta:
+Session 5 scope landed:
 
-- `cargo check -p larql-compute-cuda` — green
-- `cargo test -p larql-compute-cuda --offline` → 9 passed
-
-Session 4 scope landed:
-
-- `cudarc 0.19.8` added to `larql-compute-cuda`
-- embedded NVRTC source for `q4k_matvec`
-- optional CUDA runtime bootstrap with dynamic probing
-- panic-safe degrade-to-scaffold behavior on hosts without `libcuda`
-- native `q4k_matvec` route wired behind the existing CPU fallback
+- `Q6K_MATVEC_CUDA_SRC` + `Q4K_MATMUL_CUDA_SRC` embedded kernel sources
+- `CudaRuntime` holds three function handles; one combined NVRTC module
+- `launch_q6k_matvec` / `launch_q4k_matmul` with shape checks + panic-safe fallback
+- `native_q6k_matvec` / `native_q4k_matmul` wrappers + `trait_impl` routing behind CPU fallback
+- two runtime-gated parity tests (`native_q6k_matvec_*`, `native_q4k_matmul_*`)
+- `cargo fmt --all` applied across the repo
 
 Immediate next slice:
 
-- keep Phase 7 honesty as-is (do **not** advertise CUDA Q4/decode support yet)
-- continue Phase 4 with `q4k_matmul`, `q6k_matvec`, then prefill/decode
+- keep Phase 7 honesty as-is (do **not** advertise CUDA Q4/decode support yet — prefill/decode still delegate to CPU)
+- continue Phase 4 with the prefill/decode path: `prefill_kquant`, `decode_token`, KV cache lifecycle, then `q4k_dual_matvec` / `q6k_matmul` / `q4_matvec` / `f32_gemv` / `f16_gemv`
 
 Pre-existing environment issues (not caused by this work): `larql-python` fails on PyO3 0.24 vs Python 3.14; `larql-compute-metal`'s macOS-gated *test binary* needs `blas_src` off-Apple (lib compiles fine); OpenBLAS must be installed system-wide for any test linking `larql-compute`.
 

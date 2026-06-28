@@ -88,7 +88,11 @@ pub struct RunArgs {
     pub max_tokens: usize,
 
     /// Generic backend selector. `--metal` remains a compatibility alias.
-    #[arg(long, default_value = "auto", value_name = "auto|cpu|metal|cuda|vulkan")]
+    #[arg(
+        long,
+        default_value = "auto",
+        value_name = "auto|cpu|metal|cuda|vulkan"
+    )]
     pub backend: String,
 
     /// KV cache strategy for autoregressive decode (legacy flag).

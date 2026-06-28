@@ -25,10 +25,7 @@ pub(super) fn run_larql(
     use larql_inference::layer_graph::CachedLayerGraph;
 
     if args.verbose {
-        eprintln!(
-            "[bench] loading vindex for {}…",
-            backend_kind
-        );
+        eprintln!("[bench] loading vindex for {}…", backend_kind);
     }
 
     let mut cb = larql_vindex::SilentLoadCallbacks;

@@ -165,4 +165,49 @@ mod tests {
             .unwrap();
         assert_eq!(got, want);
     }
+
+    #[test]
+    fn native_q6k_matvec_matches_cpu_when_runtime_is_available() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+
+        let rows = 4usize;
+        let cols = 256usize;
+        let matrix: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.003).sin()).collect();
+        let q6k = quantize_q6_k(&matrix);
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.01).cos()).collect();
+
+        let got = backend
+            .native_q6k_matvec(&q6k, &x, rows, cols)
+            .expect("native q6k_matvec should launch when runtime is available")
+            .expect("runtime available should expose native q6k_matvec");
+        let want = CpuBackend.q6k_matvec(&q6k, &x, rows, cols).unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn native_q4k_matmul_matches_cpu_when_runtime_is_available() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let [(gate, _), _, _] = index.interleaved_kquant_layer_data(0).unwrap();
+        let seq_len = 3usize;
+        let x = vec![0.02f32; seq_len * weights.hidden_size];
+        let rows = index.num_features(0);
+
+        let got = backend
+            .native_q4k_matmul(gate, &x, rows, weights.hidden_size, seq_len)
+            .expect("native q4k_matmul should launch when runtime is available")
+            .expect("runtime available should expose native q4k_matmul");
+        let want = CpuBackend
+            .q4k_matmul(gate, &x, rows, weights.hidden_size, seq_len)
+            .unwrap();
+        assert_eq!(got, want);
+    }
 }

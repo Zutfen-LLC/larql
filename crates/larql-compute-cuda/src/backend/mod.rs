@@ -52,6 +52,37 @@ impl CudaBackend {
         }
     }
 
+    pub(crate) fn native_q6k_matvec(
+        &self,
+        q6k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Option<Vec<f32>>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime
+                .launch_q6k_matvec(q6k_data, x, num_rows, hidden)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn native_q4k_matmul(
+        &self,
+        q4k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+        seq_len: usize,
+    ) -> Result<Option<Vec<f32>>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime
+                .launch_q4k_matmul(q4k_data, x, num_rows, hidden, seq_len)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn native_runtime_available(&self) -> bool {
         self.runtime.is_some()
     }

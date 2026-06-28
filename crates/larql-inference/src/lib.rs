@@ -157,15 +157,25 @@ pub fn cpu_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
 fn auto_backend_order() -> &'static [ComputeBackendKind] {
     #[cfg(target_os = "macos")]
     {
-        &[ComputeBackendKind::Metal, ComputeBackendKind::Vulkan, ComputeBackendKind::Cpu]
+        &[
+            ComputeBackendKind::Metal,
+            ComputeBackendKind::Vulkan,
+            ComputeBackendKind::Cpu,
+        ]
     }
     #[cfg(not(target_os = "macos"))]
     {
-        &[ComputeBackendKind::Cuda, ComputeBackendKind::Vulkan, ComputeBackendKind::Cpu]
+        &[
+            ComputeBackendKind::Cuda,
+            ComputeBackendKind::Vulkan,
+            ComputeBackendKind::Cpu,
+        ]
     }
 }
 
-fn try_compute_backend(kind: ComputeBackendKind) -> Result<Box<dyn larql_compute::ComputeBackend>, BackendSelectionError> {
+fn try_compute_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn larql_compute::ComputeBackend>, BackendSelectionError> {
     match kind {
         ComputeBackendKind::Auto => {
             for candidate in auto_backend_order() {
@@ -241,7 +251,9 @@ fn try_compute_backend(kind: ComputeBackendKind) -> Result<Box<dyn larql_compute
     }
 }
 
-fn try_engine_backend(kind: ComputeBackendKind) -> Result<Box<dyn EngineBackend>, BackendSelectionError> {
+fn try_engine_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn EngineBackend>, BackendSelectionError> {
     match kind {
         ComputeBackendKind::Auto => {
             for candidate in auto_backend_order() {
@@ -401,7 +413,9 @@ pub fn compute_backend(
     try_compute_backend(kind)
 }
 
-pub fn engine_backend(kind: ComputeBackendKind) -> Result<Box<dyn EngineBackend>, BackendSelectionError> {
+pub fn engine_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn EngineBackend>, BackendSelectionError> {
     try_engine_backend(kind)
 }
 

@@ -193,7 +193,11 @@ pub struct EncodeArgs {
     /// Generic backend selector for the vindex path. `--metal` is a
     /// compatibility alias for `--backend metal`. The fast Q4K forced-token
     /// scorer requires a backend that advertises fused Q4K decode.
-    #[arg(long, default_value = "auto", value_name = "auto|cpu|metal|cuda|vulkan")]
+    #[arg(
+        long,
+        default_value = "auto",
+        value_name = "auto|cpu|metal|cuda|vulkan"
+    )]
     backend: String,
 
     /// Compatibility alias for `--backend metal` (macOS only).
@@ -221,7 +225,11 @@ pub struct DecodeArgs {
     /// Generic backend selector for the vindex path. `--metal` is a
     /// compatibility alias for `--backend metal`. The fast Q4K forced-token
     /// scorer requires a backend that advertises fused Q4K decode.
-    #[arg(long, default_value = "auto", value_name = "auto|cpu|metal|cuda|vulkan")]
+    #[arg(
+        long,
+        default_value = "auto",
+        value_name = "auto|cpu|metal|cuda|vulkan"
+    )]
     backend: String,
 
     /// Compatibility alias for `--backend metal` (macOS only).

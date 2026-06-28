@@ -85,12 +85,9 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let requested_backends = crate::commands::backend::backend_kinds_from_args(
-        &args.backends,
-        args.cpu,
-        args.metal,
-    )
-    .map_err(|e| format!("--backends: {e}"))?;
+    let requested_backends =
+        crate::commands::backend::backend_kinds_from_args(&args.backends, args.cpu, args.metal)
+            .map_err(|e| format!("--backends: {e}"))?;
     let want_cpu = requested_backends.contains(&ComputeBackendKind::Cpu);
     let accelerator_kinds: Vec<_> = requested_backends
         .iter()
@@ -249,9 +246,8 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 &requested_backends,
                                 ComputeBackendKind::Cpu,
                             );
-                            let backend = crate::commands::backend::engine_backend_or_err(
-                                backend_kind,
-                            )?;
+                            let backend =
+                                crate::commands::backend::engine_backend_or_err(backend_kind)?;
                             rows.push(run_engine(
                                 &mut weights,
                                 Some(&index),
