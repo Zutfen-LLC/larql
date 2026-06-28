@@ -4,14 +4,33 @@
 
 Resume the CUDA + Vulkan backend implementation for LARQL.
 
-The work completed in this session focused on:
+## Current Status (verified)
 
-1. adding workspace/feature plumbing
-2. adding explicit backend selection APIs
-3. adding CUDA/Vulkan sibling crates as compileable scaffolds
-4. starting CLI migration from Metal-only flags to generic backend names
+Two sessions of work have landed:
 
-This is not done yet. The new CUDA/Vulkan crates currently delegate most compute/KV behavior to CPU/reference paths and do not contain real accelerator kernels.
+- **Session 1** (original scaffolding): workspace/feature plumbing, explicit backend selection APIs, CUDA/Vulkan sibling crates as compileable scaffolds, partial CLI migration. Could not compile-verify (no Rust toolchain on PATH).
+- **Session 2** (verification + repair + finish CLI): brought up `cargo`/`rustc` (rustup, off-PATH), ran `cargo check`, fixed the one real compile breakage, finished the `shannon` CLI migration, and fixed three test/lint issues so the affected crates are green under `cargo test` and `cargo clippy -- -D warnings`.
+
+**The new CUDA/Vulkan crates are still scaffold backends.** They delegate most compute/KV behavior to CPU/reference paths and contain no real accelerator kernels. What exists is the repo-wide control plane needed to start that work.
+
+### Verification snapshot (Session 2, CachyOS / x86_64-linux, rustc 1.96.0)
+
+Green:
+
+- `cargo check --workspace --exclude larql-python`
+- `cargo check` on every relevant feature subset: `metal`, `cuda`, `vulkan`, `cuda,vulkan`, `gpu-all` (for `larql-inference` and `larql-cli`)
+- `cargo clippy --workspace --exclude larql-python --exclude larql-compute-metal -- -D warnings`
+- `cargo clippy -p larql-cli --features cuda,vulkan -- -D warnings`
+- `cargo test -p larql-inference --lib` → 1243 passed
+- `cargo test -p larql-cli --bins` → 243 passed
+- `cargo test -p larql-compute-cuda` → 7 passed
+- `cargo test -p larql-compute-vulkan` → 6 passed
+
+Pre-existing environment issues (NOT caused by this work, NOT fixed):
+
+- `larql-python` — PyO3 0.24.2 does not support Python 3.14 (needs `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` or a PyO3 upgrade). Excluded from checks.
+- `larql-compute-metal` *test binary* — `tests/test_pipeline_and_moe.rs` does `extern crate blas_src;` and the macOS-gated test path needs `blas_src` off-Apple. The crate's *lib* compiles fine (empty off-macOS). Excluded from the `-D warnings` clippy pass; not a regression.
+- OpenBLAS must be installed system-wide for any test that links `larql-compute` (`openblas-src` is configured with `features = ["system"]`). On this host: `sudo pacman -S openblas`.
 
 ## What Landed
 
@@ -30,7 +49,7 @@ Updated feature plumbing in:
 - `crates/larql-kv/Cargo.toml`
 - `crates/larql-vindex/Cargo.toml`
 
-Current feature model added:
+Current feature model:
 
 - `metal`
 - `cuda`
@@ -38,37 +57,33 @@ Current feature model added:
 - `gpu-all`
 - `gpu` remains an alias to `metal`
 
+Note: the backend crates themselves (`larql-compute-cuda`, `larql-compute-vulkan`) do **not** define their own `cuda`/`vulkan` features — the features live on the consumer crates. So `cargo check -p larql-compute-cuda --features cuda` errors with "does not contain this feature"; use `cargo check -p larql-inference --features cuda` instead.
+
 ### larql-inference backend selection
 
 In `crates/larql-inference/src/lib.rs`:
 
-- added `ComputeBackendKind { Auto, Cpu, Metal, Cuda, Vulkan }`
-- added:
-  - `compute_backend(kind)`
-  - `engine_backend(kind)`
-  - `async_engine_backend(kind)`
-- preserved wrappers:
-  - `default_compute_backend()`
-  - `default_engine_backend()`
-  - `default_async_engine_backend()`
+- `pub enum ComputeBackendKind { Auto, Cpu, Metal, Cuda, Vulkan }`
+- `pub enum BackendSelectionError` (with `Display` + `std::error::Error`)
+- `compute_backend(kind) -> Result<Box<dyn ComputeBackend>, BackendSelectionError>`
+- `engine_backend(kind) -> Result<Box<dyn EngineBackend>, BackendSelectionError>`
+- `async_engine_backend(kind) -> Result<Box<dyn AsyncComputeBackend>, BackendSelectionError>`
+- preserved wrappers: `default_compute_backend()`, `default_engine_backend()`, `default_async_engine_backend()` (all follow `Auto`)
 
-Current auto policy implemented:
+Auto policy:
 
 - macOS: `metal -> vulkan -> cpu`
 - non-macOS: `cuda -> vulkan -> cpu`
 
-Explicit unavailable backends return `BackendSelectionError`.
+Explicit unavailable backends return `BackendSelectionError::Unavailable`.
 
-### New backend crates
+**Session 2 fix**: the `ComputeBackendKind::Metal` arms originally called `larql_compute_metal::metal_backend()` under only `#[cfg(feature = "metal")]`, but that function is additionally gated `#[cfg(target_os = "macos")]` in the metal crate (it compiles to an empty crate off-Apple). The arms now add a `target_os = "macos"` predicate and return `BackendSelectionError::Unavailable { reason: "Metal backend is only available on macOS" }` on non-macOS hosts with the `metal` feature on. This is what unblocked `cargo check --features metal` on Linux.
 
-Added scaffold crates:
+### New backend crates (scaffolds)
 
-- `crates/larql-compute-cuda`
-- `crates/larql-compute-vulkan`
+`crates/larql-compute-cuda` and `crates/larql-compute-vulkan`, each containing:
 
-Each crate currently contains:
-
-- constructor API
+- constructor API (`cuda_backend()` / `vulkan_backend()` returning `Result`)
 - backend options
 - kernel handle + dispatch geometry structs
 - `ComputeBackend` impl
@@ -76,29 +91,37 @@ Each crate currently contains:
 - `AsyncComputeBackend` impl
 - parity-style tests
 
-Important: these are scaffold backends, not real CUDA/Vulkan implementations yet.
-
-Current behavior:
+**These are scaffold backends, not real CUDA/Vulkan implementations.** Current behavior:
 
 - dense/quant ops mostly delegate to `CpuBackend`
 - KV dispatch delegates to CPU
 - async dispatch delegates to CPU
-- capability reporting is conservative-ish but still scaffolded
+- capability reporting is conservative-ish but still scaffolded (see Phase 7 caveat below)
+
+**Session 2 fixes in the scaffolds**:
+
+- `crates/larql-compute-cuda/src/trait_impl.rs` and `crates/larql-compute-vulkan/src/trait_impl.rs` — rewrote `f16_gemv` inner loops to satisfy `clippy::needless_range_loop` (was failing `make ci`'s `-D warnings`).
+- `crates/larql-compute-cuda/src/lib.rs` — fixed `q4_input_format_routes_like_cpu` test: it used 64 weight elements but `quantize_q4_k` requires a multiple of 256; bumped to `cols=128, rows=2` (256 elements).
+- `crates/larql-inference/src/lib.rs` — fixed `unavailable_explicit_backend_errors_loudly` test: it used `expect_err` on `Result<Box<dyn ComputeBackend>, _>`, but `dyn ComputeBackend` isn't `Debug`, so the test didn't compile. Switched to a `match` on `Err`.
 
 ### CLI migration
 
-Added shared parser/helpers in:
+Shared parser/helpers in `crates/larql-cli/src/commands/backend.rs`:
 
-- `crates/larql-cli/src/commands/backend.rs`
+- `parse_backend_kind`, `parse_backend_list`
+- `backend_kind_from_args` (honors `--metal` alias)
+- `backend_kinds_from_args` (honors `--cpu`/`--metal` aliases)
+- `primary_backend_kind`, `backend_label`
+- `compute_backend_or_err`, `engine_backend_or_err`
 
-Started migration of CLI/backend wiring:
+Commands migrated to generic `--backend`/`--backends`:
 
-- `bench` now parses generic backend names
-- `run` has new `--backend`
-- `walk` has new `--backend`
-- `--metal` is still present as a compatibility alias
+- `bench` — parses generic backend names
+- `run` — `--backend <auto|cpu|metal|cuda|vulkan>`, `--metal` alias preserved
+- `walk` — `--backend`, `--metal` alias preserved
+- `shannon encode` / `shannon decode` — **migrated in Session 2**: `--backend` added, `--metal` alias preserved, routed through the shared helper. Replaced the bespoke `metal_backend_box()` with `shannon_backend_box()` → `compute_backend_or_err(kind)`. The hard `--metal` requirement is now a backend-agnostic "selected backend must advertise fused Q4K decode" check.
 
-Files touched:
+Files touched (Session 1 + Session 2):
 
 - `crates/larql-cli/src/commands/primary/bench/args.rs`
 - `crates/larql-cli/src/commands/primary/bench/local.rs`
@@ -108,105 +131,34 @@ Files touched:
 - `crates/larql-cli/src/commands/primary/bench/run.rs`
 - `crates/larql-cli/src/commands/primary/run_cmd.rs`
 - `crates/larql-cli/src/commands/extraction/walk_cmd.rs`
+- `crates/larql-cli/src/commands/primary/shannon_cmd.rs` (Session 2)
 - `crates/larql-cli/src/main.rs`
-
-## Important Caveat
-
-This environment did not have `cargo` or `rustc` installed.
-
-I could not run:
-
-- `cargo check`
-- `cargo test`
-- any compile verification
-
-So this handoff should assume there are likely compile errors or signature mismatches still present.
-
-## Likely Problem Areas To Fix First
-
-### 1. Compile the workspace immediately
-
-First command to run in the next session:
-
-```bash
-cargo check -p larql-compute-cuda -p larql-compute-vulkan -p larql-inference -p larql-cli
-```
-
-Then likely:
-
-```bash
-cargo check --workspace
-```
-
-### 2. Expect CLI struct drift
-
-Most likely compile failures are around:
-
-- new `backend: String` fields in `RunArgs` / `WalkArgs`
-- any constructor sites that still build those structs without the new field
-- any lingering `args.backends.contains("metal")` or `args.metal` assumptions
-
-Search for:
-
-```bash
-rg -n "args\\.metal|contains\\(\"metal\"\\)|--metal|RunArgs \\{|WalkArgs \\{" crates/larql-cli
-```
-
-### 3. Expect trait signature drift in new backend crates
-
-The new CUDA/Vulkan `KvDispatch` impls were updated against the current trait shape by inspection, but they were not compiled.
-
-Check:
-
-- `crates/larql-compute-cuda/src/kv_dispatch_impl.rs`
-- `crates/larql-compute-vulkan/src/kv_dispatch_impl.rs`
-- `crates/larql-compute-cuda/src/async_compute_backend_impl.rs`
-- `crates/larql-compute-vulkan/src/async_compute_backend_impl.rs`
-
-### 4. bench path still needs a cleanup pass
-
-`bench` is partially migrated, but it likely still needs:
-
-- better handling of `auto` row labeling
-- clearer behavior when multiple accelerators are requested
-- a sweep for stale comments/help text mentioning Metal-only behavior
-
-### 5. run/walk/shannon are not fully generalized yet
-
-Current state:
-
-- `run` and `walk` accept `--backend`
-- much of their actual runtime logic still treats the accelerator path as effectively Metal-shaped
-- `shannon` was not migrated yet and still has Metal-specific assumptions
-
-That follow-up work should touch:
-
-- `crates/larql-cli/src/commands/primary/shannon_cmd.rs`
-- remaining Metal-only helper functions in `run_cmd.rs` / `walk_cmd.rs`
 
 ## Honest Status Of CUDA/Vulkan MVP
 
-Not implemented yet:
+Not implemented yet (this is the Phase 4/5 work):
 
-- `cudarc`
-- `ash`
-- `shaderc`
+- `cudarc` / `ash` / `shaderc` dependencies
 - NVRTC / SPIR-V kernel compilation
 - real `prefill_kquant`
 - real `decode_token`
 - real `decode_token_with_state_dump_masked`
-- real KV cache lifecycle on device
+- real KV cache lifecycle on device (`has_kv_cache`, `reset_kv_cache`, `kv_cache_len`, `truncate_kv_cache`, `preallocate_kv_cache_per_layer`)
 - real `f32_gemv` / `f16_gemv` / `q4k_*` / `q6k_*` device kernels
+- real coarse `KvDispatch` (currently delegates to CPU)
+- real `AsyncComputeBackend` batching (currently delegates to CPU)
+- hardware-specific CI jobs for CUDA and Vulkan
 
 What exists now is the repo-wide control plane needed to start that work without inventing it later.
 
-## Suggested Next Session Order
+## Remaining Work (in suggested order)
 
-1. run `cargo check` and fix compile errors
-2. finish CLI migration to generic backend naming
-3. make `shannon` follow the same backend-selection helper
-4. tighten capability reporting in CUDA/Vulkan scaffolds
-5. replace delegated CUDA hot paths with real kernels:
+1. ~~compile + repair~~ DONE
+2. ~~CLI migration: `run`/`walk`/`bench`/`shannon` accept `--backend`~~ DONE. Remaining polish:
+   - sweep for stale Metal-only help text/comments across the migrated commands
+   - `run`/`walk` runtime branches parse `--backend` generically but still construct Metal directly in a few places (parsing is generic, backend construction is not yet fully generalized)
+3. tighten capability reporting in CUDA/Vulkan scaffolds per the plan's Phase 7. Current tension: the CUDA test `supports_reports_mvp_capabilities` asserts `supports_quant(Q4_K) == true` and `DecodeToken == false`, but the Q4K path delegates to CPU. Reconcile this with the honesty rule ("advertise only what is really implemented end-to-end") before landing real kernels — either the impl should report `supports_quant(Q4_K) == false` while delegating, or the test should move to a "real kernel landed" milestone.
+4. replace delegated CUDA hot paths with real kernels (Phase 4):
    - `f32_gemv_topk1`
    - `f16_gemv_topk1`
    - `q4k_matvec`
@@ -214,7 +166,12 @@ What exists now is the repo-wide control plane needed to start that work without
    - `q6k_matvec`
    - `prefill_kquant`
    - `decode_token`
-6. then do the same for Vulkan
+   - `decode_token_with_state_dump_masked`
+   - KV cache lifecycle
+   - coarse `KvDispatch` bridge
+5. then do the same for Vulkan (Phase 5), keeping structure parallel to CUDA and Metal
+6. integration tests mirroring Metal decode integration style (prefill shape, KV length, masked state dump `Full`/`HOnly`/`None`, heterogeneous per-layer KV preallocation, coarse `KvDispatch` prefill/decode with Q4K fixtures)
+7. hardware-specific CI jobs for CUDA and Vulkan
 
 ## Key Files Added
 
@@ -244,8 +201,8 @@ What exists now is the repo-wide control plane needed to start that work without
 
 ## Short Summary
 
-Good progress on architecture and repo wiring.
+Phases 1-3 are done and verified green (workspace compiles, clippy clean, ~1499 tests pass across the affected crates).
 
-Not production-ready yet.
+Phases 4-8 (real CUDA/Vulkan kernels, integration tests, CI) are not started — the scaffolds still delegate to CPU.
 
-The next session should begin with compilation and repair, then move from scaffold backends to real CUDA/Vulkan kernels.
+The next session should start at Phase 4: wire `cudarc` into `larql-compute-cuda` and replace the delegated hot paths with real device kernels, beginning with the Q4K decode bench path.

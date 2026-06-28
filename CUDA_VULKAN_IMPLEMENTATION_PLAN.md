@@ -422,12 +422,29 @@ MVP success criterion:
 
 ## Current Session Status
 
-As of the latest handoff:
+As of the latest handoff (Session 2):
 
-- phases 1-3 are partially implemented
-- new CUDA/Vulkan crates exist but are still scaffold backends
-- CLI migration is in progress
-- compile verification did not happen in-session because the environment lacked Rust tooling
+- **Phase 1 (workspace + features): DONE** and verified — all feature subsets compile.
+- **Phase 2 (shared backend selection API): DONE** and verified — `ComputeBackendKind`, explicit factories, `Auto` policy, `BackendSelectionError`. The Metal arm was fixed to gate on `target_os = "macos"` (was breaking Linux + `--features metal`).
+- **Phase 3 (CLI + user-facing selection): DONE** for `run`/`walk`/`bench`/`shannon` — all accept `--backend <auto|cpu|metal|cuda|vulkan>`, `--metal` preserved as alias, routed through `crates/larql-cli/src/commands/backend.rs`. Remaining polish only: stale Metal-only help text/comments, and `run`/`walk` runtime branches still construct Metal directly in a few spots (parsing is generic, construction not yet fully generalized).
+- **Phase 4 (CUDA crate MVP): NOT STARTED** — `larql-compute-cuda` is a compileable scaffold that delegates dense/quant/KV/decode to CPU. No `cudarc`, no NVRTC, no real kernels.
+- **Phase 5 (Vulkan crate MVP): NOT STARTED** — `larql-compute-vulkan` is a parallel scaffold. No `ash`/`shaderc`, no real kernels.
+- **Phase 6 (shared GPU conventions): PARTIAL** — kernel handle + dispatch geometry structs exist in both scaffolds but are not yet exercised by real kernels.
+- **Phase 7 (capability + fallback contract): NOT RECONCILED** — scaffolds over-report. Known tension: the CUDA test `supports_reports_mvp_capabilities` asserts `supports_quant(Q4_K) == true` while the Q4K path delegates to CPU. Must reconcile with the honesty rule before real kernels land.
+- **Phase 8 (CI jobs): NOT STARTED.**
+
+Verification snapshot (CachyOS / x86_64-linux, rustc 1.96.0):
+
+- `cargo check --workspace --exclude larql-python` — green
+- `cargo check` on `metal`/`cuda`/`vulkan`/`cuda,vulkan`/`gpu-all` subsets — green
+- `cargo clippy --workspace --exclude larql-python --exclude larql-compute-metal -- -D warnings` — green
+- `cargo clippy -p larql-cli --features cuda,vulkan -- -D warnings` — green
+- `cargo test -p larql-inference --lib` → 1243 passed
+- `cargo test -p larql-cli --bins` → 243 passed
+- `cargo test -p larql-compute-cuda` → 7 passed
+- `cargo test -p larql-compute-vulkan` → 6 passed
+
+Pre-existing environment issues (not caused by this work): `larql-python` fails on PyO3 0.24 vs Python 3.14; `larql-compute-metal`'s macOS-gated *test binary* needs `blas_src` off-Apple (lib compiles fine); OpenBLAS must be installed system-wide for any test linking `larql-compute`.
 
 For the immediate restart state, see:
 

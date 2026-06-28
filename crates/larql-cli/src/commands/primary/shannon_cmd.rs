@@ -190,7 +190,13 @@ pub struct EncodeArgs {
     #[arg(long, value_name = "DIR")]
     vindex: Option<PathBuf>,
 
-    /// Use the best GPU backend for the vindex path. Required for the fast Q4K path.
+    /// Generic backend selector for the vindex path. `--metal` is a
+    /// compatibility alias for `--backend metal`. The fast Q4K forced-token
+    /// scorer requires a backend that advertises fused Q4K decode.
+    #[arg(long, default_value = "auto", value_name = "auto|cpu|metal|cuda|vulkan")]
+    backend: String,
+
+    /// Compatibility alias for `--backend metal` (macOS only).
     #[arg(long)]
     metal: bool,
 }
@@ -212,7 +218,13 @@ pub struct DecodeArgs {
     #[arg(long, value_name = "DIR")]
     vindex: Option<PathBuf>,
 
-    /// Use the best GPU backend for the vindex path. Required for the fast Q4K path.
+    /// Generic backend selector for the vindex path. `--metal` is a
+    /// compatibility alias for `--backend metal`. The fast Q4K forced-token
+    /// scorer requires a backend that advertises fused Q4K decode.
+    #[arg(long, default_value = "auto", value_name = "auto|cpu|metal|cuda|vulkan")]
+    backend: String,
+
+    /// Compatibility alias for `--backend metal` (macOS only).
     #[arg(long)]
     metal: bool,
 }
@@ -962,33 +974,22 @@ struct VindexShannonRuntime {
     backend: Box<dyn larql_compute::ComputeBackend>,
 }
 
-/// Build the Metal compute backend for `--metal`, or a clear error when the
-/// crate was built without the `gpu` feature (or off macOS). Split by `cfg`
-/// so the gpu-off build rejects through a normal `Result` — a diverging
-/// `let backend = { … return Err … }` binding would otherwise mark all
-/// downstream code unreachable and its locals unused in the gpu-off compile.
-#[cfg(all(feature = "gpu", target_os = "macos"))]
-fn metal_backend_box() -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>>
-{
-    let b = larql_compute_metal::MetalBackend::new()
-        .ok_or("Metal backend unavailable — rebuild with `--features gpu` on an M-series Mac.")?;
-    Ok(Box::new(b))
-}
-
-#[cfg(not(all(feature = "gpu", target_os = "macos")))]
-fn metal_backend_box() -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>>
-{
-    Err("`--metal` requires the `gpu` feature on macOS".into())
+/// Build the compute backend for the vindex forced-token scorer from an
+/// explicit `ComputeBackendKind`. Routed through the shared
+/// [`crate::commands::backend`] helper so `shannon` selects backends
+/// identically to `run` / `walk` / `bench`. The fused Q4 forced-token
+/// scorer (`stream_forced_full_logits`) requires a backend that advertises
+/// Q4K support, which is checked by the caller after construction.
+fn shannon_backend_box(
+    kind: larql_inference::ComputeBackendKind,
+) -> Result<Box<dyn larql_compute::ComputeBackend>, Box<dyn std::error::Error>> {
+    crate::commands::backend::compute_backend_or_err(kind)
 }
 
 fn load_vindex_runtime(
     vindex: &Path,
-    metal: bool,
+    kind: larql_inference::ComputeBackendKind,
 ) -> Result<VindexShannonRuntime, Box<dyn std::error::Error>> {
-    if !metal {
-        return Err("--vindex Shannon encode/decode currently requires --metal".into());
-    }
-
     eprintln!("loading vindex {}...", vindex.display());
     let start = Instant::now();
     let cfg = larql_vindex::load_vindex_config(vindex)?;
@@ -1007,18 +1008,20 @@ fn load_vindex_runtime(
     index.load_attn_kquant(vindex)?;
     index.load_interleaved_kquant(vindex)?;
     let _ = index.load_lm_head_kquant(vindex);
-    // `larql_compute::default_backend()` always returns CPU since the
-    // GPU-backend extraction (ADR-019) — GPU selection is the caller's
-    // responsibility. The fused Q4 forced-token scorer
-    // (`stream_forced_full_logits`) requires Metal, so build it directly here
-    // when `--metal` is set, mirroring `walk_cmd.rs` and
-    // `bench/local_runtime.rs`. The previous `default_backend()` call silently
-    // fell through to CPU and then errored out at "forced Shannon logits
-    // require a fused Q4 backend", making the `encode`/`decode` --metal path
-    // unreachable on every machine.
-    let backend: Box<dyn larql_compute::ComputeBackend> = metal_backend_box()?;
+    // GPU-backend selection is the caller's responsibility (ADR-019). The
+    // fused Q4 forced-token scorer (`stream_forced_full_logits`) requires a
+    // backend that advertises Q4K, so resolve the requested backend here and
+    // let the `supports_quant` check below reject backends that can't fused-
+    // decode Q4K (e.g. CPU, or a CUDA/Vulkan scaffold that still delegates).
+    let backend: Box<dyn larql_compute::ComputeBackend> = shannon_backend_box(kind)?;
     if !backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
-        return Err("Metal/Q4 backend is not available".into());
+        return Err(format!(
+            "selected backend `{}` does not advertise fused Q4K decode; \
+             pass `--backend metal` on an M-series Mac (or another Q4K-capable \
+             backend) for the fast Shannon vindex path",
+            backend.name()
+        )
+        .into());
     }
     eprintln!(
         "loaded vindex. {} layers, hidden_size={}, backend={} ({:.1}s)",
@@ -1039,7 +1042,9 @@ fn load_vindex_runtime(
 fn run_encode_vindex(args: EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let vindex = args.vindex.as_ref().ok_or("--vindex missing")?;
     let text = read_text(&args.input, args.bytes)?;
-    let mut rt = load_vindex_runtime(vindex, args.metal)?;
+    let kind = crate::commands::backend::backend_kind_from_args(&args.backend, args.metal)
+        .map_err(|e| format!("--backend: {e}"))?;
+    let mut rt = load_vindex_runtime(vindex, kind)?;
     let ids = encode_prompt(&rt.tokenizer, &*rt.weights.arch, &text)?;
     if ids.len() < 2 {
         return Err("input must tokenize to at least one encoded token".into());
@@ -1232,7 +1237,9 @@ fn run_decode_vindex(args: DecodeArgs) -> Result<(), Box<dyn std::error::Error>>
     let mut raw = Vec::new();
     fs::File::open(&args.input)?.read_to_end(&mut raw)?;
     let blob = ShannonFile::from_bytes(&raw)?;
-    let mut rt = load_vindex_runtime(vindex, args.metal)?;
+    let kind = crate::commands::backend::backend_kind_from_args(&args.backend, args.metal)
+        .map_err(|e| format!("--backend: {e}"))?;
+    let mut rt = load_vindex_runtime(vindex, kind)?;
     let blocks = parse_vindex_blocks(&blob.payload)?.unwrap_or_else(|| {
         vec![VindexShannonBlock {
             first_token: blob.first_token,

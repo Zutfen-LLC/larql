@@ -2147,7 +2147,9 @@ dependencies = [
  "image",
  "indicatif 0.17.11",
  "larql-compute",
+ "larql-compute-cuda",
  "larql-compute-metal",
+ "larql-compute-vulkan",
  "larql-core",
  "larql-inference",
  "larql-kv",
@@ -2185,6 +2187,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "larql-compute-cuda"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "larql-compute",
+ "larql-models",
+ "ndarray",
+]
+
+[[package]]
 name = "larql-compute-metal"
 version = "0.1.0"
 dependencies = [
@@ -2199,6 +2211,16 @@ dependencies = [
  "objc",
  "rayon",
  "serde_json",
+]
+
+[[package]]
+name = "larql-compute-vulkan"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "larql-compute",
+ "larql-models",
+ "ndarray",
 ]
 
 [[package]]
@@ -2226,7 +2248,9 @@ dependencies = [
  "futures",
  "half",
  "larql-compute",
+ "larql-compute-cuda",
  "larql-compute-metal",
+ "larql-compute-vulkan",
  "larql-core",
  "larql-kv",
  "larql-models",
@@ -2264,7 +2288,9 @@ dependencies = [
  "criterion",
  "larql-boundary",
  "larql-compute",
+ "larql-compute-cuda",
  "larql-compute-metal",
+ "larql-compute-vulkan",
  "larql-inference",
  "larql-vindex",
  "ndarray",
@@ -2443,7 +2469,9 @@ dependencies = [
  "criterion",
  "hf-hub",
  "larql-compute",
+ "larql-compute-cuda",
  "larql-compute-metal",
+ "larql-compute-vulkan",
  "larql-core",
  "larql-inference",
  "larql-models",

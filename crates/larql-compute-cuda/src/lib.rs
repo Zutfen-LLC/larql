@@ -120,7 +120,10 @@ mod tests {
 
     #[test]
     fn q4_input_format_routes_like_cpu() {
-        let cols = 32usize;
+        // `quantize_q4_k` requires the weight element count to be a multiple
+        // of 256 (one Q4_K super-block per 256 elements), so pick dimensions
+        // whose product satisfies that contract.
+        let cols = 128usize;
         let rows = 2usize;
         let weights: Vec<f32> = (0..rows * cols).map(|i| i as f32 * 0.01).collect();
         let q4 = quantize_q4_k(&weights);

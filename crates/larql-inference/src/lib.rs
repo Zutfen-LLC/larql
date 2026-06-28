@@ -177,7 +177,7 @@ fn try_compute_backend(kind: ComputeBackendKind) -> Result<Box<dyn larql_compute
         }
         ComputeBackendKind::Cpu => Ok(larql_compute::cpu_backend()),
         ComputeBackendKind::Metal => {
-            #[cfg(feature = "metal")]
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             {
                 if let Some(metal) = larql_compute_metal::metal_backend() {
                     return Ok(Box::new(metal));
@@ -185,6 +185,13 @@ fn try_compute_backend(kind: ComputeBackendKind) -> Result<Box<dyn larql_compute
                 Err(BackendSelectionError::Unavailable {
                     kind,
                     reason: "no Metal device or pipeline initialization failed".to_string(),
+                })
+            }
+            #[cfg(all(feature = "metal", not(target_os = "macos")))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "Metal backend is only available on macOS".to_string(),
                 })
             }
             #[cfg(not(feature = "metal"))]
@@ -246,7 +253,7 @@ fn try_engine_backend(kind: ComputeBackendKind) -> Result<Box<dyn EngineBackend>
         }
         ComputeBackendKind::Cpu => Ok(cpu_engine_backend()),
         ComputeBackendKind::Metal => {
-            #[cfg(feature = "metal")]
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             {
                 if let Some(metal) = larql_compute_metal::metal_backend() {
                     return Ok(Box::new(metal));
@@ -254,6 +261,13 @@ fn try_engine_backend(kind: ComputeBackendKind) -> Result<Box<dyn EngineBackend>
                 Err(BackendSelectionError::Unavailable {
                     kind,
                     reason: "no Metal device or pipeline initialization failed".to_string(),
+                })
+            }
+            #[cfg(all(feature = "metal", not(target_os = "macos")))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "Metal backend is only available on macOS".to_string(),
                 })
             }
             #[cfg(not(feature = "metal"))]
@@ -317,7 +331,7 @@ fn try_async_engine_backend(
         }
         ComputeBackendKind::Cpu => Ok(cpu_async_engine_backend()),
         ComputeBackendKind::Metal => {
-            #[cfg(feature = "metal")]
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             {
                 if let Some(metal) = larql_compute_metal::metal_backend() {
                     return Ok(Box::new(metal));
@@ -325,6 +339,13 @@ fn try_async_engine_backend(
                 Err(BackendSelectionError::Unavailable {
                     kind,
                     reason: "no Metal device or pipeline initialization failed".to_string(),
+                })
+            }
+            #[cfg(all(feature = "metal", not(target_os = "macos")))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "Metal backend is only available on macOS".to_string(),
                 })
             }
             #[cfg(not(feature = "metal"))]
@@ -658,8 +679,10 @@ mod factory_tests {
     fn unavailable_explicit_backend_errors_loudly() {
         #[cfg(not(feature = "cuda"))]
         {
-            let err = compute_backend(ComputeBackendKind::Cuda).expect_err("cuda should be gated");
-            assert!(err.to_string().contains("cuda"));
+            match compute_backend(ComputeBackendKind::Cuda) {
+                Err(err) => assert!(err.to_string().contains("cuda")),
+                Ok(_) => panic!("cuda backend should be gated when the `cuda` feature is off"),
+            }
         }
     }
 

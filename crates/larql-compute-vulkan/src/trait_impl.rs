@@ -37,14 +37,15 @@ impl MatMul for VulkanBackend {
 
     fn f16_gemv(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {
         let mut out = vec![0.0f32; n];
-        for row in 0..n {
+        for (row, out_row) in out.iter_mut().enumerate() {
             let mut acc = 0.0f32;
-            for col in 0..k {
-                let off = 2 * (row * k + col);
+            let row_off = 2 * (row * k);
+            for (col, &xv) in x.iter().enumerate().take(k) {
+                let off = row_off + 2 * col;
                 let bits = u16::from_le_bytes([w_f16[off], w_f16[off + 1]]);
-                acc += f16::from_bits(bits).to_f32() * x[col];
+                acc += f16::from_bits(bits).to_f32() * xv;
             }
-            out[row] = acc;
+            *out_row = acc;
         }
         Some(out)
     }
