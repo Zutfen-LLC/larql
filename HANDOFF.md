@@ -6,13 +6,14 @@ Resume the CUDA + Vulkan backend implementation for LARQL.
 
 ## Current Status (verified)
 
-Three sessions of work have landed:
+Four sessions of work have landed:
 
 - **Session 1** (original scaffolding): workspace/feature plumbing, explicit backend selection APIs, CUDA/Vulkan sibling crates as compileable scaffolds, partial CLI migration. Could not compile-verify (no Rust toolchain on PATH).
 - **Session 2** (verification + repair + finish CLI): brought up `cargo`/`rustc` (rustup, off-PATH), ran `cargo check`, fixed the one real compile breakage, finished the `shannon` CLI migration, and fixed three test/lint issues so the affected crates are green under `cargo test` and `cargo clippy -- -D warnings`.
 - **Session 3** (capability honesty + walk backend dispatch): reconciled CUDA/Vulkan scaffold capability reporting so delegated CPU/reference methods remain callable for parity tests but no longer advertise native `QuantMatVec`/`F32Gemv`/`F16Gemv`/`Q4_K` support. `walk`'s Q4 predict/generate path now constructs the requested backend generically and gates the fused fast path on `PrefillQ4 + DecodeToken + Q4_K`; `--backend auto` falls back to CPU when only scaffolds are present, while explicit CUDA/Vulkan fail loudly until native kernels land.
+- **Session 4** (CUDA runtime bring-up + first native kernel): wired `cudarc` into `larql-compute-cuda`, added an optional dynamic CUDA/NVRTC bootstrap, caught missing-`libcuda` probe panics so non-CUDA hosts still degrade cleanly to the scaffold path, and landed a first native `q4k_matvec` kernel launch path behind the existing CPU fallback. Capability reporting was intentionally left conservative: CUDA still does **not** advertise native Q4/decode support until more of Phase 4 is real.
 
-**The new CUDA/Vulkan crates are still scaffold backends.** They delegate most compute/KV behavior to CPU/reference paths and contain no real accelerator kernels. What exists is the repo-wide control plane needed to start that work.
+**Vulkan is still a pure scaffold backend. CUDA has now crossed into Phase 4, but only for the very first slice.** `larql-compute-cuda` has a real runtime/bootstrap layer and one native `q4k_matvec` path; everything else in CUDA and all of Vulkan still delegate most compute/KV behavior to CPU/reference paths.
 
 ### Verification snapshot (Session 2, CachyOS / x86_64-linux, rustc 1.96.0)
 
@@ -35,6 +36,11 @@ Session 3 delta verified:
 - `cargo test -p larql-inference --lib` → 1243 passed, 4 ignored
 - `cargo check -p larql-cli --features cuda,vulkan` — green
 - `cargo clippy -p larql-cli --features cuda,vulkan -- -D warnings` — green
+
+Session 4 delta verified:
+
+- `cargo check -p larql-compute-cuda` — green
+- `cargo test -p larql-compute-cuda --offline` → 9 passed
 
 Pre-existing environment issues (NOT caused by this work, NOT fixed):
 
@@ -101,7 +107,7 @@ Explicit unavailable backends return `BackendSelectionError::Unavailable`.
 - `AsyncComputeBackend` impl
 - parity-style tests
 
-**These are scaffold backends, not real CUDA/Vulkan implementations.** Current behavior:
+**These are still mostly scaffold backends, but CUDA has started its first real runtime/kernel slice.** Current behavior:
 
 - dense/quant ops mostly delegate to `CpuBackend`
 - KV dispatch delegates to CPU
@@ -113,6 +119,18 @@ Explicit unavailable backends return `BackendSelectionError::Unavailable`.
 - `crates/larql-compute-cuda/src/trait_impl.rs` and `crates/larql-compute-vulkan/src/trait_impl.rs` — rewrote `f16_gemv` inner loops to satisfy `clippy::needless_range_loop` (was failing `make ci`'s `-D warnings`).
 - `crates/larql-compute-cuda/src/lib.rs` — fixed `q4_input_format_routes_like_cpu` test: it used 64 weight elements but `quantize_q4_k` requires a multiple of 256; bumped to `cols=128, rows=2` (256 elements).
 - `crates/larql-inference/src/lib.rs` — fixed `unavailable_explicit_backend_errors_loudly` test: it used `expect_err` on `Result<Box<dyn ComputeBackend>, _>`, but `dyn ComputeBackend` isn't `Debug`, so the test didn't compile. Switched to a `match` on `Err`.
+
+**Session 4 CUDA bring-up**:
+
+- `crates/larql-compute-cuda/Cargo.toml` — added `cudarc` (dynamic loading + NVRTC).
+- `crates/larql-compute-cuda/src/backend/runtime.rs` — new runtime/bootstrap layer that:
+  - creates a CUDA context when available
+  - compiles an embedded kernel with NVRTC
+  - loads the module/function via `cudarc`
+  - catches missing-`libcuda` probe panics so non-CUDA hosts fall back to the scaffold path instead of aborting tests
+- `crates/larql-compute-cuda/src/ops.rs` — embedded a first CUDA `q4k_matvec` kernel source string.
+- `crates/larql-compute-cuda/src/backend/mod.rs` / `trait_impl.rs` — wired optional native runtime state into the backend and routed `q4k_matvec` through CUDA when available, otherwise through the existing CPU fallback.
+- `crates/larql-compute-cuda/src/lib.rs` — added tests for runtime-status reporting and CUDA-vs-CPU parity when the runtime is present.
 
 ### CLI migration
 
@@ -148,18 +166,24 @@ Files touched (Session 1 + Session 2):
 
 Not implemented yet (this is the Phase 4/5 work):
 
-- `cudarc` / `ash` / `shaderc` dependencies
-- NVRTC / SPIR-V kernel compilation
+- `ash` / `shaderc` dependencies
+- SPIR-V kernel compilation
 - real `prefill_kquant`
 - real `decode_token`
 - real `decode_token_with_state_dump_masked`
 - real KV cache lifecycle on device (`has_kv_cache`, `reset_kv_cache`, `kv_cache_len`, `truncate_kv_cache`, `preallocate_kv_cache_per_layer`)
-- real `f32_gemv` / `f16_gemv` / `q4k_*` / `q6k_*` device kernels
+- real `f32_gemv` / `f16_gemv` / most `q4k_*` / `q6k_*` device kernels
 - real coarse `KvDispatch` (currently delegates to CPU)
 - real `AsyncComputeBackend` batching (currently delegates to CPU)
 - hardware-specific CI jobs for CUDA and Vulkan
 
-What exists now is the repo-wide control plane needed to start that work without inventing it later.
+What exists now is:
+
+- the repo-wide control plane from Sessions 1-3
+- plus a real CUDA runtime/bootstrap path (`cudarc` + NVRTC)
+- plus one native CUDA matvec (`q4k_matvec`) behind the existing CPU fallback
+
+That is enough to continue Phase 4 on real kernels without first doing more control-plane work.
 
 ## Remaining Work (in suggested order)
 
@@ -168,10 +192,10 @@ What exists now is the repo-wide control plane needed to start that work without
    - sweep for stale Metal-only help text/comments across the migrated commands
    - `walk` Q4 predict/generate now constructs backends generically; `run` still has Metal-specific construction in remote FFN/MoE and `--experts` branches.
 3. ~~tighten capability reporting in CUDA/Vulkan scaffolds per the plan's Phase 7~~ DONE in Session 3. Delegated scaffold methods still exist for parity tests, but `supports(...)` and `supports_quant(...)` report false until native kernels land.
-4. replace delegated CUDA hot paths with real kernels (Phase 4):
+4. continue replacing delegated CUDA hot paths with real kernels (Phase 4):
    - `f32_gemv_topk1`
    - `f16_gemv_topk1`
-   - `q4k_matvec`
+   - `q4k_matvec` — first native slice landed in Session 4; still not capability-advertised and needs follow-on validation/optimization
    - `q4k_matmul`
    - `q6k_matvec`
    - `prefill_kquant`
@@ -188,6 +212,7 @@ What exists now is the repo-wide control plane needed to start that work without
 - `crates/larql-compute-cuda/Cargo.toml`
 - `crates/larql-compute-cuda/src/lib.rs`
 - `crates/larql-compute-cuda/src/backend/mod.rs`
+- `crates/larql-compute-cuda/src/backend/runtime.rs`
 - `crates/larql-compute-cuda/src/options.rs`
 - `crates/larql-compute-cuda/src/kernels.rs`
 - `crates/larql-compute-cuda/src/buffers.rs`
@@ -213,6 +238,6 @@ What exists now is the repo-wide control plane needed to start that work without
 
 Phases 1-3 are done and verified green (workspace compiles, clippy clean, ~1499 tests pass across the affected crates).
 
-Phases 4-5 and 8 (real CUDA/Vulkan kernels and hardware CI) are not started — the scaffolds still delegate to CPU. Phase 7's first honesty pass is done for the scaffolds.
+Phase 4 is now **started in CUDA only**: `cudarc`/NVRTC are wired, runtime fallback is panic-safe on non-CUDA hosts, and `q4k_matvec` has a first native path. Vulkan Phase 5 and hardware CI are still not started. Phase 7's first honesty pass remains in force: capabilities stay false until more of CUDA is truly native.
 
-The next session should start at Phase 4: wire `cudarc` into `larql-compute-cuda` and replace the delegated hot paths with real device kernels, beginning with the Q4K decode bench path.
+The next session should continue Phase 4 inside `larql-compute-cuda`: build on the new runtime layer and replace the next delegated hot paths (`q4k_matmul`, `q6k_matvec`, then prefill/decode) while keeping the current conservative capability contract.
