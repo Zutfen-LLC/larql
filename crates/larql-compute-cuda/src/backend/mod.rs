@@ -1,8 +1,15 @@
+mod runtime;
+
 use crate::options::BackendOptions;
+use std::sync::Arc;
+
+pub(crate) use runtime::{CudaRuntime, RuntimeError};
 
 #[derive(Debug, Clone)]
 pub struct CudaBackend {
     options: BackendOptions,
+    runtime: Option<Arc<CudaRuntime>>,
+    runtime_status: Option<String>,
 }
 
 impl CudaBackend {
@@ -11,22 +18,56 @@ impl CudaBackend {
     }
 
     pub fn with_options(options: BackendOptions) -> Result<Self, BackendInitError> {
-        if !options.allow_cpu_delegate {
-            return Err(BackendInitError::Unavailable(
-                "CUDA scaffold requires `allow_cpu_delegate=true` until native kernels land",
-            ));
+        match CudaRuntime::initialize(options.device_ordinal) {
+            Ok(runtime) => Ok(Self {
+                options,
+                runtime: Some(Arc::new(runtime)),
+                runtime_status: None,
+            }),
+            Err(err) if options.allow_cpu_delegate => Ok(Self {
+                options,
+                runtime: None,
+                runtime_status: Some(err.to_string()),
+            }),
+            Err(err) => Err(BackendInitError::Unavailable(err.to_string())),
         }
-        Ok(Self { options })
     }
 
     pub fn options(&self) -> &BackendOptions {
         &self.options
     }
+
+    pub(crate) fn native_q4k_matvec(
+        &self,
+        q4k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Option<Vec<f32>>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime
+                .launch_q4k_matvec(q4k_data, x, num_rows, hidden)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn native_runtime_available(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    pub(crate) fn runtime_summary(&self) -> &str {
+        match (&self.runtime, &self.runtime_status) {
+            (Some(runtime), _) => runtime.summary(),
+            (None, Some(status)) => status.as_str(),
+            (None, None) => "CUDA runtime unavailable; using CPU delegate scaffold",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum BackendInitError {
-    Unavailable(&'static str),
+    Unavailable(String),
 }
 
 impl std::fmt::Display for BackendInitError {

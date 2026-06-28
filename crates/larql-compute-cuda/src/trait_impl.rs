@@ -110,6 +110,9 @@ impl QuantMatVec for CudaBackend {
         num_rows: usize,
         hidden: usize,
     ) -> Option<Vec<f32>> {
+        if let Ok(Some(native)) = self.native_q4k_matvec(q4k_data, x, num_rows, hidden) {
+            return Some(native);
+        }
         CPU.q4k_matvec(q4k_data, x, num_rows, hidden)
     }
 
@@ -155,11 +158,15 @@ impl DecodeBackend for CudaBackend {}
 
 impl ComputeBackend for CudaBackend {
     fn name(&self) -> &str {
-        "cuda (cpu-delegate scaffold)"
+        if self.native_runtime_available() {
+            "cuda (native q4k matvec + cpu fallback)"
+        } else {
+            "cuda (cpu-delegate scaffold)"
+        }
     }
 
     fn device_info(&self) -> String {
-        "CUDA scaffold backend (CPU delegate)".to_string()
+        self.runtime_summary().to_string()
     }
 
     fn supports(&self, cap: Capability) -> bool {

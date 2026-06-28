@@ -122,6 +122,15 @@ mod tests {
     }
 
     #[test]
+    fn device_info_reports_native_or_fallback_status() {
+        let info = backend().device_info();
+        assert!(
+            info.contains("CUDA") || info.contains("cuda"),
+            "device_info should mention CUDA status: {info}"
+        );
+    }
+
+    #[test]
     fn q4_input_format_routes_like_cpu() {
         // `quantize_q4_k` requires the weight element count to be a multiple
         // of 256 (one Q4_K super-block per 256 elements), so pick dimensions
@@ -132,5 +141,28 @@ mod tests {
         let q4 = quantize_q4_k(&weights);
         let x = vec![0.1f32; cols];
         assert!(backend().q4k_matvec(&q4, &x, rows, cols).is_some());
+    }
+
+    #[test]
+    fn native_q4k_matvec_matches_cpu_when_runtime_is_available() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let [(gate, _), _, _] = index.interleaved_kquant_layer_data(0).unwrap();
+        let x = vec![0.01f32; weights.hidden_size];
+        let rows = index.num_features(0);
+
+        let got = backend
+            .native_q4k_matvec(gate, &x, rows, weights.hidden_size)
+            .expect("native q4k_matvec should launch when runtime is available")
+            .expect("runtime available should expose native q4k_matvec");
+        let want = CpuBackend
+            .q4k_matvec(gate, &x, rows, weights.hidden_size)
+            .unwrap();
+        assert_eq!(got, want);
     }
 }

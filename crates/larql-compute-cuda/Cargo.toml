@@ -9,6 +9,7 @@ keywords = ["cuda", "gpu", "quantization", "matmul"]
 categories = ["science"]
 
 [dependencies]
+cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-11040"] }
 larql-compute = { path = "../larql-compute" }
 larql-models = { path = "../larql-models" }
 ndarray = "0.16"
