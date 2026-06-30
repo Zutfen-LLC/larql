@@ -124,6 +124,9 @@ impl QuantMatVec for CudaBackend {
         num_rows: usize,
         hidden: usize,
     ) -> Option<(Vec<f32>, Vec<f32>)> {
+        if let Ok(Some(native)) = self.native_q4k_dual_matvec(q4k_a, q4k_b, x, num_rows, hidden) {
+            return Some(native);
+        }
         CPU.q4k_dual_matvec(q4k_a, q4k_b, x, num_rows, hidden)
     }
 

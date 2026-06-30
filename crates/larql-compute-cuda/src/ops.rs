@@ -24,6 +24,22 @@ pub const Q4K_MATMUL_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const Q6K_MATMUL_KERNEL: KernelHandle = KernelHandle::new(
+    "q6k_matmul",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
+pub const Q4K_DUAL_MATVEC_KERNEL: KernelHandle = KernelHandle::new(
+    "q4k_dual_matvec",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -264,5 +280,219 @@ extern "C" __global__ void q4k_matmul(
 
     // out is [seq, rows] row-major.
     out[s * n + row] = acc;
+}
+"#;
+
+/// Amortised Q6_K × f32 matmul: `out[s, r] = sum_k W[r, k] * X[s, k]`. One
+/// (row, seq) pair per thread. Each Q6_K super-block (210 bytes, 256
+/// weights) is decoded once into registers and FMA'd across all `seq`
+/// columns, mirroring the CPU `q6k_matmul_into` amortised pattern. Output is
+/// `[seq, rows]` row-major to match the CPU contract.
+pub const Q6K_MATMUL_CUDA_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+union larql_half_bits {
+    unsigned short bits;
+    __half half;
+};
+
+__device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
+    larql_half_bits value;
+    value.bits = bits;
+    return __half2float(value.half);
+}
+
+extern "C" __global__ void q6k_matmul(
+    const unsigned char* w6k,
+    const float* x,
+    float* out,
+    unsigned int n,
+    unsigned int k,
+    unsigned int seq)
+{
+    // Flatten (row, seq) into a 1D thread index.
+    const unsigned int tile = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int row = tile / seq;
+    const unsigned int s = tile % seq;
+    if (row >= n || s >= seq) {
+        return;
+    }
+
+    const unsigned int superblocks = k / 256u;
+    const unsigned int bytes_per_row = superblocks * 210u;
+    const unsigned char* row_w = w6k + row * bytes_per_row;
+    const float* x_row = x + s * k;
+    float acc = 0.0f;
+
+    for (unsigned int sb = 0; sb < superblocks; ++sb) {
+        const unsigned char* block = row_w + sb * 210u;
+        const unsigned char* ql = block;
+        const unsigned char* qh = block + 128u;
+        const unsigned char* scales = block + 192u;
+        const float d = larql_decode_f16(
+            static_cast<unsigned short>(block[208]) |
+            (static_cast<unsigned short>(block[209]) << 8u));
+
+        for (unsigned int j = 0u; j < 16u; ++j) {
+            const float sc = d * static_cast<float>(static_cast<signed char>(scales[j]));
+            const unsigned int base = j * 16u;
+            const unsigned int x_base = sb * 256u + base;
+            float dot = 0.0f;
+            #pragma unroll
+            for (unsigned int i = 0u; i < 16u; ++i) {
+                const unsigned int idx = base + i;
+                const unsigned int lo4 = (idx & 1u) == 0u
+                    ? (ql[idx >> 1u] & 0x0Fu)
+                    : ((ql[idx >> 1u] >> 4u) & 0x0Fu);
+                const unsigned int hi2 = (qh[idx >> 2u] >> ((idx & 3u) * 2u)) & 0x03u;
+                const float val = static_cast<float>(
+                    static_cast<signed int>((lo4 | (hi2 << 4u)) - 32u));
+                dot += val * x_row[x_base + i];
+            }
+            acc += sc * dot;
+        }
+    }
+
+    // out is [seq, rows] row-major.
+    out[s * n + row] = acc;
+}
+"#;
+
+/// Fused two-weight Q4_K matvec sharing one input vector. One row per
+/// thread. Both weight matrices `w_a` and `w_b` have identical `(rows,
+/// hidden)` shape and the same input `x`. Writes `out_a[row] = W_a · x`
+/// and `out_b[row] = W_b · x`. Mirrors the CPU `q4k_dual_matvec_into`
+/// contract (gate+up projections share `x`).
+pub const Q4K_DUAL_MATVEC_CUDA_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+union larql_half_bits {
+    unsigned short bits;
+    __half half;
+};
+
+__device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
+    larql_half_bits value;
+    value.bits = bits;
+    return __half2float(value.half);
+}
+
+extern "C" __global__ void q4k_dual_matvec(
+    const unsigned char* w_a,
+    const unsigned char* w_b,
+    const float* x,
+    float* out_a,
+    float* out_b,
+    unsigned int n,
+    unsigned int k)
+{
+    const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) {
+        return;
+    }
+
+    const unsigned int superblocks = k / 256u;
+    const unsigned int bytes_per_row = superblocks * 144u;
+    const unsigned char* row_a = w_a + row * bytes_per_row;
+    const unsigned char* row_b = w_b + row * bytes_per_row;
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+
+    for (unsigned int sb = 0; sb < superblocks; ++sb) {
+        const unsigned char* block_a = row_a + sb * 144u;
+        const unsigned char* block_b = row_b + sb * 144u;
+
+        const float d_a = larql_decode_f16(
+            static_cast<unsigned short>(block_a[0]) |
+            (static_cast<unsigned short>(block_a[1]) << 8u));
+        const float dmin_a = larql_decode_f16(
+            static_cast<unsigned short>(block_a[2]) |
+            (static_cast<unsigned short>(block_a[3]) << 8u));
+        const float d_b = larql_decode_f16(
+            static_cast<unsigned short>(block_b[0]) |
+            (static_cast<unsigned short>(block_b[1]) << 8u));
+        const float dmin_b = larql_decode_f16(
+            static_cast<unsigned short>(block_b[2]) |
+            (static_cast<unsigned short>(block_b[3]) << 8u));
+        const unsigned char* pa = block_a + 4u;
+        const unsigned char* pb = block_b + 4u;
+
+        unsigned int scales_a[8u];
+        unsigned int mins_a[8u];
+        unsigned int scales_b[8u];
+        unsigned int mins_b[8u];
+        #pragma unroll
+        for (unsigned int j = 0u; j < 4u; ++j) {
+            scales_a[j] = static_cast<unsigned int>(pa[j]) & 0x3Fu;
+            mins_a[j] = static_cast<unsigned int>(pa[j + 4u]) & 0x3Fu;
+            scales_a[j + 4u] = (static_cast<unsigned int>(pa[j + 8u]) & 0x0Fu)
+                | ((static_cast<unsigned int>(pa[j]) >> 6u) << 4u);
+            mins_a[j + 4u] = (static_cast<unsigned int>(pa[j + 8u]) >> 4u)
+                | ((static_cast<unsigned int>(pa[j + 4u]) >> 6u) << 4u);
+            scales_b[j] = static_cast<unsigned int>(pb[j]) & 0x3Fu;
+            mins_b[j] = static_cast<unsigned int>(pb[j + 4u]) & 0x3Fu;
+            scales_b[j + 4u] = (static_cast<unsigned int>(pb[j + 8u]) & 0x0Fu)
+                | ((static_cast<unsigned int>(pb[j]) >> 6u) << 4u);
+            mins_b[j + 4u] = (static_cast<unsigned int>(pb[j + 8u]) >> 4u)
+                | ((static_cast<unsigned int>(pb[j + 4u]) >> 6u) << 4u);
+        }
+
+        const unsigned char* qa = block_a + 16u;
+        const unsigned char* qb = block_b + 16u;
+        const unsigned int x_sb_base = sb * 256u;
+
+        #pragma unroll
+        for (unsigned int g = 0u; g < 4u; ++g) {
+            const unsigned int sb_lo = 2u * g;
+            const unsigned int sb_hi = 2u * g + 1u;
+            const float sc_a_lo = d_a * static_cast<float>(scales_a[sb_lo]);
+            const float sc_a_hi = d_a * static_cast<float>(scales_a[sb_hi]);
+            const float mn_a_lo = dmin_a * static_cast<float>(mins_a[sb_lo]);
+            const float mn_a_hi = dmin_a * static_cast<float>(mins_a[sb_hi]);
+            const float sc_b_lo = d_b * static_cast<float>(scales_b[sb_lo]);
+            const float sc_b_hi = d_b * static_cast<float>(scales_b[sb_hi]);
+            const float mn_b_lo = dmin_b * static_cast<float>(mins_b[sb_lo]);
+            const float mn_b_hi = dmin_b * static_cast<float>(mins_b[sb_hi]);
+
+            const unsigned int x_lo_base = x_sb_base + sb_lo * 32u;
+            const unsigned int x_hi_base = x_sb_base + sb_hi * 32u;
+            const unsigned char* chunk_a = qa + g * 32u;
+            const unsigned char* chunk_b = qb + g * 32u;
+
+            float sum_x_lo = 0.0f;
+            float dot_a_lo = 0.0f;
+            float dot_b_lo = 0.0f;
+            #pragma unroll
+            for (unsigned int l = 0u; l < 32u; ++l) {
+                const float xv = x[x_lo_base + l];
+                const unsigned char byte_a = chunk_a[l];
+                const unsigned char byte_b = chunk_b[l];
+                sum_x_lo += xv;
+                dot_a_lo += static_cast<float>(byte_a & 0x0Fu) * xv;
+                dot_b_lo += static_cast<float>(byte_b & 0x0Fu) * xv;
+            }
+
+            float sum_x_hi = 0.0f;
+            float dot_a_hi = 0.0f;
+            float dot_b_hi = 0.0f;
+            #pragma unroll
+            for (unsigned int l = 0u; l < 32u; ++l) {
+                const float xv = x[x_hi_base + l];
+                const unsigned char byte_a = chunk_a[l];
+                const unsigned char byte_b = chunk_b[l];
+                sum_x_hi += xv;
+                dot_a_hi += static_cast<float>((byte_a >> 4u) & 0x0Fu) * xv;
+                dot_b_hi += static_cast<float>((byte_b >> 4u) & 0x0Fu) * xv;
+            }
+
+            acc_a += sc_a_lo * dot_a_lo - mn_a_lo * sum_x_lo;
+            acc_a += sc_a_hi * dot_a_hi - mn_a_hi * sum_x_hi;
+            acc_b += sc_b_lo * dot_b_lo - mn_b_lo * sum_x_lo;
+            acc_b += sc_b_hi * dot_b_hi - mn_b_hi * sum_x_hi;
+        }
+    }
+
+    out_a[row] = acc_a;
+    out_b[row] = acc_b;
 }
 "#;

@@ -83,6 +83,46 @@ impl CudaBackend {
         }
     }
 
+    /// Native Q6_K amortised matmul. Not yet routed through the
+    /// `QuantMatVec` trait (no `q6k_matmul` trait method exists — the
+    /// amortised Q6_K matmul is currently a CPU-only free function in
+    /// `ffn/weight.rs::quant_matmul`). Exposed here so the prefill-kquant
+    /// backend-routing slice can dispatch through it without re-adding the
+    /// kernel. Parity-verified when a CUDA runtime is present.
+    #[allow(dead_code)]
+    pub(crate) fn native_q6k_matmul(
+        &self,
+        q6k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+        seq_len: usize,
+    ) -> Result<Option<Vec<f32>>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime
+                .launch_q6k_matmul(q6k_data, x, num_rows, hidden, seq_len)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn native_q4k_dual_matvec(
+        &self,
+        q4k_a: &[u8],
+        q4k_b: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Option<(Vec<f32>, Vec<f32>)>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime
+                .launch_q4k_dual_matvec(q4k_a, q4k_b, x, num_rows, hidden)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn native_runtime_available(&self) -> bool {
         self.runtime.is_some()
     }
