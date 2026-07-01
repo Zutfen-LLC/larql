@@ -83,13 +83,9 @@ impl CudaBackend {
         }
     }
 
-    /// Native Q6_K amortised matmul. Not yet routed through the
-    /// `QuantMatVec` trait (no `q6k_matmul` trait method exists — the
-    /// amortised Q6_K matmul is currently a CPU-only free function in
-    /// `ffn/weight.rs::quant_matmul`). Exposed here so the prefill-kquant
-    /// backend-routing slice can dispatch through it without re-adding the
-    /// kernel. Parity-verified when a CUDA runtime is present.
-    #[allow(dead_code)]
+    /// Native Q6_K amortised matmul, routed through the
+    /// `QuantMatVec::q6k_matmul` trait method (native-then-CPU fallback).
+    /// Parity-verified when a CUDA runtime is present.
     pub(crate) fn native_q6k_matmul(
         &self,
         q6k_data: &[u8],

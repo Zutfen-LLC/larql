@@ -145,6 +145,17 @@ impl QuantMatVec for VulkanBackend {
         CPU.q6k_matvec(q6k_data, x, num_rows, hidden)
     }
 
+    fn q6k_matmul(
+        &self,
+        q6k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+        seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        CPU.q6k_matmul(q6k_data, x, num_rows, hidden, seq_len)
+    }
+
     fn supports_quant(&self, format: larql_compute::QuantFormat) -> bool {
         let _ = format;
         false

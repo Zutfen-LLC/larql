@@ -203,9 +203,15 @@ pub fn run_attention_with_kv_backend(
 
     let (mut q, mut k, mut v) = if let Some(attn) = attn_q4k {
         (
-            crate::ffn::weight::quant_proj(attn[0].0, attn[0].1, &h_norm, q_dim, in_dim, seq_len),
-            crate::ffn::weight::quant_proj(attn[1].0, attn[1].1, &h_norm, kv_dim, in_dim, seq_len),
-            crate::ffn::weight::quant_proj(attn[2].0, attn[2].1, &h_norm, kv_dim, in_dim, seq_len),
+            crate::ffn::weight::quant_proj(
+                attn[0].0, attn[0].1, &h_norm, q_dim, in_dim, seq_len, backend,
+            ),
+            crate::ffn::weight::quant_proj(
+                attn[1].0, attn[1].1, &h_norm, kv_dim, in_dim, seq_len, backend,
+            ),
+            crate::ffn::weight::quant_proj(
+                attn[2].0, attn[2].1, &h_norm, kv_dim, in_dim, seq_len, backend,
+            ),
         )
     } else {
         let wq = weights.tensor(&arch.attn_q_key(layer))?;
@@ -295,7 +301,9 @@ pub fn run_attention_with_kv_backend(
         arch.attn_logit_softcapping(),
     );
     let mut o = if let Some(attn) = attn_q4k {
-        crate::ffn::weight::quant_proj(attn[3].0, attn[3].1, &attn_out, in_dim, q_dim, seq_len)
+        crate::ffn::weight::quant_proj(
+            attn[3].0, attn[3].1, &attn_out, in_dim, q_dim, seq_len, backend,
+        )
     } else {
         let wo = weights.tensor(&arch.attn_o_key(layer))?;
         crate::dot_proj_gpu(&attn_out, wo, backend)

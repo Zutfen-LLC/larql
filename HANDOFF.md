@@ -14,8 +14,9 @@ Four sessions of work have landed:
 - **Session 4** (CUDA runtime bring-up + first native kernel): wired `cudarc` into `larql-compute-cuda`, added an optional dynamic CUDA/NVRTC bootstrap, caught missing-`libcuda` probe panics so non-CUDA hosts still degrade cleanly to the scaffold path, and landed a first native `q4k_matvec` kernel launch path behind the existing CPU fallback. Capability reporting was intentionally left conservative: CUDA still does **not** advertise native Q4/decode support until more of Phase 4 is real.
 - **Session 5** (CUDA: two more native kernels): added native `q6k_matvec` and `q4k_matmul` CUDA kernels alongside the existing `q4k_matvec`, wired them through `CudaRuntime` (one combined NVRTC module holding all three entry points) → `CudaBackend` → `trait_impl`, each behind its CPU fallback. Added runtime-gated parity tests for both. Capability reporting stays conservative (still `supports_quant(Q4_K) == false` etc.). Also applied a `cargo fmt --all` pass that folded in the prior session's pending reformatting.
 - **Session 6** (CUDA: remaining k-quant kernels): added native `q6k_matmul` and `q4k_dual_matvec` CUDA kernels. `q4k_dual_matvec` is wired through the existing `QuantMatVec::q4k_dual_matvec` trait method (native-then-CPU fallback) with a delegate parity test plus a runtime-gated native parity test. `q6k_matmul` is loaded into the NVRTC module and exposed via `CudaBackend::native_q6k_matmul`, but is **not yet routed through a trait method** — there is no `q6k_matmul` on `QuantMatVec` (the amortised Q6_K matmul is currently a CPU-only free function `q6k_matmul_into` called from `ffn/weight.rs::quant_matmul`); it's staged with `#[allow(dead_code)]` for the prefill-kquant backend-routing slice, parity-verified by a runtime-gated test. Combined NVRTC unit now holds five entry points. Capability reporting unchanged (still conservative: `supports`/`supports_quant` all false).
+- **Session 7** (route staged `q6k_matmul` through a trait method + backend-aware `quant_matmul`): added a `QuantMatVec::q6k_matmul` trait method (default `None`) — the Q6_K twin of `q4k_matmul`. Implemented it on `CpuBackend` (wraps `q6k_matmul_into`), routed CUDA's `q6k_matmul` through the trait (native-then-CPU fallback) and dropped the `#[allow(dead_code)]` on `native_q6k_matmul`/`launch_q6k_matmul` so the staged kernel is now live, and added a Vulkan delegate. Made `ffn/weight.rs::quant_matmul` + `quant_proj` backend-aware: both take `Option<&dyn ComputeBackend>`; the Q6_K arm first tries the backend's `q6k_matmul` and falls back to the CPU free function on `None`. Threaded the backend through the attention `gpu.rs` Q/K/V/O `quant_proj` calls (so the Q6_K V projection routes through the backend when present); `Q4kMatmulFfn` (no backend field) keeps passing `None`, preserving its current behaviour. Added three parity tests: a `larql-compute` trait test (CPU matches free function + default returns `None`), a CUDA always-runs delegate test, and a CUDA runtime-gated native-via-trait test. Capability reporting unchanged (still conservative).
 
-**Vulkan is still a pure scaffold backend. CUDA now has five native k-quant kernels** — `q4k_matvec`, `q6k_matvec`, `q4k_matmul`, `q6k_matmul`, and `q4k_dual_matvec` — each behind its CPU fallback and gated by an optional runtime. `q4k_dual_matvec` is fully trait-routed; `q6k_matmul` is staged for the prefill slice. Everything else in CUDA and all of Vulkan still delegate most compute/KV behavior to CPU/reference paths.
+**Vulkan is still a pure scaffold backend. CUDA now has five native k-quant kernels** — `q4k_matvec`, `q6k_matvec`, `q4k_matmul`, `q6k_matmul`, and `q4k_dual_matvec` — each behind its CPU fallback and gated by an optional runtime. As of Session 7, **all five are trait-routed** through `QuantMatVec` (`q4k_dual_matvec` since Session 6, `q6k_matmul` since Session 7); the Q6_K arm of `ffn/weight.rs::quant_matmul` now dispatches through a backend's `q6k_matmul` when one is supplied, so the staged `q6k_matmul` CUDA kernel is live. Everything else in CUDA and all of Vulkan still delegate most compute/KV behavior to CPU/reference paths.
 
 ### Verification snapshot (Session 2, CachyOS / x86_64-linux, rustc 1.96.0)
 
@@ -71,6 +72,22 @@ Session 6 delta verified (CachyOS / x86_64-linux, rustc 1.96.0, no CUDA hardware
 - `cargo test -p larql-inference --lib` → 1243 passed, 4 ignored
 - `cargo test -p larql-cli --bins` → 243 passed
 - `cargo test -p larql-compute-vulkan` → 6 passed
+
+Session 7 delta verified (CachyOS / x86_64-linux, rustc 1.96.0, no CUDA hardware on host):
+
+- `cargo fmt --all -- --check` — clean
+- `cargo check -p larql-compute -p larql-compute-cuda -p larql-compute-vulkan` — green
+- `cargo check --workspace --exclude larql-python` — green
+- `cargo check -p larql-cli --features cuda,vulkan` — green
+- `cargo check -p larql-inference --features gpu-all` — green
+- `cargo clippy --workspace --exclude larql-python --exclude larql-compute-metal -- -D warnings` — green
+- `cargo clippy -p larql-cli --features cuda,vulkan -- -D warnings` — green
+- `cargo clippy -p larql-compute-cuda --tests -- -D warnings` — green
+- `cargo test -p larql-compute --lib` → 734 passed (up from 733; +1 trait test)
+- `cargo test -p larql-compute-cuda` → 16 passed (up from 14; +2: q6k_matmul trait delegate + native-via-trait)
+- `cargo test -p larql-compute-vulkan` → 7 passed (up from 6; +1: q6k_matmul delegate)
+- `cargo test -p larql-inference --lib` → 1243 passed, 4 ignored
+- `cargo test -p larql-cli --bins` → 243 passed
 
 Pre-existing environment issues (NOT caused by this work, NOT fixed):
 
@@ -220,7 +237,7 @@ Not implemented yet (this is the Phase 4/5 work):
 - real `decode_token_with_state_dump_masked`
 - real KV cache lifecycle on device (`has_kv_cache`, `reset_kv_cache`, `kv_cache_len`, `truncate_kv_cache`, `preallocate_kv_cache_per_layer`)
 - real `f32_gemv` / `f16_gemv` / most remaining `q4k_*` / `q6k_*` device kernels (CUDA now has `q4k_matvec`, `q6k_matvec`, `q4k_matmul`, `q6k_matmul`, `q4k_dual_matvec`; still missing `q4_matvec`, `q4_vecmat`; `q6k_matmul` is loaded but not yet trait-routed — see below)
-- routing of the amortised Q6_K matmul through a backend (CUDA `q6k_matmul` kernel exists and is parity-verified via `native_q6k_matmul`, but `QuantMatVec` has no `q6k_matmul` trait method; the CPU path uses the free function `q6k_matmul_into` directly in `ffn/weight.rs::quant_matmul`. The prefill-kquant slice should add the trait method + backend routing to bring this kernel live.)
+- routing of the amortised Q6_K matmul through a backend ~~— DONE in Session 7.~~ `QuantMatVec::q6k_matmul` added (default `None`); CpuBackend wraps `q6k_matmul_into`; CUDA routes native-then-CPU; the Q6_K arm of `ffn/weight.rs::quant_matmul` dispatches through a backend's `q6k_matmul` when supplied (attention `gpu.rs` Q/K/V/O pass the backend; `Q4kMatmulFfn` passes `None`).
 - real coarse `KvDispatch` (currently delegates to CPU)
 - real `AsyncComputeBackend` batching (currently delegates to CPU)
 - hardware-specific CI jobs for CUDA and Vulkan
@@ -247,14 +264,14 @@ That is enough to continue Phase 4 on the prefill/decode path.
     - ~~`q4k_matmul`~~ — landed Session 5; still not capability-advertised
     - ~~`q6k_matvec`~~ — landed Session 5; still not capability-advertised
     - ~~`q4k_dual_matvec`~~ — landed Session 6 (trait-routed); still not capability-advertised
-    - ~~`q6k_matmul`~~ — landed Session 6 (loaded + parity-verified, NOT yet trait-routed — needs a `QuantMatVec::q6k_matmul` trait method + backend routing to go live)
+    - ~~`q6k_matmul`~~ — landed Session 6 (kernel) + Session 7 (trait-routed: `QuantMatVec::q6k_matmul` + `ffn/weight.rs::quant_matmul` Q6_K arm dispatch); still not capability-advertised
     - `q4_matvec` / `q4_vecmat`
     - `prefill_kquant`
     - `decode_token`
     - `decode_token_with_state_dump_masked`
     - KV cache lifecycle
     - coarse `KvDispatch` bridge
-    - (routing) add `q6k_matmul` to `QuantMatVec` + dispatch `ffn/weight.rs::quant_matmul`'s Q6_K arm through the backend so the staged CUDA kernel goes live
+    - (routing) ~~add `q6k_matmul` to `QuantMatVec` + dispatch `ffn/weight.rs::quant_matmul`'s Q6_K arm through the backend~~ DONE in Session 7 — the staged CUDA kernel is live
 5. then do the same for Vulkan (Phase 5), keeping structure parallel to CUDA and Metal
 6. integration tests mirroring Metal decode integration style (prefill shape, KV length, masked state dump `Full`/`HOnly`/`None`, heterogeneous per-layer KV preallocation, coarse `KvDispatch` prefill/decode with Q4K fixtures)
 7. hardware-specific CI jobs for CUDA and Vulkan
@@ -290,6 +307,6 @@ That is enough to continue Phase 4 on the prefill/decode path.
 
 Phases 1-3 are done and verified green (workspace compiles, clippy clean, ~1502 tests pass across the affected crates).
 
-Phase 4 is **underway in CUDA**: `cudarc`/NVRTC are wired, runtime fallback is panic-safe on non-CUDA hosts, and five native k-quant kernels are live — `q4k_matvec`, `q6k_matvec`, `q4k_matmul`, `q6k_matmul`, and `q4k_dual_matvec` — each behind its CPU fallback with runtime-gated parity tests. `q4k_dual_matvec` is fully trait-routed; `q6k_matmul` is loaded + parity-verified but staged (no `QuantMatVec::q6k_matmul` trait method yet — routing belongs to the prefill-kquant slice). Vulkan Phase 5 and hardware CI are still not started. Phase 7's honesty pass remains in force: capabilities stay false until more of CUDA is truly native (prefill/decode still delegate to CPU).
+Phase 4 is **underway in CUDA**: `cudarc`/NVRTC are wired, runtime fallback is panic-safe on non-CUDA hosts, and five native k-quant kernels are live — `q4k_matvec`, `q6k_matvec`, `q4k_matmul`, `q6k_matmul`, and `q4k_dual_matvec` — each behind its CPU fallback with runtime-gated parity tests. As of Session 7 **all five are trait-routed** through `QuantMatVec`, and the `q6k_matmul` kernel is now live end-to-end: the Q6_K arm of `ffn/weight.rs::quant_matmul` dispatches through a backend's `q6k_matmul` (attention `gpu.rs` passes its backend; `Q4kMatmulFfn` keeps the CPU path). Vulkan Phase 5 and hardware CI are still not started. Phase 7's honesty pass remains in force: capabilities stay false until more of CUDA is truly native (prefill/decode still delegate to CPU).
 
-The next session should continue Phase 4 inside `larql-compute-cuda`: the next high-value slice is the prefill/decode path (`prefill_kquant`, `decode_token`, KV cache lifecycle, + routing the staged `q6k_matmul` kernel through a new `QuantMatVec::q6k_matmul` trait method) — that is what unlocks capability advertisement and the `walk`/`bench` fast paths for CUDA — while keeping the current conservative capability contract.
+The next session should continue Phase 4 inside `larql-compute-cuda`: the next high-value slice is the prefill/decode path (`prefill_kquant`, `decode_token`, `decode_token_with_state_dump_masked`, KV cache lifecycle) — that is what unlocks capability advertisement and the `walk`/`bench` fast paths for CUDA — while keeping the current conservative capability contract. With the k-quant matmul/matvec kernels all trait-routed, the remaining `f32_gemv_topk1`/`f16_gemv_topk1`/`q4_matvec`/`q4_vecmat` kernels and the full decode pipeline are the remaining Phase 4 surface.

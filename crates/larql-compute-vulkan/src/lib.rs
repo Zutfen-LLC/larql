@@ -99,6 +99,20 @@ mod tests {
     }
 
     #[test]
+    fn q6k_matmul_matches_cpu_delegate() {
+        let rows = 3usize;
+        let cols = 256usize;
+        let seq = 2usize;
+        let matrix: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.004).cos()).collect();
+        let q6k = quantize_q6_k(&matrix);
+        let x: Vec<f32> = (0..seq * cols).map(|i| (i as f32 * 0.02).sin()).collect();
+
+        let got = backend().q6k_matmul(&q6k, &x, rows, cols, seq).unwrap();
+        let want = CpuBackend.q6k_matmul(&q6k, &x, rows, cols, seq).unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[test]
     fn f32_gemv_topk1_matches_manual_reference() {
         let w = Array2::from_shape_vec(
             (4, 3),

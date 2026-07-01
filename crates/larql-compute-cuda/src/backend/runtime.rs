@@ -318,10 +318,9 @@ impl CudaRuntime {
             .map_err(|err| RuntimeError::context("reading CUDA q4k_matmul output", err))
     }
 
-    /// Amortised Q6_K × f32 matmul launch. Kept alongside the loaded kernel
-    /// handle for the prefill-kquant backend-routing slice; unused until
-    /// that slice routes `quant_matmul`'s Q6_K arm through `native_q6k_matmul`.
-    #[allow(dead_code)]
+    /// Amortised Q6_K × f32 matmul launch. Routed live through
+    /// `QuantMatVec::q6k_matmul` (native-then-CPU fallback) and
+    /// `ffn/weight.rs::quant_matmul`'s Q6_K arm.
     pub(crate) fn launch_q6k_matmul(
         &self,
         q6k_data: &[u8],

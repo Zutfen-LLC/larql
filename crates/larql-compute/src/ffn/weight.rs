@@ -13,6 +13,13 @@ use larql_models::{ModelWeights, WeightsView};
 /// materialising the full f32 weight. Returns `None` for a format without a
 /// kernel so the caller can dequantise + matmul. Shared by the q4k-direct FFN
 /// and the attention Q/K/V/O projections.
+///
+/// When `backend` is `Some`, the Q6_K arm first tries the backend's
+/// `QuantMatVec::q6k_matmul` (native GPU kernel when available) and falls back
+/// to the CPU free function `q6k_matmul_into` on `None`. The Q4_K arm always
+/// uses the CPU free function — there is no backend-routing asymmetry to
+/// preserve here yet, and `Q4kMatmulFfn` (the dominant prefill caller) passes
+/// `None` to keep its current behaviour unchanged.
 pub(crate) fn quant_matmul(
     bytes: &[u8],
     fmt: &str,
@@ -20,20 +27,44 @@ pub(crate) fn quant_matmul(
     rows: usize,
     cols: usize,
     seq: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Option<Array2<f32>> {
-    let mut out = vec![0.0f32; seq * rows];
     match fmt {
-        "Q4_K" => crate::cpu::ops::q4_common::q4k_matmul_into(&mut out, x, bytes, rows, cols, seq),
-        "Q6_K" => crate::cpu::ops::q4_common::q6k_matmul_into(&mut out, x, bytes, rows, cols, seq),
-        _ => return None,
+        "Q4_K" => {
+            let mut out = vec![0.0f32; seq * rows];
+            crate::cpu::ops::q4_common::q4k_matmul_into(&mut out, x, bytes, rows, cols, seq);
+            Some(
+                Array2::from_shape_vec((seq, rows), out)
+                    .expect("quant_matmul output shape [seq, rows]"),
+            )
+        }
+        "Q6_K" => {
+            if let Some(b) = backend {
+                if let Some(native) = b.q6k_matmul(bytes, x, rows, cols, seq) {
+                    return Some(
+                        Array2::from_shape_vec((seq, rows), native)
+                            .expect("quant_matmul output shape [seq, rows]"),
+                    );
+                }
+            }
+            let mut out = vec![0.0f32; seq * rows];
+            crate::cpu::ops::q4_common::q6k_matmul_into(&mut out, x, bytes, rows, cols, seq);
+            Some(
+                Array2::from_shape_vec((seq, rows), out)
+                    .expect("quant_matmul output shape [seq, rows]"),
+            )
+        }
+        _ => None,
     }
-    Some(Array2::from_shape_vec((seq, rows), out).expect("quant_matmul output shape [seq, rows]"))
 }
 
 /// Project `x[seq, in_dim] -> [seq, out_rows]` from quantised weight bytes;
 /// `in_dim` must be a 256-multiple. Q4_K/Q6_K read the bytes once via the
 /// amortised kernel; any other format dequantises then matmuls. Used for the
 /// FFN gate/up and the attention Q/K/V/O projections.
+///
+/// `backend` routes the Q6_K arm through `QuantMatVec::q6k_matmul` when
+/// available (see [`quant_matmul`]); pass `None` for the CPU-only path.
 pub(crate) fn quant_proj(
     bytes: &[u8],
     fmt: &str,
@@ -41,6 +72,7 @@ pub(crate) fn quant_proj(
     out_rows: usize,
     in_dim: usize,
     seq: usize,
+    backend: Option<&dyn ComputeBackend>,
 ) -> Array2<f32> {
     if let Some(r) = quant_matmul(
         bytes,
@@ -49,6 +81,7 @@ pub(crate) fn quant_proj(
         out_rows,
         in_dim,
         seq,
+        backend,
     ) {
         r
     } else {
@@ -175,7 +208,7 @@ impl Q4kMatmulFfn<'_> {
         in_dim: usize,
         seq: usize,
     ) -> Array2<f32> {
-        quant_proj(bytes, fmt, x, out_rows, in_dim, seq)
+        quant_proj(bytes, fmt, x, out_rows, in_dim, seq, None)
     }
 
     /// down projection: `act[seq, intermediate] -> [seq, hidden]`. The stored
@@ -195,7 +228,7 @@ impl Q4kMatmulFfn<'_> {
         let act_slice = act.as_slice().expect("contiguous activation");
 
         if inter_padded == intermediate {
-            if let Some(r) = quant_matmul(bytes, fmt, act_slice, hidden, inter_padded, seq) {
+            if let Some(r) = quant_matmul(bytes, fmt, act_slice, hidden, inter_padded, seq, None) {
                 return r;
             }
             let w =
@@ -210,7 +243,7 @@ impl Q4kMatmulFfn<'_> {
             padded[s * inter_padded..s * inter_padded + intermediate]
                 .copy_from_slice(&act_slice[s * intermediate..(s + 1) * intermediate]);
         }
-        if let Some(r) = quant_matmul(bytes, fmt, &padded, hidden, inter_padded, seq) {
+        if let Some(r) = quant_matmul(bytes, fmt, &padded, hidden, inter_padded, seq, None) {
             return r;
         }
         let w_full =

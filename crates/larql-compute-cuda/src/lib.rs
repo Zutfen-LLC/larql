@@ -230,6 +230,56 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// The trait-routed `QuantMatVec::q6k_matmul` must agree with the CPU
+    /// free function on every host — when no CUDA runtime is present it
+    /// delegates to `CpuBackend::q6k_matmul` (the amortised CPU kernel),
+    /// so this always runs and pins the fallback contract.
+    #[test]
+    fn q6k_matmul_trait_matches_cpu_free_function() {
+        use larql_compute::backend::QuantMatVec;
+        let backend = backend();
+
+        let rows = 4usize;
+        let cols = 256usize;
+        let seq = 3usize;
+        let matrix: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.003).sin()).collect();
+        let q6k = quantize_q6_k(&matrix);
+        let x: Vec<f32> = (0..seq * cols).map(|i| (i as f32 * 0.01).cos()).collect();
+
+        let got = backend
+            .q6k_matmul(&q6k, &x, rows, cols, seq)
+            .expect("q6k_matmul trait method must not return None");
+        let mut want = vec![0.0f32; seq * rows];
+        larql_compute::cpu::ops::q4_common::q6k_matmul_into(&mut want, &x, &q6k, rows, cols, seq);
+        assert_eq!(got, want);
+    }
+
+    /// When a CUDA runtime is present, the trait-routed `q6k_matmul` must
+    /// pick the native kernel and match the CPU reference. Runtime-gated:
+    /// no-op on hosts without CUDA (like this CI host).
+    #[test]
+    fn q6k_matmul_trait_native_matches_cpu_when_runtime_is_available() {
+        use larql_compute::backend::QuantMatVec;
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+
+        let rows = 4usize;
+        let cols = 256usize;
+        let seq = 3usize;
+        let matrix: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.003).sin()).collect();
+        let q6k = quantize_q6_k(&matrix);
+        let x: Vec<f32> = (0..seq * cols).map(|i| (i as f32 * 0.01).cos()).collect();
+
+        let got = backend
+            .q6k_matmul(&q6k, &x, rows, cols, seq)
+            .expect("q6k_matmul trait method must not return None");
+        let mut want = vec![0.0f32; seq * rows];
+        larql_compute::cpu::ops::q4_common::q6k_matmul_into(&mut want, &x, &q6k, rows, cols, seq);
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn native_q4k_dual_matvec_matches_cpu_when_runtime_is_available() {
         let backend = backend();
