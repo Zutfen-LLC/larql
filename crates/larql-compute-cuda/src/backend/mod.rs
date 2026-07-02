@@ -119,6 +119,38 @@ impl CudaBackend {
         }
     }
 
+    /// Native dense f32 GEMV. `w` is the row-major `[n, k]` slice behind an
+    /// `ArrayView2` — the launcher checks the slice length against `n*k`.
+    pub(crate) fn native_f32_gemv(
+        &self,
+        w: &[f32],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Option<Vec<f32>>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime.launch_f32_gemv(w, x, num_rows, hidden).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Native dense f16 GEMV. `w_f16` is a row-major `[n, k]` little-endian
+    /// f16 byte slice.
+    pub(crate) fn native_f16_gemv(
+        &self,
+        w_f16: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Option<Vec<f32>>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime
+                .launch_f16_gemv(w_f16, x, num_rows, hidden)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn native_runtime_available(&self) -> bool {
         self.runtime.is_some()
     }

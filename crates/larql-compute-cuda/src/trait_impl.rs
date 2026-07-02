@@ -7,6 +7,16 @@ use crate::CudaBackend;
 
 const CPU: CpuBackend = CpuBackend;
 
+/// FLOP threshold mirroring Metal's `calibration::DEFAULT_FLOP_THRESHOLD`.
+/// Below this the htod-upload + sync + dtoh-download round-trip costs more
+/// than the CPU reference loop, so the native kernel is skipped and the CPU
+/// fallback runs. This keeps the per-token dense lm_head decode path on the
+/// zero-copy mmap CPU path instead of re-uploading gigabytes every token.
+/// (The CPU fallback is reached via the `MatMul` trait's default
+/// `matmul_transb`-based path in the caller; `f32_gemv` returning `None`
+/// there is the intended fast-path-fallback signal.)
+const GEMV_FLOP_THRESHOLD: usize = 500_000_000;
+
 impl MatMul for CudaBackend {
     fn matmul(&self, a: ArrayView2<f32>, b: ArrayView2<f32>) -> Array2<f32> {
         CPU.matmul(a, b)
@@ -17,25 +27,47 @@ impl MatMul for CudaBackend {
     }
 
     fn f32_gemv(&self, w: ArrayView2<f32>, x: &[f32]) -> Option<Vec<f32>> {
-        let mut out = Vec::with_capacity(w.nrows());
+        let n = w.nrows();
+        let k = w.ncols();
+        // Below the flop threshold the htod + sync + dtoh round-trip costs
+        // more than the CPU loop, so skip the native kernel and let the
+        // caller fall back to the `matmul_transb` CPU path.
+        if 2 * n * k < GEMV_FLOP_THRESHOLD {
+            return None;
+        }
+        // Try the native path only when the view is row-major contiguous —
+        // the launcher uploads a flat `[n, k]` slice. Non-contiguous views
+        // (e.g. transposed) fall through to the CPU reference.
+        if let Some(w_slice) = w.as_slice() {
+            if let Ok(Some(native)) = self.native_f32_gemv(w_slice, x, n, k) {
+                return Some(native);
+            }
+        }
+        let mut out = Vec::with_capacity(n);
         for row in w.rows() {
             out.push(row.iter().zip(x).map(|(a, b)| *a * *b).sum());
         }
         Some(out)
     }
 
-    fn f32_gemv_topk1(&self, w: ArrayView2<f32>, x: &[f32]) -> Option<(u32, f32)> {
-        self.f32_gemv(w, x).and_then(|scores| {
-            scores
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(idx, score)| (idx as u32, score))
-        })
+    /// Not specialised on CUDA yet. Returning `None` (the trait default)
+    /// keeps the greedy-decode top-1 path on the CPU reference / fused path
+    /// instead of the un-fused full-upload + full-readback + CPU argmax that
+    /// `f32_gemv` would otherwise force. A native fused-argmax kernel is the
+    /// Phase 4 follow-up that will override this.
+    fn f32_gemv_topk1(&self, _w: ArrayView2<f32>, _x: &[f32]) -> Option<(u32, f32)> {
+        None
     }
 
     fn f16_gemv(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {
+        // Below the flop threshold the htod + sync + dtoh round-trip costs
+        // more than the CPU loop; skip the native kernel (see `f32_gemv`).
+        if 2 * n * k < GEMV_FLOP_THRESHOLD {
+            return None;
+        }
+        if let Ok(Some(native)) = self.native_f16_gemv(w_f16, x, n, k) {
+            return Some(native);
+        }
         let mut out = vec![0.0f32; n];
         for (row, out_row) in out.iter_mut().enumerate() {
             let mut acc = 0.0f32;
@@ -50,15 +82,15 @@ impl MatMul for CudaBackend {
         Some(out)
     }
 
-    fn f16_gemv_topk1(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<(u32, f32)> {
-        self.f16_gemv(w_f16, x, n, k).and_then(|scores| {
-            scores
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(idx, score)| (idx as u32, score))
-        })
+    /// Not specialised on CUDA yet — see `f32_gemv_topk1`.
+    fn f16_gemv_topk1(
+        &self,
+        _w_f16: &[u8],
+        _x: &[f32],
+        _n: usize,
+        _k: usize,
+    ) -> Option<(u32, f32)> {
+        None
     }
 
     fn f16_gemv_topk(
@@ -69,6 +101,8 @@ impl MatMul for CudaBackend {
         k: usize,
         top_k: usize,
     ) -> Option<Vec<(u32, f32)>> {
+        // Gated by the same flop threshold as `f16_gemv`; below it the
+        // `f16_gemv` call returns `None` and this returns `None` too.
         let mut pairs: Vec<_> = self
             .f16_gemv(w_f16, x, n, k)?
             .into_iter()
@@ -182,7 +216,7 @@ impl DecodeBackend for CudaBackend {}
 impl ComputeBackend for CudaBackend {
     fn name(&self) -> &str {
         if self.native_runtime_available() {
-            "cuda (native q4k matvec + cpu fallback)"
+            "cuda (native k-quant + gemv + cpu fallback)"
         } else {
             "cuda (cpu-delegate scaffold)"
         }

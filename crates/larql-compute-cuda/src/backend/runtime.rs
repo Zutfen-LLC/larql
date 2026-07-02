@@ -6,6 +6,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 
 use crate::ops::{
+    F16_GEMV_CUDA_SRC, F16_GEMV_KERNEL, F32_GEMV_CUDA_SRC, F32_GEMV_KERNEL,
     Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC, Q4K_MATMUL_KERNEL,
     Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
     Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL,
@@ -24,6 +25,8 @@ pub(crate) struct CudaRuntime {
     #[allow(dead_code)]
     q6k_matmul: CudaFunction,
     q4k_dual_matvec: CudaFunction,
+    f32_gemv: CudaFunction,
+    f16_gemv: CudaFunction,
     summary: String,
 }
 
@@ -52,7 +55,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}"
         );
         let ptx = compile_ptx_with_opts(
             &combined_src,
@@ -80,6 +83,12 @@ impl CudaRuntime {
         let q4k_dual_matvec = module
             .load_function(Q4K_DUAL_MATVEC_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading q4k_dual_matvec CUDA function", err))?;
+        let f32_gemv = module
+            .load_function(F32_GEMV_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading f32_gemv CUDA function", err))?;
+        let f16_gemv = module
+            .load_function(F16_GEMV_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading f16_gemv CUDA function", err))?;
         let stream = context.default_stream();
 
         Ok(Self {
@@ -91,8 +100,10 @@ impl CudaRuntime {
             q4k_matmul,
             q6k_matmul,
             q4k_dual_matvec,
+            f32_gemv,
+            f16_gemv,
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv loaded, remaining ops use CPU fallback"
             ),
         })
     }
@@ -488,6 +499,155 @@ impl CudaRuntime {
             .clone_dtoh(&out_b_dev)
             .map_err(|err| RuntimeError::context("reading CUDA q4k_dual_matvec out_b", err))?;
         Ok((out_a, out_b))
+    }
+
+    /// Dense f32 GEMV launch. `w` is a row-major `[n, k]` slice (the
+    /// flattened `ArrayView2` from `MatMul::f32_gemv`). Returns `out[n]`.
+    pub(crate) fn launch_f32_gemv(
+        &self,
+        w: &[f32],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        if num_rows == 0 {
+            return Ok(Vec::new());
+        }
+        // The device indexes in 64-bit, but `n`/`k` are passed as 32-bit
+        // kernel args, so a dim exceeding u32::MAX would truncate. Reject
+        // before the length check / upload (falling back to CPU) rather than
+        // launching a truncated dispatch.
+        if num_rows > u32::MAX as usize || hidden > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "f32_gemv shape ({num_rows}, {hidden}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        if x.len() != hidden {
+            return Err(RuntimeError::usage(format!(
+                "f32_gemv expected x.len() == hidden ({hidden}), got {}",
+                x.len()
+            )));
+        }
+        let expected = num_rows
+            .checked_mul(hidden)
+            .ok_or_else(|| RuntimeError::usage("f32_gemv size overflow".to_string()))?;
+        if w.len() != expected {
+            return Err(RuntimeError::usage(format!(
+                "f32_gemv expected {expected} weight elements for shape ({num_rows}, {hidden}), got {}",
+                w.len()
+            )));
+        }
+
+        let w_dev = self
+            .stream
+            .clone_htod(w)
+            .map_err(|err| RuntimeError::context("uploading f32 weights to CUDA", err))?;
+        let x_dev = self
+            .stream
+            .clone_htod(x)
+            .map_err(|err| RuntimeError::context("uploading f32 activation to CUDA", err))?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(num_rows)
+            .map_err(|err| RuntimeError::context("allocating CUDA f32_gemv output buffer", err))?;
+        let threads_x = F32_GEMV_KERNEL.geometry.threads_per_group[0];
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.f32_gemv);
+        launch_args
+            .arg(&w_dev)
+            .arg(&x_dev)
+            .arg(&mut out_dev)
+            .arg(&n)
+            .arg(&k);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA f32_gemv kernel", err))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing CUDA f32_gemv stream", err))?;
+        self.stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading CUDA f32_gemv output", err))
+    }
+
+    /// Dense f16 GEMV launch. `w_f16` is a row-major `[n, k]` little-endian
+    /// f16 byte slice (same layout as `MatMul::f16_gemv`). Returns `out[n]`.
+    pub(crate) fn launch_f16_gemv(
+        &self,
+        w_f16: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        if num_rows == 0 {
+            return Ok(Vec::new());
+        }
+        // The device computes the per-row byte offset as `2 * row * k` and
+        // passes `n`/`k` as 32-bit. Guard against shapes that would exceed
+        // the 32-bit kernel argument range before the length check / upload.
+        // (A future kernel taking 64-bit grid dims would lift this.)
+        if num_rows > u32::MAX as usize || hidden > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "f16_gemv shape ({num_rows}, {hidden}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        if x.len() != hidden {
+            return Err(RuntimeError::usage(format!(
+                "f16_gemv expected x.len() == hidden ({hidden}), got {}",
+                x.len()
+            )));
+        }
+        let expected = num_rows
+            .checked_mul(hidden)
+            .and_then(|elems| elems.checked_mul(2))
+            .ok_or_else(|| RuntimeError::usage("f16_gemv byte-size overflow".to_string()))?;
+        if w_f16.len() != expected {
+            return Err(RuntimeError::usage(format!(
+                "f16_gemv expected {expected} f16 bytes for shape ({num_rows}, {hidden}), got {}",
+                w_f16.len()
+            )));
+        }
+
+        let w_dev = self
+            .stream
+            .clone_htod(w_f16)
+            .map_err(|err| RuntimeError::context("uploading f16 weights to CUDA", err))?;
+        let x_dev = self
+            .stream
+            .clone_htod(x)
+            .map_err(|err| RuntimeError::context("uploading f16 activation to CUDA", err))?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(num_rows)
+            .map_err(|err| RuntimeError::context("allocating CUDA f16_gemv output buffer", err))?;
+        let threads_x = F16_GEMV_KERNEL.geometry.threads_per_group[0];
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.f16_gemv);
+        launch_args
+            .arg(&w_dev)
+            .arg(&x_dev)
+            .arg(&mut out_dev)
+            .arg(&n)
+            .arg(&k);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA f16_gemv kernel", err))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing CUDA f16_gemv stream", err))?;
+        self.stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading CUDA f16_gemv output", err))
     }
 }
 

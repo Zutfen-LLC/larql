@@ -99,16 +99,17 @@ mod tests {
     }
 
     #[test]
-    fn f32_gemv_topk1_matches_manual_reference() {
+    fn f32_gemv_topk1_returns_none_no_fused_kernel() {
+        // `f32_gemv_topk1` intentionally returns `None` on CUDA until a native
+        // fused-argmax kernel lands, so greedy decode keeps the CPU fast path
+        // instead of the un-fused full-upload + full-readback + CPU argmax.
         let w = Array2::from_shape_vec(
             (3, 4),
             vec![1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0],
         )
         .unwrap();
         let x = vec![0.5, 0.75, 1.0, -2.0];
-        let got = backend().f32_gemv_topk1(w.view(), &x).unwrap();
-        assert_eq!(got.0, 2);
-        assert_eq!(got.1, 3.0);
+        assert!(backend().f32_gemv_topk1(w.view(), &x).is_none());
     }
 
     #[test]
@@ -326,5 +327,168 @@ mod tests {
             .q4k_matmul(gate, &x, rows, weights.hidden_size, seq_len)
             .unwrap();
         assert_eq!(got, want);
+    }
+
+    /// Dense f32 GEMV trait path is flop-threshold-gated: below
+    /// `GEMV_FLOP_THRESHOLD` (500M flops) it returns `None` so the caller
+    /// keeps the zero-copy CPU `matmul_transb` path instead of paying the
+    /// htod + sync + dtoh round-trip. Tiny shape here is well below the
+    /// threshold, so the gate fires on every host (CUDA or not).
+    #[test]
+    fn f32_gemv_returns_none_below_flop_threshold() {
+        let n = 6usize;
+        let k = 8usize;
+        let w: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01).sin()).collect();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.1).cos()).collect();
+        let w_view = ndarray::ArrayView2::from_shape((n, k), &w).unwrap();
+
+        assert!(backend().f32_gemv(w_view, &x).is_none());
+    }
+
+    /// The `f32_gemv_topk1` trait method intentionally returns `None` on
+    /// CUDA (no fused-argmax kernel yet), so greedy decode keeps the CPU
+    /// fast path instead of the un-fused full-upload gemv.
+    #[test]
+    fn f32_gemv_topk1_returns_none() {
+        let n = 6usize;
+        let k = 8usize;
+        let w: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01).sin()).collect();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.1).cos()).collect();
+        let w_view = ndarray::ArrayView2::from_shape((n, k), &w).unwrap();
+
+        assert!(backend().f32_gemv_topk1(w_view, &x).is_none());
+    }
+
+    #[test]
+    fn native_f32_gemv_matches_cpu_when_runtime_is_available() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+
+        let n = 6usize;
+        let k = 8usize;
+        let w: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01).sin()).collect();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.1).cos()).collect();
+
+        let got = backend
+            .native_f32_gemv(&w, &x, n, k)
+            .expect("native f32_gemv should launch when runtime is available")
+            .expect("runtime available should expose native f32_gemv");
+        let want: Vec<f32> = (0..n)
+            .map(|row| (0..k).map(|col| w[row * k + col] * x[col]).sum::<f32>())
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// Native f32 GEMV rejects dims exceeding the 32-bit kernel argument
+    /// limit. The device indexes in 64-bit, so the only remaining overflow
+    /// surface is the `n`/`k` kernel args being u32; the host guard fires on
+    // the dims before any upload. Runtime-gated.
+    #[test]
+    fn native_f32_gemv_rejects_dim_exceeding_u32_index_limit() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+        let n = u32::MAX as usize + 1;
+        let k = 16usize;
+        let w: Vec<f32> = Vec::new();
+        let x: Vec<f32> = Vec::new();
+        let result = backend.native_f32_gemv(&w, &x, n, k);
+        assert!(
+            matches!(result, Err(ref e) if e.to_string().contains("32-bit kernel index limit")),
+            "expected shape-rejection error, got {result:?}"
+        );
+    }
+
+    /// Dense f16 GEMV trait path is flop-threshold-gated (see
+    /// `f32_gemv_returns_none_below_flop_threshold`). Tiny shape is well
+    /// below the threshold, so the gate fires on every host.
+    #[test]
+    fn f16_gemv_returns_none_below_flop_threshold() {
+        let n = 6usize;
+        let k = 8usize;
+        let mut w_f16 = Vec::with_capacity(n * k * 2);
+        for i in 0..n * k {
+            let bits = half::f16::from_f32((i as f32 * 0.01).sin()).to_bits();
+            w_f16.extend_from_slice(&bits.to_le_bytes());
+        }
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.1).cos()).collect();
+
+        assert!(backend().f16_gemv(&w_f16, &x, n, k).is_none());
+    }
+
+    /// `f16_gemv_topk1` returns `None` on CUDA (no fused-argmax kernel yet).
+    #[test]
+    fn f16_gemv_topk1_returns_none() {
+        let n = 6usize;
+        let k = 8usize;
+        let mut w_f16 = Vec::with_capacity(n * k * 2);
+        for i in 0..n * k {
+            let bits = half::f16::from_f32((i as f32 * 0.01).sin()).to_bits();
+            w_f16.extend_from_slice(&bits.to_le_bytes());
+        }
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.1).cos()).collect();
+
+        assert!(backend().f16_gemv_topk1(&w_f16, &x, n, k).is_none());
+    }
+
+    #[test]
+    fn native_f16_gemv_matches_cpu_when_runtime_is_available() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+
+        let n = 6usize;
+        let k = 8usize;
+        let w_f32: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.01).sin()).collect();
+        let mut w_f16 = Vec::with_capacity(n * k * 2);
+        for v in &w_f32 {
+            let bits = half::f16::from_f32(*v).to_bits();
+            w_f16.extend_from_slice(&bits.to_le_bytes());
+        }
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.1).cos()).collect();
+
+        let got = backend
+            .native_f16_gemv(&w_f16, &x, n, k)
+            .expect("native f16_gemv should launch when runtime is available")
+            .expect("runtime available should expose native f16_gemv");
+        let want: Vec<f32> = (0..n)
+            .map(|row| {
+                (0..k)
+                    .map(|col| {
+                        let off = 2 * (row * k + col);
+                        let bits = u16::from_le_bytes([w_f16[off], w_f16[off + 1]]);
+                        half::f16::from_bits(bits).to_f32() * x[col]
+                    })
+                    .sum::<f32>()
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// Native f16 GEMV rejects dims exceeding the 32-bit kernel argument
+    /// limit. The device now indexes bytes in 64-bit, so the only remaining
+    /// overflow surface is the `n`/`k` kernel args themselves being u32; the
+    /// host guard fires on the dims before any upload. Runtime-gated.
+    #[test]
+    fn native_f16_gemv_rejects_dim_exceeding_u32_index_limit() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+        // A dim just above u32::MAX — the guard fires before the length
+        // check, so a zero-length dummy slice is fine.
+        let n = u32::MAX as usize + 1;
+        let k = 16usize;
+        let w_f16: Vec<u8> = Vec::new();
+        let x: Vec<f32> = Vec::new();
+        let result = backend.native_f16_gemv(&w_f16, &x, n, k);
+        assert!(
+            matches!(result, Err(ref e) if e.to_string().contains("32-bit kernel index limit")),
+            "expected shape-rejection error, got {result:?}"
+        );
     }
 }

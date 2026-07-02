@@ -40,6 +40,22 @@ pub const Q4K_DUAL_MATVEC_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const F32_GEMV_KERNEL: KernelHandle = KernelHandle::new(
+    "f32_gemv",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
+pub const F16_GEMV_KERNEL: KernelHandle = KernelHandle::new(
+    "f16_gemv",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -494,5 +510,82 @@ extern "C" __global__ void q4k_dual_matvec(
 
     out_a[row] = acc_a;
     out_b[row] = acc_b;
+}
+"#;
+
+/// Dense f32 matrix-vector multiply: `out[row] = sum_col W[row, col] * x[col]`.
+/// One row per thread. `w` is row-major `[n, k]`. Matches the CPU
+/// `MatMul::f32_gemv` contract (input is `ArrayView2<f32>`, flattened to a
+/// row-major slice by the launcher).
+pub const F32_GEMV_CUDA_SRC: &str = r#"
+extern "C" __global__ void f32_gemv(
+    const float* w,
+    const float* x,
+    float* out,
+    unsigned int n,
+    unsigned int k)
+{
+    const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) {
+        return;
+    }
+
+    // 64-bit element offset: a large dense matrix (n*k > 2^32 f32) would
+    // wrap a 32-bit `row * k` and read out-of-bounds. The host launcher
+    // guards the same limit.
+    const float* row_w = w + (unsigned long long)row * (unsigned long long)k;
+    float acc = 0.0f;
+    #pragma unroll 4
+    for (unsigned int col = 0u; col < k; ++col) {
+        acc += row_w[col] * x[col];
+    }
+    out[row] = acc;
+}
+"#;
+
+/// Dense f16 matrix-vector multiply: `out[row] = sum_col W[row, col] * x[col]`.
+/// One row per thread. `w_f16` is row-major `[n, k]` little-endian f16 bytes
+/// (the same layout the CPU `MatMul::f16_gemv` consumes). f16 → f32 decode
+/// reuses the Q6_K helper union so the two halves of the module share one
+/// decoder.
+pub const F16_GEMV_CUDA_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+union larql_half_bits {
+    unsigned short bits;
+    __half half;
+};
+
+__device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
+    larql_half_bits value;
+    value.bits = bits;
+    return __half2float(value.half);
+}
+
+extern "C" __global__ void f16_gemv(
+    const unsigned char* w_f16,
+    const float* x,
+    float* out,
+    unsigned int n,
+    unsigned int k)
+{
+    const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) {
+        return;
+    }
+
+    // Use 64-bit byte/element offsets: a large vocab head (e.g. 262144 x 8192
+    // f16) exceeds 2^31 bytes, so a 32-bit `2u * row * k` would wrap and read
+    // out-of-bounds global memory. The host launcher guards the same limit.
+    const unsigned long long row_bytes = (unsigned long long)2u * (unsigned long long)row * (unsigned long long)k;
+    float acc = 0.0f;
+    #pragma unroll 4
+    for (unsigned int col = 0u; col < k; ++col) {
+        const unsigned long long off = row_bytes + (unsigned long long)2u * (unsigned long long)col;
+        const unsigned short bits = static_cast<unsigned short>(w_f16[off])
+            | (static_cast<unsigned short>(w_f16[off + 1u]) << 8u);
+        acc += larql_decode_f16(bits) * x[col];
+    }
+    out[row] = acc;
 }
 "#;
