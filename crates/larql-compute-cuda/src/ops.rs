@@ -96,6 +96,38 @@ pub const RMS_NORM_HEADS_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const GEGGLU_SILU_KERNEL: KernelHandle = KernelHandle::new(
+    "geglu_silu",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
+pub const GEGGLU_GELU_TANH_KERNEL: KernelHandle = KernelHandle::new(
+    "geglu_gelu_tanh",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
+pub const ACTIVATION_SILU_KERNEL: KernelHandle = KernelHandle::new(
+    "activation_silu",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
+pub const ACTIVATION_GELU_TANH_KERNEL: KernelHandle = KernelHandle::new(
+    "activation_gelu_tanh",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -961,5 +993,104 @@ extern "C" __global__ void rms_norm_heads(
         const float w = (has_weight != 0) ? (offset + weight[d]) : 1.0f;
         out_row[head_off + d] = (x_row[head_off + d] / rms) * w;
     }
+}
+"#;
+
+/// GEGLU SiLU: `out[i] = silu(gate[i]) * up[i]` where
+/// `silu(x) = x / (1 + exp(-x))`. One thread per element. The device twin of
+/// `larql_compute::cpu::ops::geglu::geglu_silu` and the host
+/// `apply_activation_gated(Silu, …)` path in `pipeline.rs`. Element-wise, no
+/// reduction — no shared memory or cross-thread coordination.
+pub const GEGGLU_SILU_CUDA_SRC: &str = r#"
+extern "C" __global__ void geglu_silu(
+    const float* gate,
+    const float* up,
+    float* out,
+    unsigned int n)
+{
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) {
+        return;
+    }
+    const float g = gate[tid];
+    out[tid] = (g / (1.0f + expf(-g))) * up[tid];
+}
+"#;
+
+/// GEGLU GELU-tanh: `out[i] = gelu_tanh(gate[i]) * up[i]` where
+/// `gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+/// One thread per element. The device twin of the host
+/// `apply_activation_gated(GeluTanh, …)` path.
+///
+/// The tanh argument is clamped to ±15 before `tanhf`: NVIDIA's `tanhf`
+/// uses `(expf(2y) - 1) / (expf(2y) + 1)`, which overflows f32 and returns NaN
+/// once `|y|` ≳ 44 (ln(f32_max) / 2). For gate values around ±50 the
+/// argument `y` hits ~50 and poisons the activation with NaNs. Clamping at
+/// ±15 is exact: `tanhf(15)` differs from 1.0f by < 1e-13, far below f32
+/// precision, so the output is unchanged at any representable gate value.
+/// The host reference does not clamp (Rust's `tanh` saturates to ±1.0
+/// without overflow), so the clamp is a numerical-safe parity-preserving
+/// fix, not a behavioural difference.
+pub const GEGGLU_GELU_TANH_CUDA_SRC: &str = r#"
+extern "C" __global__ void geglu_gelu_tanh(
+    const float* gate,
+    const float* up,
+    float* out,
+    unsigned int n)
+{
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) {
+        return;
+    }
+    const float g = gate[tid];
+    // GELU with tanh approximation:
+    //   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    const float c = 0.7978845608f; // sqrt(2/pi)
+    float y = c * (g + 0.044715f * g * g * g);
+    y = fminf(fmaxf(y, -15.0f), 15.0f);
+    const float t = tanhf(y);
+    out[tid] = (0.5f * g * (1.0f + t)) * up[tid];
+}
+"#;
+
+/// Standard (non-gated) SiLU activation: `out[i] = silu(x[i]) = x[i] / (1 +
+/// exp(-x[i]))`. One thread per element. The device twin of the host
+/// `apply_activation_std(Silu, …)` path. Used when `ffn_type == Standard`
+/// (up → activation → down, no gate).
+pub const ACTIVATION_SILU_CUDA_SRC: &str = r#"
+extern "C" __global__ void activation_silu(
+    const float* input,
+    float* out,
+    unsigned int n)
+{
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) {
+        return;
+    }
+    const float x = input[tid];
+    out[tid] = x / (1.0f + expf(-x));
+}
+"#;
+
+/// Standard (non-gated) GELU-tanh activation: `out[i] = gelu_tanh(x[i])`.
+/// One thread per element. The device twin of the host
+/// `apply_activation_std(GeluTanh, …)` path. The tanh argument is clamped
+/// to ±15 (see `geglu_gelu_tanh` for the rationale).
+pub const ACTIVATION_GELU_TANH_CUDA_SRC: &str = r#"
+extern "C" __global__ void activation_gelu_tanh(
+    const float* input,
+    float* out,
+    unsigned int n)
+{
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) {
+        return;
+    }
+    const float x = input[tid];
+    const float c = 0.7978845608f; // sqrt(2/pi)
+    float y = c * (x + 0.044715f * x * x * x);
+    y = fminf(fmaxf(y, -15.0f), 15.0f);
+    const float t = tanhf(y);
+    out[tid] = 0.5f * x * (1.0f + t);
 }
 "#;

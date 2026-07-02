@@ -7,12 +7,14 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 
 use crate::ops::{
-    F16_GEMV_CUDA_SRC, F16_GEMV_KERNEL, F32_GEMV_CUDA_SRC, F32_GEMV_KERNEL, KV_APPEND_CUDA_SRC,
-    KV_APPEND_KERNEL, Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC,
-    Q4K_MATMUL_KERNEL, Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q4_MATVEC_CUDA_SRC,
-    Q4_MATVEC_KERNEL, Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
-    Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL, RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC,
-    RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
+    ACTIVATION_GELU_TANH_CUDA_SRC, ACTIVATION_GELU_TANH_KERNEL, ACTIVATION_SILU_CUDA_SRC,
+    ACTIVATION_SILU_KERNEL, F16_GEMV_CUDA_SRC, F16_GEMV_KERNEL, F32_GEMV_CUDA_SRC, F32_GEMV_KERNEL,
+    GEGGLU_GELU_TANH_CUDA_SRC, GEGGLU_GELU_TANH_KERNEL, GEGGLU_SILU_CUDA_SRC, GEGGLU_SILU_KERNEL,
+    KV_APPEND_CUDA_SRC, KV_APPEND_KERNEL, Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL,
+    Q4K_MATMUL_CUDA_SRC, Q4K_MATMUL_KERNEL, Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL,
+    Q4_MATVEC_CUDA_SRC, Q4_MATVEC_KERNEL, Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL,
+    Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL, Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL,
+    RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC, RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
 };
 
 #[derive(Debug)]
@@ -35,6 +37,10 @@ pub(crate) struct CudaRuntime {
     kv_append: CudaFunction,
     rms_norm: CudaFunction,
     rms_norm_heads: CudaFunction,
+    geglu_silu: CudaFunction,
+    geglu_gelu_tanh: CudaFunction,
+    activation_silu: CudaFunction,
+    activation_gelu_tanh: CudaFunction,
     summary: String,
 }
 
@@ -63,7 +69,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}"
         );
         let ptx = compile_ptx_with_opts(
             &combined_src,
@@ -112,6 +118,20 @@ impl CudaRuntime {
         let rms_norm_heads = module
             .load_function(RMS_NORM_HEADS_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading rms_norm_heads CUDA function", err))?;
+        let geglu_silu = module
+            .load_function(GEGGLU_SILU_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading geglu_silu CUDA function", err))?;
+        let geglu_gelu_tanh = module
+            .load_function(GEGGLU_GELU_TANH_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading geglu_gelu_tanh CUDA function", err))?;
+        let activation_silu = module
+            .load_function(ACTIVATION_SILU_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading activation_silu CUDA function", err))?;
+        let activation_gelu_tanh = module
+            .load_function(ACTIVATION_GELU_TANH_KERNEL.identifier)
+            .map_err(|err| {
+                RuntimeError::context("loading activation_gelu_tanh CUDA function", err)
+            })?;
         let stream = context.default_stream();
 
         Ok(Self {
@@ -130,8 +150,12 @@ impl CudaRuntime {
             kv_append,
             rms_norm,
             rms_norm_heads,
+            geglu_silu,
+            geglu_gelu_tanh,
+            activation_silu,
+            activation_gelu_tanh,
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh loaded, remaining ops use CPU fallback"
             ),
         })
     }
@@ -1173,6 +1197,183 @@ impl CudaRuntime {
         out.copy_from_slice(&host_out);
         Ok(())
     }
+
+    /// Native GEGLU-SiLU launch: `out[i] = silu(gate[i]) * up[i]`, one
+    /// thread per element. `gate`, `up`, `out` are each `n` elements.
+    pub(crate) fn launch_geglu_silu(
+        &self,
+        gate: &[f32],
+        up: &[f32],
+        out: &mut [f32],
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary(&self.geglu_silu, gate, up, out, n, "geglu_silu")
+    }
+
+    /// Native GEGLU-GELU-tanh launch: `out[i] = gelu_tanh(gate[i]) * up[i]`.
+    pub(crate) fn launch_geglu_gelu_tanh(
+        &self,
+        gate: &[f32],
+        up: &[f32],
+        out: &mut [f32],
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary(&self.geglu_gelu_tanh, gate, up, out, n, "geglu_gelu_tanh")
+    }
+
+    /// Native standard SiLU launch: `out[i] = silu(x[i])`. `up` is unused
+    /// (the binary kernel signature is shared via a no-op second buffer is
+    /// avoided here — the standalone `activation_silu` kernel takes a single
+    /// input).
+    pub(crate) fn launch_activation_silu(
+        &self,
+        input: &[f32],
+        out: &mut [f32],
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_unary(&self.activation_silu, input, out, n, "activation_silu")
+    }
+
+    /// Native standard GELU-tanh launch: `out[i] = gelu_tanh(x[i])`.
+    pub(crate) fn launch_activation_gelu_tanh(
+        &self,
+        input: &[f32],
+        out: &mut [f32],
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_unary(
+            &self.activation_gelu_tanh,
+            input,
+            out,
+            n,
+            "activation_gelu_tanh",
+        )
+    }
+
+    /// Shared binary elementwise dispatch (gate, up → out). All four
+    /// activation kernels take the same `(gate, up, out, n)` arg layout,
+    /// so the upload/launch/sync/readback is identical — only the function
+    /// handle + context string differ.
+    fn launch_elementwise_binary(
+        &self,
+        func: &CudaFunction,
+        gate: &[f32],
+        up: &[f32],
+        out: &mut [f32],
+        n: usize,
+        ctx: &'static str,
+    ) -> Result<(), RuntimeError> {
+        if n == 0 {
+            return Ok(());
+        }
+        if gate.len() != n || up.len() != n || out.len() != n {
+            return Err(RuntimeError::usage(format!(
+                "{ctx} expected gate/up/out of length {n}, got {} / {} / {}",
+                gate.len(),
+                up.len(),
+                out.len()
+            )));
+        }
+        // The element count is the only index; guard it against the 32-bit
+        // grid-dim limit (a single `unsigned int` `n` arg).
+        if n > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "{ctx} length {n} exceeds the 32-bit kernel index limit"
+            )));
+        }
+
+        let gate_dev = self
+            .stream
+            .clone_htod(gate)
+            .map_err(|err| RuntimeError::context_concat("uploading ", ctx, " gate to CUDA", err))?;
+        let up_dev = self
+            .stream
+            .clone_htod(up)
+            .map_err(|err| RuntimeError::context_concat("uploading ", ctx, " up to CUDA", err))?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(n)
+            .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
+        let threads_x = GEGGLU_SILU_KERNEL.geometry.threads_per_group[0];
+        let n_u = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_u.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(func);
+        launch_args
+            .arg(&gate_dev)
+            .arg(&up_dev)
+            .arg(&mut out_dev)
+            .arg(&n_u);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
+        self.stream.synchronize().map_err(|err| {
+            RuntimeError::context_concat("synchronizing CUDA ", ctx, " stream", err)
+        })?;
+        let host_out = self
+            .stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context_concat("reading CUDA ", ctx, " output", err))?;
+        out.copy_from_slice(&host_out);
+        Ok(())
+    }
+
+    /// Shared unary elementwise dispatch (input → out). The standalone
+    /// `activation_silu`/`activation_gelu_tanh` kernels take a single input.
+    fn launch_elementwise_unary(
+        &self,
+        func: &CudaFunction,
+        input: &[f32],
+        out: &mut [f32],
+        n: usize,
+        ctx: &'static str,
+    ) -> Result<(), RuntimeError> {
+        if n == 0 {
+            return Ok(());
+        }
+        if input.len() != n || out.len() != n {
+            return Err(RuntimeError::usage(format!(
+                "{ctx} expected input/out of length {n}, got {} / {}",
+                input.len(),
+                out.len()
+            )));
+        }
+        if n > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "{ctx} length {n} exceeds the 32-bit kernel index limit"
+            )));
+        }
+
+        let input_dev = self.stream.clone_htod(input).map_err(|err| {
+            RuntimeError::context_concat("uploading ", ctx, " input to CUDA", err)
+        })?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(n)
+            .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
+        let threads_x = ACTIVATION_SILU_KERNEL.geometry.threads_per_group[0];
+        let n_u = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_u.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(func);
+        launch_args.arg(&input_dev).arg(&mut out_dev).arg(&n_u);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
+        self.stream.synchronize().map_err(|err| {
+            RuntimeError::context_concat("synchronizing CUDA ", ctx, " stream", err)
+        })?;
+        let host_out = self
+            .stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context_concat("reading CUDA ", ctx, " output", err))?;
+        out.copy_from_slice(&host_out);
+        Ok(())
+    }
 }
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -1194,6 +1395,21 @@ impl RuntimeError {
     fn context(action: &'static str, source: DriverError) -> Self {
         Self {
             message: format!("{action}: {source}"),
+        }
+    }
+
+    /// Compose a context string from a prefix + a kernel/operation name + a
+    /// suffix, then attach a `DriverError`. Used by the shared elementwise
+    /// launchers so each kernel gets a distinct, actionable error string
+    /// without a per-kernel `context` method.
+    fn context_concat(
+        prefix: &'static str,
+        name: &'static str,
+        suffix: &'static str,
+        source: DriverError,
+    ) -> Self {
+        Self {
+            message: format!("{prefix}{name}{suffix}: {source}"),
         }
     }
 

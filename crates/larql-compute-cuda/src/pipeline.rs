@@ -443,7 +443,7 @@ impl CudaBackend {
             larql_compute::FfnType::Gated => {
                 for s in 0..seq_len {
                     let off = s * inter;
-                    apply_activation_gated(
+                    self.apply_activation_gated_native(
                         layer.activation,
                         &gate_vec[off..off + inter],
                         &up_vec[off..off + inter],
@@ -454,7 +454,7 @@ impl CudaBackend {
             larql_compute::FfnType::Standard => {
                 for s in 0..seq_len {
                     let off = s * inter;
-                    apply_activation_std(
+                    self.apply_activation_std_native(
                         layer.activation,
                         &up_vec[off..off + inter],
                         &mut activated[off..off + inter],
@@ -710,12 +710,12 @@ impl CudaBackend {
         let activated = match layer.ffn_type {
             larql_compute::FfnType::Gated => {
                 let mut a = vec![0.0f32; inter];
-                apply_activation_gated(layer.activation, &gate_vec, &up_vec, &mut a);
+                self.apply_activation_gated_native(layer.activation, &gate_vec, &up_vec, &mut a);
                 a
             }
             larql_compute::FfnType::Standard => {
                 let mut a = vec![0.0f32; inter];
-                apply_activation_std(layer.activation, &up_vec, &mut a);
+                self.apply_activation_std_native(layer.activation, &up_vec, &mut a);
                 a
             }
         };
@@ -870,6 +870,69 @@ impl CudaBackend {
     /// device round-trip.
     fn native_norm_worthwhile(elems: usize) -> bool {
         elems >= Self::NORM_NATIVE_MIN_ELEMS
+    }
+
+    /// Minimum element count for a native activation dispatch to be worth the
+    /// host→device upload + kernel launch + sync + device→host readback
+    /// round-trip. Below this, the host `apply_activation_*` reference is
+    /// faster (the activation output is read straight back to host and
+    /// re-uploaded by the down projection, so there's no fusion benefit —
+    /// only transfer+sync overhead). Mirrors `NORM_NATIVE_MIN_ELEMS`.
+    const ACTIVATION_NATIVE_MIN_ELEMS: usize = 8192;
+
+    /// True when an activation of `elems` elements is large enough that the
+    /// native CUDA kernel is likely to beat the host reference after the
+    /// per-call device round-trip.
+    fn native_activation_worthwhile(elems: usize) -> bool {
+        elems >= Self::ACTIVATION_NATIVE_MIN_ELEMS
+    }
+
+    /// Gated activation (`out[i] = act(gate[i]) * up[i]`) routed through the
+    /// native CUDA kernel when a runtime is present AND the element count is
+    /// large enough to amortise the device round-trip; falls back to the host
+    /// `apply_activation_gated` reference on `Ok(false)`/`Err` or small
+    /// inputs. Only `Silu` / `GeluTanh` are reachable via `FullPipelineLayer`
+    /// (see `apply_activation_gated`); the other arms fail loud via
+    /// `unreachable!`.
+    pub(crate) fn apply_activation_gated_native(
+        &self,
+        act: Activation,
+        gate: &[f32],
+        up: &[f32],
+        out: &mut [f32],
+    ) {
+        if Self::native_activation_worthwhile(out.len()) {
+            let launched = match act {
+                Activation::Silu => self.native_geglu_silu(gate, up, out),
+                Activation::GeluTanh => self.native_geglu_gelu_tanh(gate, up, out),
+                _ => unreachable!(
+                    "apply_activation_gated_native: FullPipelineLayer only emits Silu/GeluTanh (got {act:?})"
+                ),
+            };
+            if matches!(launched, Ok(true)) {
+                return;
+            }
+        }
+        apply_activation_gated(act, gate, up, out);
+    }
+
+    /// Standard (non-gated) activation (`out[i] = act(x[i])`) routed through
+    /// the native CUDA kernel when a runtime is present AND the element
+    /// count is large enough; falls back to the host reference otherwise.
+    pub(crate) fn apply_activation_std_native(&self, act: Activation, x: &[f32], out: &mut [f32]) {
+        if Self::native_activation_worthwhile(out.len()) {
+            let launched = match act {
+                Activation::Silu => self.native_activation_silu(x, out),
+                Activation::GeluTanh => self.native_activation_gelu_tanh(x, out),
+                _ => unreachable!(
+                    "apply_activation_std_native: FullPipelineLayer only emits Silu/GeluTanh (got {act:?})"
+                ),
+            };
+            if matches!(launched, Ok(true)) {
+                return;
+            }
+        }
+        apply_activation_std(act, x, out);
     }
 
     /// RMSNorm or LayerNorm for a `[rows, cols]` array using a `&[f32]`
@@ -1072,7 +1135,7 @@ fn add_residual(h: &Array2<f32>, x: &Array2<f32>, b_scale: f32) -> Array2<f32> {
 /// to exactly those two (mirrors Metal's `stages/ffn.rs`). The other arms
 /// fail loud via `unreachable!` so a future builder change that emits a new
 /// variant surfaces here instead of silently miscomputing.
-fn apply_activation_gated(act: Activation, gate: &[f32], up: &[f32], out: &mut [f32]) {
+pub(crate) fn apply_activation_gated(act: Activation, gate: &[f32], up: &[f32], out: &mut [f32]) {
     match act {
         Activation::Silu => {
             for i in 0..out.len() {
@@ -1095,7 +1158,7 @@ fn apply_activation_gated(act: Activation, gate: &[f32], up: &[f32], out: &mut [
 }
 
 /// Apply a standard (non-gated) activation: `out[i] = act(x[i])`.
-fn apply_activation_std(act: Activation, x: &[f32], out: &mut [f32]) {
+pub(crate) fn apply_activation_std(act: Activation, x: &[f32], out: &mut [f32]) {
     match act {
         Activation::Silu => {
             for i in 0..out.len() {

@@ -262,6 +262,76 @@ impl CudaBackend {
         }
     }
 
+    /// Native GEGLU-SiLU: `out[i] = silu(gate[i]) * up[i]`. Returns `Ok(true)`
+    /// on a native launch, `Ok(false)` when there's no runtime (caller falls
+    /// back to the host reference), or `Err` on a launch failure.
+    pub(crate) fn native_geglu_silu(
+        &self,
+        gate: &[f32],
+        up: &[f32],
+        out: &mut [f32],
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_geglu_silu(gate, up, out, gate.len())?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Native GEGLU-GELU-tanh: `out[i] = gelu_tanh(gate[i]) * up[i]`.
+    /// Returns `Ok(true)` on a native launch, `Ok(false)` when there's no
+    /// runtime, or `Err` on a launch failure.
+    pub(crate) fn native_geglu_gelu_tanh(
+        &self,
+        gate: &[f32],
+        up: &[f32],
+        out: &mut [f32],
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_geglu_gelu_tanh(gate, up, out, gate.len())?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Native standard SiLU: `out[i] = silu(x[i])`. Returns `Ok(true)` on a
+    /// native launch, `Ok(false)` when there's no runtime, or `Err` on a
+    /// launch failure.
+    pub(crate) fn native_activation_silu(
+        &self,
+        input: &[f32],
+        out: &mut [f32],
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_activation_silu(input, out, input.len())?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Native standard GELU-tanh: `out[i] = gelu_tanh(x[i])`. Returns
+    /// `Ok(true)` on a native launch, `Ok(false)` when there's no runtime,
+    /// or `Err` on a launch failure.
+    pub(crate) fn native_activation_gelu_tanh(
+        &self,
+        input: &[f32],
+        out: &mut [f32],
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_activation_gelu_tanh(input, out, input.len())?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Lock the KV-cache mutex, recovering from poisoning by taking the
     /// inner value (a poisoned mutex only means a prior holder panicked; the
     /// cache itself is still usable). This keeps the documented "fall back
