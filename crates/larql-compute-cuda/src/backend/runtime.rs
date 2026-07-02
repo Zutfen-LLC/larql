@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 
 use crate::ops::{
-    F16_GEMV_CUDA_SRC, F16_GEMV_KERNEL, F32_GEMV_CUDA_SRC, F32_GEMV_KERNEL,
-    Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC, Q4K_MATMUL_KERNEL,
-    Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q4_MATVEC_CUDA_SRC, Q4_MATVEC_KERNEL,
-    Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
+    F16_GEMV_CUDA_SRC, F16_GEMV_KERNEL, F32_GEMV_CUDA_SRC, F32_GEMV_KERNEL, KV_APPEND_CUDA_SRC,
+    KV_APPEND_KERNEL, Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC,
+    Q4K_MATMUL_KERNEL, Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q4_MATVEC_CUDA_SRC,
+    Q4_MATVEC_KERNEL, Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
     Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL,
 };
 
@@ -30,6 +31,7 @@ pub(crate) struct CudaRuntime {
     f16_gemv: CudaFunction,
     q4_matvec: CudaFunction,
     q4_vecmat: CudaFunction,
+    kv_append: CudaFunction,
     summary: String,
 }
 
@@ -58,7 +60,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}"
         );
         let ptx = compile_ptx_with_opts(
             &combined_src,
@@ -98,6 +100,9 @@ impl CudaRuntime {
         let q4_vecmat = module
             .load_function(Q4_VECMAT_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading q4_vecmat CUDA function", err))?;
+        let kv_append = module
+            .load_function(KV_APPEND_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading kv_append CUDA function", err))?;
         let stream = context.default_stream();
 
         Ok(Self {
@@ -113,14 +118,128 @@ impl CudaRuntime {
             f16_gemv,
             q4_matvec,
             q4_vecmat,
+            kv_append,
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append loaded, remaining ops use CPU fallback"
             ),
         })
     }
 
     pub(crate) fn summary(&self) -> &str {
         &self.summary
+    }
+
+    /// Borrow the runtime's stream. Used by the KV cache to allocate
+    /// per-layer device buffers (`CudaSlice<f32>` holds an `Arc<CudaStream>`
+    /// so the cache outlives this borrow).
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// KV append: copy a contiguous block of `seq_len` freshly-projected
+    /// K/V rows into the cache starting at slot `pos`. `new_k` / `new_v`
+    /// are `seq_len * row_elems` elements each, uploaded in a single
+    /// host→device transfer and written by one kernel launch over all rows
+    /// (no per-row sync). `row_elems = num_kv_heads * head_dim` is
+    /// precomputed here with overflow checks and passed to the kernel as a
+    /// 32-bit value, so the device-side multiplication cannot wrap. The
+    /// caller is responsible for bumping the layer's `current_len` after a
+    /// successful launch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_kv_append(
+        &self,
+        new_k: &[f32],
+        new_v: &[f32],
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+        pos: usize,
+        seq_len: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), RuntimeError> {
+        // `row_elems = num_kv_heads * head_dim`. Guard the product against
+        // `usize` overflow and against exceeding the 32-bit kernel index
+        // (the kernel takes `row_elems` as `unsigned int`).
+        let row_elems = num_kv_heads.checked_mul(head_dim).ok_or_else(|| {
+            RuntimeError::usage(format!(
+                "kv_append row_elems overflow: num_kv_heads={num_kv_heads} head_dim={head_dim}"
+            ))
+        })?;
+        if row_elems > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "kv_append row_elems {row_elems} exceeds the 32-bit kernel index limit"
+            )));
+        }
+        let block_len = seq_len.checked_mul(row_elems).ok_or_else(|| {
+            RuntimeError::usage(format!(
+                "kv_append block overflow: seq_len={seq_len} row_elems={row_elems}"
+            ))
+        })?;
+        if new_k.len() != block_len || new_v.len() != block_len {
+            return Err(RuntimeError::usage(format!(
+                "kv_append expected new_k/new_v of length {block_len} (seq_len={seq_len} row_elems={row_elems}), got {} / {}",
+                new_k.len(),
+                new_v.len()
+            )));
+        }
+        // `pos` and `seq_len` are passed as 32-bit args; the slot offset is
+        // computed in 64-bit on the device, so the only remaining truncation
+        // surface is the args themselves.
+        if pos > u32::MAX as usize || seq_len > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "kv_append shape (pos={pos}, seq_len={seq_len}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        // Capacity check in checked arithmetic: the last written slot is
+        // `(pos + seq_len) * row_elems + (row_elems - 1)`, i.e. the block
+        // occupies `(pos + seq_len) * row_elems` elements.
+        let end_slot = pos
+            .checked_add(seq_len)
+            .and_then(|last_row| last_row.checked_mul(row_elems))
+            .ok_or_else(|| {
+                RuntimeError::usage(
+                    "kv_append slot offset overflow (pos + seq_len) * row_elems".to_string(),
+                )
+            })?;
+        let max_seq_elems = k_cache.len();
+        if end_slot > max_seq_elems {
+            return Err(RuntimeError::usage(format!(
+                "kv_append slots {pos}..{end_slot} exceed cache capacity {max_seq_elems}"
+            )));
+        }
+
+        let k_in = self
+            .stream
+            .clone_htod(new_k)
+            .map_err(|err| RuntimeError::context("uploading K block to CUDA", err))?;
+        let v_in = self
+            .stream
+            .clone_htod(new_v)
+            .map_err(|err| RuntimeError::context("uploading V block to CUDA", err))?;
+        let threads_x = KV_APPEND_KERNEL.geometry.threads_per_group[0];
+        let pos_u = pos as u32;
+        let seq_u = seq_len as u32;
+        let row_elems_u = row_elems as u32;
+        let total = block_len as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.kv_append);
+        launch_args
+            .arg(&k_in)
+            .arg(&v_in)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(&pos_u)
+            .arg(&seq_u)
+            .arg(&row_elems_u);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA kv_append kernel", err))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing CUDA kv_append stream", err))
     }
 
     pub(crate) fn launch_q4k_matvec(

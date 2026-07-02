@@ -72,6 +72,14 @@ pub const Q4_VECMAT_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const KV_APPEND_KERNEL: KernelHandle = KernelHandle::new(
+    "kv_append",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -735,5 +743,39 @@ extern "C" __global__ void q4_vecmat(
     }
 
     out[col] = acc;
+}
+"#;
+
+/// KV append: copy a contiguous block of freshly-projected K/V rows into
+/// the cache starting at slot `pos`. One thread per element across all
+/// `seq_len` rows (`seq_len * num_kv_heads * head_dim` elements total). The
+/// cache layout is `[max_seq, num_kv_heads, head_dim]` row-major over the
+/// sequence dimension, so the slot for `(row, elem)` begins at
+/// `(pos + row) * row_elems + elem`. The 64-bit slot-offset guard mirrors
+/// the other kernels so a cache larger than 2^32 elements doesn't wrap.
+/// `row_elems` is passed as a precomputed 32-bit value by the host launcher
+/// (which already verified `num_kv_heads * head_dim <= u32::MAX`), so the
+/// kernel-side multiplication cannot wrap.
+pub const KV_APPEND_CUDA_SRC: &str = r#"
+extern "C" __global__ void kv_append(
+    const float* new_k,
+    const float* new_v,
+    float* k_cache,
+    float* v_cache,
+    unsigned int pos,
+    unsigned int seq_len,
+    unsigned int row_elems)
+{
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = seq_len * row_elems;
+    if (tid >= total) {
+        return;
+    }
+    const unsigned int row = tid / row_elems;
+    const unsigned int elem = tid - row * row_elems;
+    const unsigned long long slot = (unsigned long long)(pos + row) * (unsigned long long)row_elems
+        + (unsigned long long)elem;
+    k_cache[slot] = new_k[tid];
+    v_cache[slot] = new_v[tid];
 }
 "#;

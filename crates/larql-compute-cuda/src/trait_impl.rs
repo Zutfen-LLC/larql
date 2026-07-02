@@ -218,7 +218,73 @@ impl QuantMatVec for CudaBackend {
     }
 }
 
-impl DecodeBackend for CudaBackend {}
+impl DecodeBackend for CudaBackend {
+    /// CUDA reports KV-cache support only when a native runtime is present
+    /// *and* a cache has been pre-allocated. The scaffold path (no device)
+    /// returns `false` so engines route through the CPU reference store.
+    fn has_kv_cache(&self) -> bool {
+        self.native_runtime_available() && self.kv_cache_allocated()
+    }
+
+    fn reset_kv_cache(&self) {
+        self.reset_kv_cache_native();
+    }
+
+    fn kv_cache_len(&self) -> usize {
+        self.kv_cache_len_native()
+    }
+
+    fn truncate_kv_cache(&self, len: usize) {
+        self.truncate_kv_cache_native(len);
+    }
+
+    fn preallocate_kv_cache_per_layer(&self, shapes: &[(usize, usize)], max_seq: usize) {
+        // Only attempt a device allocation when a runtime is present; the
+        // scaffold path leaves the cache `None` and `has_kv_cache` reports
+        // false, so engines route KV through the CPU reference store.
+        if !self.native_runtime_available() {
+            return;
+        }
+        // A failed allocation is non-fatal: leave the cache unallocated and
+        // let `has_kv_cache` report false so the caller's KV path falls back
+        // to the host reference store.
+        let _ = self.preallocate_kv_cache(shapes, max_seq);
+    }
+
+    /// Populate the device KV cache for one layer with prefill K/V data.
+    /// All `seq_len` rows are uploaded in a single host→device transfer and
+    /// written by one kernel launch (no per-row stalls). When no runtime /
+    /// cache is present this is a no-op (the host reference store remains
+    /// the source of truth). A launch failure leaves the layer's cursor
+    /// unchanged (the caller's KV path falls back to the host store).
+    fn populate_kv_layer(
+        &self,
+        layer: usize,
+        k_data: &[f32],
+        v_data: &[f32],
+        seq_len: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) {
+        // Checked geometry: a dim overflow would otherwise bypass the length
+        // guard and panic on a host slice index. On `None` (overflow), treat
+        // as short data and return early (no-op / host-store fallback).
+        let row_elems = match num_kv_heads.checked_mul(head_dim) {
+            Some(r) => r,
+            None => return,
+        };
+        let block_len = match seq_len.checked_mul(row_elems) {
+            Some(b) => b,
+            None => return,
+        };
+        if k_data.len() < block_len || v_data.len() < block_len {
+            return;
+        }
+        let k_block = &k_data[..block_len];
+        let v_block = &v_data[..block_len];
+        let _ = self.native_kv_append(layer, k_block, v_block, 0, seq_len);
+    }
+}
 
 impl ComputeBackend for CudaBackend {
     fn name(&self) -> &str {
