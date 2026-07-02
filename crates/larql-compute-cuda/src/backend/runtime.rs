@@ -8,7 +8,8 @@ use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 use crate::ops::{
     F16_GEMV_CUDA_SRC, F16_GEMV_KERNEL, F32_GEMV_CUDA_SRC, F32_GEMV_KERNEL,
     Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC, Q4K_MATMUL_KERNEL,
-    Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
+    Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q4_MATVEC_CUDA_SRC, Q4_MATVEC_KERNEL,
+    Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
     Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL,
 };
 
@@ -27,6 +28,8 @@ pub(crate) struct CudaRuntime {
     q4k_dual_matvec: CudaFunction,
     f32_gemv: CudaFunction,
     f16_gemv: CudaFunction,
+    q4_matvec: CudaFunction,
+    q4_vecmat: CudaFunction,
     summary: String,
 }
 
@@ -55,7 +58,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}"
         );
         let ptx = compile_ptx_with_opts(
             &combined_src,
@@ -89,6 +92,12 @@ impl CudaRuntime {
         let f16_gemv = module
             .load_function(F16_GEMV_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading f16_gemv CUDA function", err))?;
+        let q4_matvec = module
+            .load_function(Q4_MATVEC_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading q4_matvec CUDA function", err))?;
+        let q4_vecmat = module
+            .load_function(Q4_VECMAT_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading q4_vecmat CUDA function", err))?;
         let stream = context.default_stream();
 
         Ok(Self {
@@ -102,8 +111,10 @@ impl CudaRuntime {
             q4k_dual_matvec,
             f32_gemv,
             f16_gemv,
+            q4_matvec,
+            q4_vecmat,
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat loaded, remaining ops use CPU fallback"
             ),
         })
     }
@@ -648,6 +659,180 @@ impl CudaRuntime {
         self.stream
             .clone_dtoh(&out_dev)
             .map_err(|err| RuntimeError::context("reading CUDA f16_gemv output", err))
+    }
+
+    /// Q4_0 × Q8 matvec launch. `q4_data` is packed Q4_0 (18 bytes per
+    /// 32-element block), `q8_x` / `q8_scales` are the pre-quantised Q8
+    /// input. Returns `out[num_rows]`.
+    pub(crate) fn launch_q4_matvec(
+        &self,
+        q4_data: &[u8],
+        q8_x: &[i8],
+        q8_scales: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        if num_rows == 0 {
+            return Ok(Vec::new());
+        }
+        // The device indexes the row offset in 64-bit, but `n`/`k` are
+        // passed as 32-bit kernel args, so a dim exceeding u32::MAX would
+        // truncate. Reject before the length check / upload (falling back
+        // to CPU) rather than launching a truncated dispatch.
+        if num_rows > u32::MAX as usize || hidden > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "q4_matvec shape ({num_rows}, {hidden}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        if !hidden.is_multiple_of(32) {
+            return Err(RuntimeError::usage(format!(
+                "q4_matvec hidden size must be a multiple of 32, got {hidden}"
+            )));
+        }
+        let blocks = hidden / 32;
+        if q8_x.len() != hidden {
+            return Err(RuntimeError::usage(format!(
+                "q4_matvec expected q8_x.len() == hidden ({hidden}), got {}",
+                q8_x.len()
+            )));
+        }
+        if q8_scales.len() != blocks {
+            return Err(RuntimeError::usage(format!(
+                "q4_matvec expected q8_scales.len() == hidden/32 ({blocks}), got {}",
+                q8_scales.len()
+            )));
+        }
+        let expected_bytes = num_rows
+            .checked_mul(blocks)
+            .and_then(|b| b.checked_mul(18))
+            .ok_or_else(|| RuntimeError::usage("q4_matvec byte-size overflow".to_string()))?;
+        if q4_data.len() != expected_bytes {
+            return Err(RuntimeError::usage(format!(
+                "q4_matvec expected {expected_bytes} Q4_0 bytes for shape ({num_rows}, {hidden}), got {}",
+                q4_data.len()
+            )));
+        }
+
+        let w_dev = self
+            .stream
+            .clone_htod(q4_data)
+            .map_err(|err| RuntimeError::context("uploading Q4_0 weights to CUDA", err))?;
+        let q8_dev = self
+            .stream
+            .clone_htod(q8_x)
+            .map_err(|err| RuntimeError::context("uploading Q8 input to CUDA", err))?;
+        let scales_dev = self
+            .stream
+            .clone_htod(q8_scales)
+            .map_err(|err| RuntimeError::context("uploading Q8 scales to CUDA", err))?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(num_rows)
+            .map_err(|err| RuntimeError::context("allocating CUDA q4_matvec output buffer", err))?;
+        let threads_x = Q4_MATVEC_KERNEL.geometry.threads_per_group[0];
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.q4_matvec);
+        launch_args
+            .arg(&w_dev)
+            .arg(&q8_dev)
+            .arg(&scales_dev)
+            .arg(&mut out_dev)
+            .arg(&n)
+            .arg(&k);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA q4_matvec kernel", err))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing CUDA q4_matvec stream", err))?;
+        self.stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading CUDA q4_matvec output", err))
+    }
+
+    /// Q4_0 vector-matrix launch. `out[hidden] = activation[intermediate] @
+    /// Q4[intermediate, hidden]`. One output column per thread.
+    pub(crate) fn launch_q4_vecmat(
+        &self,
+        activation: &[f32],
+        q4_data: &[u8],
+        intermediate: usize,
+        hidden: usize,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        if hidden == 0 {
+            return Ok(Vec::new());
+        }
+        if intermediate == 0 {
+            return Ok(vec![0.0f32; hidden]);
+        }
+        if intermediate > u32::MAX as usize || hidden > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "q4_vecmat shape ({intermediate}, {hidden}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        if activation.len() != intermediate {
+            return Err(RuntimeError::usage(format!(
+                "q4_vecmat expected activation.len() == intermediate ({intermediate}), got {}",
+                activation.len()
+            )));
+        }
+        if !hidden.is_multiple_of(32) {
+            return Err(RuntimeError::usage(format!(
+                "q4_vecmat hidden size must be a multiple of 32, got {hidden}"
+            )));
+        }
+        let blocks_per_row = hidden / 32;
+        let expected_bytes = intermediate
+            .checked_mul(blocks_per_row)
+            .and_then(|b| b.checked_mul(18))
+            .ok_or_else(|| RuntimeError::usage("q4_vecmat byte-size overflow".to_string()))?;
+        if q4_data.len() != expected_bytes {
+            return Err(RuntimeError::usage(format!(
+                "q4_vecmat expected {expected_bytes} Q4_0 bytes for shape ({intermediate}, {hidden}), got {}",
+                q4_data.len()
+            )));
+        }
+
+        let act_dev = self
+            .stream
+            .clone_htod(activation)
+            .map_err(|err| RuntimeError::context("uploading activation to CUDA", err))?;
+        let w_dev = self
+            .stream
+            .clone_htod(q4_data)
+            .map_err(|err| RuntimeError::context("uploading Q4_0 weights to CUDA", err))?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(hidden)
+            .map_err(|err| RuntimeError::context("allocating CUDA q4_vecmat output buffer", err))?;
+        let threads_x = Q4_VECMAT_KERNEL.geometry.threads_per_group[0];
+        let n = intermediate as u32;
+        let k = hidden as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (k.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.q4_vecmat);
+        launch_args
+            .arg(&act_dev)
+            .arg(&w_dev)
+            .arg(&mut out_dev)
+            .arg(&n)
+            .arg(&k);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA q4_vecmat kernel", err))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing CUDA q4_vecmat stream", err))?;
+        self.stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading CUDA q4_vecmat output", err))
     }
 }
 

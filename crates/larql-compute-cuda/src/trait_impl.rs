@@ -124,6 +124,10 @@ impl QuantMatVec for CudaBackend {
         num_rows: usize,
         hidden: usize,
     ) -> Option<Vec<f32>> {
+        if let Ok(Some(native)) = self.native_q4_matvec(q4_data, q8_x, q8_scales, num_rows, hidden)
+        {
+            return Some(native);
+        }
         CPU.q4_matvec(q4_data, q8_x, q8_scales, num_rows, hidden)
     }
 
@@ -134,6 +138,9 @@ impl QuantMatVec for CudaBackend {
         intermediate: usize,
         hidden: usize,
     ) -> Option<Vec<f32>> {
+        if let Ok(Some(native)) = self.native_q4_vecmat(activation, q4_data, intermediate, hidden) {
+            return Some(native);
+        }
         CPU.q4_vecmat(activation, q4_data, intermediate, hidden)
     }
 

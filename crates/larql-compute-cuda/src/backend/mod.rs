@@ -151,6 +151,43 @@ impl CudaBackend {
         }
     }
 
+    /// Native Q4_0 × Q8 matvec. `q4_data` is packed Q4_0 (18 bytes per
+    /// 32-element block); `q8_x` / `q8_scales` are the pre-quantised Q8
+    /// input. Routed through `QuantMatVec::q4_matvec` (native-then-CPU
+    /// fallback).
+    pub(crate) fn native_q4_matvec(
+        &self,
+        q4_data: &[u8],
+        q8_x: &[i8],
+        q8_scales: &[f32],
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<Option<Vec<f32>>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime
+                .launch_q4_matvec(q4_data, q8_x, q8_scales, num_rows, hidden)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Native Q4_0 vector-matrix. Routed through `QuantMatVec::q4_vecmat`
+    /// (native-then-CPU fallback).
+    pub(crate) fn native_q4_vecmat(
+        &self,
+        activation: &[f32],
+        q4_data: &[u8],
+        intermediate: usize,
+        hidden: usize,
+    ) -> Result<Option<Vec<f32>>, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => runtime
+                .launch_q4_vecmat(activation, q4_data, intermediate, hidden)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn native_runtime_available(&self) -> bool {
         self.runtime.is_some()
     }

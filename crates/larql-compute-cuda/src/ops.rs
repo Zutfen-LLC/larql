@@ -56,6 +56,22 @@ pub const F16_GEMV_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const Q4_MATVEC_KERNEL: KernelHandle = KernelHandle::new(
+    "q4_matvec",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
+pub const Q4_VECMAT_KERNEL: KernelHandle = KernelHandle::new(
+    "q4_vecmat",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -587,5 +603,137 @@ extern "C" __global__ void f16_gemv(
         acc += larql_decode_f16(bits) * x[col];
     }
     out[row] = acc;
+}
+"#;
+
+/// Q4_0 × Q8 matvec: `out[row] = sum_blocks (q4_scale * q8_scale * sum_j
+/// ((nib - 8) * q8[j]))`. One row per thread. Each Q4_0 block is 18 bytes:
+/// 2-byte little-endian f16 scale followed by 16 packed nibble bytes (lo
+/// nibble = element 2j, hi nibble = element 2j+1, value = nibble - 8). The
+/// input is pre-quantised Q8 (`q8_x[hidden]` int8 + per-32-block `q8_scales`
+/// f32). Mirrors the CPU scalar `q4_0_matvec_c` non-ARM fallback exactly.
+pub const Q4_MATVEC_CUDA_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+union larql_half_bits {
+    unsigned short bits;
+    __half half;
+};
+
+__device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
+    larql_half_bits value;
+    value.bits = bits;
+    return __half2float(value.half);
+}
+
+extern "C" __global__ void q4_matvec(
+    const unsigned char* q4_data,
+    const signed char* q8_x,
+    const float* q8_scales,
+    float* out,
+    unsigned int n,
+    unsigned int k)
+{
+    const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) {
+        return;
+    }
+
+    const unsigned int blocks = k / 32u;
+    const unsigned int bytes_per_row = blocks * 18u;
+    // 64-bit row offset: a wide FFN (n*bytes_per_row > 2^32) would wrap a
+    // 32-bit `row * bytes_per_row` and read OOB. The host launcher guards
+    // the same limit on the dims.
+    const unsigned long long row_off = (unsigned long long)row * (unsigned long long)bytes_per_row;
+    const unsigned char* row_w = q4_data + row_off;
+    float acc = 0.0f;
+
+    for (unsigned int b = 0u; b < blocks; ++b) {
+        const unsigned char* block = row_w + b * 18u;
+        const float q4_scale = larql_decode_f16(
+            static_cast<unsigned short>(block[0]) |
+            (static_cast<unsigned short>(block[1]) << 8u));
+        const float combined_scale = q4_scale * q8_scales[b];
+        const unsigned char* quants = block + 2u;
+        const signed char* q8_ptr = q8_x + b * 32u;
+        #pragma unroll
+        for (unsigned int j = 0u; j < 16u; ++j) {
+            const unsigned char byte = quants[j];
+            const int lo_v = static_cast<int>(byte & 0x0Fu) - 8;
+            const int hi_v = static_cast<int>((byte >> 4u) & 0x0Fu) - 8;
+            acc += static_cast<float>(lo_v) * static_cast<float>(q8_ptr[j * 2u])     * combined_scale;
+            acc += static_cast<float>(hi_v) * static_cast<float>(q8_ptr[j * 2u + 1u]) * combined_scale;
+        }
+    }
+
+    out[row] = acc;
+}
+"#;
+
+/// Q4_0 vector-matrix: `out[col] = sum_rows (act[row] * q4_scale * (nib -
+/// 8))`. One output column per thread (gather across all `intermediate`
+/// rows). Each Q4_0 block is 18 bytes (2-byte f16 scale + 16 packed nibble
+/// bytes; lo nibble = element 2j, hi nibble = element 2j+1, value = nibble -
+/// 8). The CPU reference scatters row-major; this transposes the loop to a
+/// per-output gather, which produces identical arithmetic and maps naturally
+/// to one-thread-per-output-column parallelism. Rows with `|act| < 1e-10`
+/// are skipped (matching the CPU zero-skip).
+pub const Q4_VECMAT_CUDA_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+union larql_half_bits {
+    unsigned short bits;
+    __half half;
+};
+
+__device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
+    larql_half_bits value;
+    value.bits = bits;
+    return __half2float(value.half);
+}
+
+extern "C" __global__ void q4_vecmat(
+    const float* activation,
+    const unsigned char* q4_data,
+    float* out,
+    unsigned int intermediate,
+    unsigned int hidden)
+{
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= hidden) {
+        return;
+    }
+
+    const unsigned int blocks_per_row = hidden / 32u;
+    const unsigned int bytes_per_row = blocks_per_row * 18u;
+    // Locate which 32-element block and intra-block position this output
+    // column maps to. Within a block, element 2j is the lo nibble of
+    // quants[j], element 2j+1 is the hi nibble.
+    const unsigned int block_idx = col / 32u;
+    const unsigned int in_block = col - block_idx * 32u;
+    const bool is_hi = (in_block & 1u) != 0u;
+    const unsigned int j = in_block >> 1u;
+
+    float acc = 0.0f;
+    for (unsigned int row = 0u; row < intermediate; ++row) {
+        const float act = activation[row];
+        // Zero-skip mirrors the CPU reference.
+        if (act > -1e-10f && act < 1e-10f) {
+            continue;
+        }
+        // 64-bit row offset guard (matches q4_matvec).
+        const unsigned long long row_off = (unsigned long long)row * (unsigned long long)bytes_per_row;
+        const unsigned char* block = q4_data + row_off + block_idx * 18u;
+        const float scale = larql_decode_f16(
+            static_cast<unsigned short>(block[0]) |
+            (static_cast<unsigned short>(block[1]) << 8u)) * act;
+        const unsigned char quants_byte = block[2u + j];
+        const int val = is_hi
+            ? static_cast<int>((quants_byte >> 4u) & 0x0Fu) - 8
+            : static_cast<int>(quants_byte & 0x0Fu) - 8;
+        acc += static_cast<float>(val) * scale;
+    }
+
+    out[col] = acc;
 }
 "#;

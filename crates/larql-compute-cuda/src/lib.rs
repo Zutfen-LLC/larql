@@ -33,6 +33,7 @@ pub fn cuda_backend_with_options(options: BackendOptions) -> Result<CudaBackend,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_to_q8};
     use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
     use larql_compute::prelude::*;
     use larql_compute::KvIndex;
@@ -486,6 +487,149 @@ mod tests {
         let w_f16: Vec<u8> = Vec::new();
         let x: Vec<f32> = Vec::new();
         let result = backend.native_f16_gemv(&w_f16, &x, n, k);
+        assert!(
+            matches!(result, Err(ref e) if e.to_string().contains("32-bit kernel index limit")),
+            "expected shape-rejection error, got {result:?}"
+        );
+    }
+
+    /// Trait-routed `q4_matvec` must agree with the CPU reference on every
+    /// host — when no CUDA runtime is present it delegates to
+    /// `CpuBackend::q4_matvec`, so this always runs and pins the fallback
+    /// contract.
+    #[test]
+    fn q4_matvec_matches_cpu_delegate() {
+        use larql_compute::backend::QuantMatVec;
+        let hidden = 256usize;
+        let rows = 32usize;
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.01).sin()).collect();
+        let matrix: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i as f32 * 0.001).cos())
+            .collect();
+        let q4 = quantize_q4_0(&matrix);
+        let (q8_x, q8_scales) = quantize_to_q8(&x);
+
+        let got = backend()
+            .q4_matvec(&q4, &q8_x, &q8_scales, rows, hidden)
+            .unwrap();
+        let want = CpuBackend
+            .q4_matvec(&q4, &q8_x, &q8_scales, rows, hidden)
+            .unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// Trait-routed `q4_vecmat` must agree with the CPU reference on every
+    /// host — when no CUDA runtime is present it delegates to
+    /// `CpuBackend::q4_vecmat`, so this always runs and pins the fallback
+    /// contract.
+    #[test]
+    fn q4_vecmat_matches_cpu_delegate() {
+        use larql_compute::backend::QuantMatVec;
+        let hidden = 256usize;
+        let inter = 128usize;
+        let act: Vec<f32> = (0..inter)
+            .map(|i| if i % 3 == 0 { 1.0 } else { 0.0 })
+            .collect();
+        let matrix: Vec<f32> = (0..inter * hidden)
+            .map(|i| (i as f32 * 0.001).cos())
+            .collect();
+        let q4 = quantize_q4_0(&matrix);
+
+        let got = backend().q4_vecmat(&act, &q4, inter, hidden).unwrap();
+        let want = CpuBackend.q4_vecmat(&act, &q4, inter, hidden).unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// Native `q4_matvec` must match the CPU reference when a CUDA runtime is
+    /// present. Runtime-gated: no-op on hosts without CUDA (like this CI host).
+    #[test]
+    fn native_q4_matvec_matches_cpu_when_runtime_is_available() {
+        use larql_compute::backend::QuantMatVec;
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+
+        let hidden = 256usize;
+        let rows = 32usize;
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.01).sin()).collect();
+        let matrix: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i as f32 * 0.001).cos())
+            .collect();
+        let q4 = quantize_q4_0(&matrix);
+        let (q8_x, q8_scales) = quantize_to_q8(&x);
+
+        let got = backend
+            .native_q4_matvec(&q4, &q8_x, &q8_scales, rows, hidden)
+            .expect("native q4_matvec should launch when runtime is available")
+            .expect("runtime available should expose native q4_matvec");
+        let want = CpuBackend
+            .q4_matvec(&q4, &q8_x, &q8_scales, rows, hidden)
+            .unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// Native `q4_vecmat` must match the CPU reference when a CUDA runtime is
+    /// present. Runtime-gated: no-op on hosts without CUDA (like this CI host).
+    #[test]
+    fn native_q4_vecmat_matches_cpu_when_runtime_is_available() {
+        use larql_compute::backend::QuantMatVec;
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+
+        let hidden = 256usize;
+        let inter = 128usize;
+        let act: Vec<f32> = (0..inter)
+            .map(|i| if i % 3 == 0 { 1.0 } else { 0.0 })
+            .collect();
+        let matrix: Vec<f32> = (0..inter * hidden)
+            .map(|i| (i as f32 * 0.001).cos())
+            .collect();
+        let q4 = quantize_q4_0(&matrix);
+
+        let got = backend
+            .native_q4_vecmat(&act, &q4, inter, hidden)
+            .expect("native q4_vecmat should launch when runtime is available")
+            .expect("runtime available should expose native q4_vecmat");
+        let want = CpuBackend.q4_vecmat(&act, &q4, inter, hidden).unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// Native `q4_matvec` rejects dims exceeding the 32-bit kernel argument
+    /// limit. Runtime-gated.
+    #[test]
+    fn native_q4_matvec_rejects_dim_exceeding_u32_index_limit() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+        let n = u32::MAX as usize + 1;
+        let k = 32usize;
+        let q4: Vec<u8> = Vec::new();
+        let q8_x: Vec<i8> = Vec::new();
+        let q8_scales: Vec<f32> = Vec::new();
+        let result = backend.native_q4_matvec(&q4, &q8_x, &q8_scales, n, k);
+        assert!(
+            matches!(result, Err(ref e) if e.to_string().contains("32-bit kernel index limit")),
+            "expected shape-rejection error, got {result:?}"
+        );
+    }
+
+    /// Native `q4_vecmat` rejects dims exceeding the 32-bit kernel argument
+    /// limit. Runtime-gated.
+    #[test]
+    fn native_q4_vecmat_rejects_dim_exceeding_u32_index_limit() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+        let inter = u32::MAX as usize + 1;
+        let k = 32usize;
+        let act: Vec<f32> = Vec::new();
+        let q4: Vec<u8> = Vec::new();
+        let result = backend.native_q4_vecmat(&act, &q4, inter, k);
         assert!(
             matches!(result, Err(ref e) if e.to_string().contains("32-bit kernel index limit")),
             "expected shape-rejection error, got {result:?}"
