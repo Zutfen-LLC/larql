@@ -1245,4 +1245,347 @@ mod tests {
         assert!(honly_state.v_new_per_layer.is_empty());
         assert!(honly_state.is_complete_under(num_layers, larql_compute::StateDumpMask::HOnly));
     }
+
+    // ── Session 12: hybrid-MoE host pipeline ───────────────────────────────
+
+    use larql_models::test_fixtures::make_test_gemma4_moe_weights;
+
+    /// Quantize the gemma4-moe fixture's dense gate/up/down to Q4_K and
+    /// build a `FullPipelineLayer` whose `moe` is populated by
+    /// `build_moe_weights` (BF16 expert monolith from the fixture's
+    /// `raw_bytes`). The quant byte vectors are leaked to a `'static`
+    /// lifetime so the returned owned layer can borrow them; `weights`
+    /// must also be `'static` (leak the `ModelWeights` in the caller).
+    /// Test-only; never runs in prod.
+    fn build_moe_layer_from_fixture(
+        weights: &'static larql_models::ModelWeights,
+        layer_idx: usize,
+    ) -> (larql_compute::FullPipelineLayer<'static>, usize) {
+        let arch = &*weights.arch;
+        let gate_f32 = weights
+            .tensors
+            .get(&arch.ffn_gate_key(layer_idx))
+            .expect("dense gate weight")
+            .as_slice()
+            .expect("contiguous gate");
+        let up_f32 = weights
+            .tensors
+            .get(&arch.ffn_up_key(layer_idx))
+            .expect("dense up weight")
+            .as_slice()
+            .expect("contiguous up");
+        let down_f32 = weights
+            .tensors
+            .get(&arch.ffn_down_key(layer_idx))
+            .expect("dense down weight")
+            .as_slice()
+            .expect("contiguous down");
+        let inter = weights
+            .tensors
+            .get(&arch.ffn_gate_key(layer_idx))
+            .expect("gate")
+            .nrows();
+        let gate: &'static [u8] = Box::leak(quantize_q4_k(gate_f32).into_boxed_slice());
+        let up: &'static [u8] = Box::leak(quantize_q4_k(up_f32).into_boxed_slice());
+        let down: &'static [u8] = Box::leak(quantize_q4_k(down_f32).into_boxed_slice());
+        let empty = larql_compute::QuantWeight {
+            data: &[],
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
+        let qw = |d: &'static [u8]| larql_compute::QuantWeight {
+            data: d,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
+        let layer = larql_compute::pipeline_layer::build_arch_params(
+            weights,
+            layer_idx,
+            empty,
+            empty,
+            empty,
+            empty,
+            qw(gate),
+            qw(up),
+            qw(down),
+        );
+        (layer, inter)
+    }
+
+    /// `moe_outer_norm` returns the dedicated outer norm when
+    /// `moe_combined_output_norm` is set, and `None` otherwise.
+    #[test]
+    fn moe_outer_norm_selection_matches_reference() {
+        let weights = Box::leak(Box::new(make_test_gemma4_moe_weights()));
+        let (layer, _) = build_moe_layer_from_fixture(weights, 0);
+        // Gemma 4 ships a combined-output norm → dedicated outer norm wins.
+        assert!(layer.moe_combined_output_norm);
+        let selected = crate::pipeline::moe_outer_norm(&layer);
+        assert!(
+            selected.is_some(),
+            "combined_output_norm arch must select an outer norm"
+        );
+        // The dedicated `moe_outer_post_norm` is preferred over `post_ffn_norm`
+        // when present.
+        if layer.moe_outer_post_norm.is_some() {
+            assert_eq!(
+                selected, layer.moe_outer_post_norm,
+                "dedicated moe_outer_post_norm must be preferred"
+            );
+        }
+    }
+
+    /// `host_ffn_block_moe_decode` must compose the dense slab (delta) +
+    /// substrate expert block + substrate outer combine in exactly the
+    /// documented Gemma-4 order. This locks the wiring: a bug that uses the
+    /// full dense slab (instead of the delta), the wrong outer norm, or
+    /// skips the expert contribution diverges from the independently-built
+    /// reference. Host-runnable (CPU-fallback matvec on no-CUDA hosts).
+    #[test]
+    fn moe_decode_block_matches_independent_composition() {
+        use larql_compute::cpu::ops::moe::cpu_moe_forward;
+        use larql_compute::cpu::ops::outer_combine::outer_post_norm_residual;
+
+        let b = backend();
+        let weights = Box::leak(Box::new(make_test_gemma4_moe_weights()));
+        let (layer, inter) = build_moe_layer_from_fixture(weights, 0);
+        let hidden = weights.hidden_size;
+        let moe = layer.moe.as_ref().expect("moe fixture layer has experts");
+
+        // Synthetic post-attention residual (non-trivial so the expert
+        // block routes to nonzero outputs).
+        let h_post_attn: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 * 0.013) - 1.7).sin())
+            .collect();
+        let h_pa = Array2::from_shape_vec((1, hidden), h_post_attn.clone()).unwrap();
+
+        let got = b
+            .host_ffn_block_moe_decode(&layer, &h_pa, hidden, inter)
+            .expect("host MoE decode block must succeed");
+        assert_eq!(got.shape(), &[1, hidden]);
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "MoE output must be finite"
+        );
+
+        // Independent reference: dense slab (same backend) → delta, plus the
+        // substrate expert block, combined via the substrate outer norm.
+        let dense = b
+            .host_ffn_block(&layer, &h_pa, hidden, inter)
+            .expect("dense slab");
+        let h2 = cpu_moe_forward(&h_post_attn, moe, layer.norm_offset, layer.eps);
+        let mut combined = vec![0.0f32; hidden];
+        for i in 0..hidden {
+            combined[i] = (dense[[0, i]] - h_post_attn[i]) + h2[i];
+        }
+        let outer_w = crate::pipeline::moe_outer_norm(&layer);
+        let expected = outer_post_norm_residual(
+            &h_post_attn,
+            &combined,
+            outer_w,
+            layer.norm_offset,
+            layer.eps,
+        );
+
+        let max_abs = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-5,
+            "MoE decode block diverged from independent composition: max_abs={max_abs:.6e}"
+        );
+
+        // Sanity: the expert contribution actually changed the output vs the
+        // dense-only slab (proves the expert block was wired in, not skipped).
+        let dense_max = dense
+            .iter()
+            .zip(got.iter())
+            .map(|(d, g)| (d - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            dense_max > 1e-4,
+            "MoE output should differ from the dense-only slab (dense_max={dense_max:.6e})"
+        );
+    }
+
+    /// Multi-position version of the composition parity (prefill MoE FFN
+    /// block). Host-runnable.
+    #[test]
+    fn moe_prefill_block_matches_independent_composition() {
+        use larql_compute::cpu::ops::moe::cpu_moe_forward;
+        use larql_compute::cpu::ops::outer_combine::outer_post_norm_residual;
+
+        let b = backend();
+        let weights = Box::leak(Box::new(make_test_gemma4_moe_weights()));
+        let (layer, inter) = build_moe_layer_from_fixture(weights, 0);
+        let hidden = weights.hidden_size;
+        let moe = layer.moe.as_ref().expect("moe fixture layer has experts");
+        let seq_len = 3usize;
+
+        let h_flat: Vec<f32> = (0..seq_len * hidden)
+            .map(|i| ((i as f32 * 0.007) - 0.9).sin())
+            .collect();
+        let h_pa = Array2::from_shape_vec((seq_len, hidden), h_flat.clone()).unwrap();
+
+        let got = b
+            .host_prefill_ffn_block_moe(&layer, &h_pa, hidden, inter)
+            .expect("host MoE prefill block must succeed");
+        assert_eq!(got.shape(), &[seq_len, hidden]);
+        assert!(got.iter().all(|v| v.is_finite()));
+
+        // Independent reference, per position.
+        let dense = b
+            .host_prefill_ffn_block(&layer, &h_pa, hidden, inter)
+            .expect("dense slab");
+        let outer_w = crate::pipeline::moe_outer_norm(&layer);
+        let mut expected = vec![0.0f32; seq_len * hidden];
+        for pos in 0..seq_len {
+            let off = pos * hidden;
+            let h2 = cpu_moe_forward(
+                &h_flat[off..off + hidden],
+                moe,
+                layer.norm_offset,
+                layer.eps,
+            );
+            let mut combined = vec![0.0f32; hidden];
+            for i in 0..hidden {
+                combined[i] = (dense[[pos, i]] - h_flat[off + i]) + h2[i];
+            }
+            let row = outer_post_norm_residual(
+                &h_flat[off..off + hidden],
+                &combined,
+                outer_w,
+                layer.norm_offset,
+                layer.eps,
+            );
+            expected[off..off + hidden].copy_from_slice(&row);
+        }
+        let max_abs = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-5,
+            "MoE prefill block diverged from independent composition: max_abs={max_abs:.6e}"
+        );
+    }
+
+    /// PLE and remote-FFN layers still bail to `None` (they need data / a
+    /// callback the trait surface doesn't carry). Drives the bail via the
+    /// host path directly so it runs on every host (no runtime gate).
+    #[test]
+    fn ple_and_remote_ffn_layers_bail_to_none() {
+        let weights = Box::leak(Box::new(make_test_gemma4_moe_weights()));
+        let hidden = weights.hidden_size;
+        let inter = build_moe_layer_from_fixture(weights, 0).1;
+        let b = backend();
+        let x = vec![0.1f32; hidden];
+
+        // Baseline: the MoE layer runs.
+        let layer = build_moe_layer_from_fixture(weights, 0).0;
+        let layers = vec![layer];
+        assert!(b
+            .host_decode_token(
+                &layers,
+                &x,
+                hidden,
+                inter,
+                0,
+                None,
+                larql_compute::StateDumpMask::None
+            )
+            .is_some());
+
+        // Mark the layer remote → bail.
+        let mut remote = build_moe_layer_from_fixture(weights, 0).0;
+        remote.ffn_is_remote = true;
+        let remote_layers = vec![remote];
+        assert!(b
+            .host_decode_token(
+                &remote_layers,
+                &x,
+                hidden,
+                inter,
+                0,
+                None,
+                larql_compute::StateDumpMask::None
+            )
+            .is_none());
+
+        // PLE gate present → bail (synthesise a non-None gate slice).
+        let mut ple = build_moe_layer_from_fixture(weights, 0).0;
+        ple.ple_input_gate = Some(&[]);
+        let ple_layers = vec![ple];
+        assert!(b
+            .host_decode_token(
+                &ple_layers,
+                &x,
+                hidden,
+                inter,
+                0,
+                None,
+                larql_compute::StateDumpMask::None
+            )
+            .is_none());
+
+        // Prefill path bails too.
+        let xp = vec![0.1f32; hidden * 2];
+        assert!(b
+            .host_prefill_kquant(&remote_layers, &xp, hidden, inter, 2, 0.0)
+            .is_none());
+        assert!(b
+            .host_prefill_kquant(&ple_layers, &xp, hidden, inter, 2, 0.0)
+            .is_none());
+    }
+
+    /// End-to-end MoE prefill + decode through the public trait surface.
+    /// Runtime-gated (no-op on hosts without a CUDA runtime): on real
+    /// hardware this exercises the full MoE pipeline (native projections +
+    /// host expert block + KV mirror). Asserts shape/finite only — the
+    /// composition parity is pinned by the host-runnable tests above.
+    #[test]
+    fn moe_prefill_and_decode_run_through_trait_surface() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = Box::leak(Box::new(make_test_gemma4_moe_weights()));
+        let arch = &*weights.arch;
+        let inter = build_moe_layer_from_fixture(weights, 0).1;
+        // Build one layer per model layer (reuse the same fixture layer —
+        // synthetic weights, so cross-layer identity is fine for a smoke run).
+        let layers: Vec<larql_compute::FullPipelineLayer<'static>> = (0..weights.num_layers)
+            .map(|_| build_moe_layer_from_fixture(weights, 0).0)
+            .collect();
+        let hidden = weights.hidden_size;
+        let seq_len = 2usize;
+        let x: Vec<f32> = (0..seq_len * hidden)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect();
+
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+
+        let h = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, 0.0)
+            .expect("MoE prefill must succeed with a runtime");
+        assert_eq!(h.len(), seq_len * hidden);
+        assert!(h.iter().all(|v| v.is_finite()));
+
+        let x_dec: Vec<f32> = x[..hidden].to_vec();
+        let h_dec = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("MoE decode must succeed with a runtime");
+        assert_eq!(h_dec.len(), hidden);
+        assert!(h_dec.iter().all(|v| v.is_finite()));
+    }
 }

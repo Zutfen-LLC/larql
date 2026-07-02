@@ -34,6 +34,8 @@
 
 use larql_compute::attention::decode::gqa_attention_decode_step;
 use larql_compute::attention::rope::apply_rope_partial_at_full;
+use larql_compute::cpu::ops::moe::cpu_moe_forward;
+use larql_compute::cpu::ops::outer_combine::outer_post_norm_residual;
 use larql_compute::residual::{
     layer_norm_eps, rms_norm_eps, rms_norm_heads, rms_norm_heads_no_weight,
 };
@@ -117,11 +119,13 @@ impl CudaBackend {
 
         let mut h = Array2::from_shape_vec((1, hidden), x.to_vec()).ok()?;
         for (li, layer) in layers.iter().enumerate() {
-            if layer.moe.is_some() || layer.ple_input_gate.is_some() || layer.ffn_is_remote {
-                // Hybrid-MoE / PLE / remote-FFN archs aren't handled by this
-                // host-orchestrated path yet — bail so the caller's CPU
-                // fallback runs. (The Q4K decode fixture is plain dense, so
-                // parity tests stay green.)
+            // MoE layers are handled by the host-orchestrated expert path
+            // below (`host_ffn_block_moe_decode`). PLE / remote-FFN still
+            // bail: PLE needs the precomputed per-layer embedding input
+            // (token-embedding-derived, not carried on `FullPipelineLayer`),
+            // and remote-FFN needs a dispatch callback (only
+            // `decode_token_with_moe` carries one).
+            if layer.ple_input_gate.is_some() || layer.ffn_is_remote {
                 return None;
             }
             if let Some(dump) = state.as_deref_mut() {
@@ -163,9 +167,16 @@ impl CudaBackend {
                 }
             }
 
-            let mut h_post_ffn = self.host_ffn_block(layer, &h_post_attn, hidden, inter)?;
+            let mut h_post_ffn = if layer.moe.is_some() {
+                self.host_ffn_block_moe_decode(layer, &h_post_attn, hidden, inter)?
+            } else {
+                self.host_ffn_block(layer, &h_post_attn, hidden, inter)?
+            };
 
             // Per-layer scalar (Gemma 4). Skip 0.0 (absent) and 1.0 (identity).
+            // Applied uniformly for dense + MoE: the MoE block returns the
+            // outer-combined residual (no PLE on the supported 26B-A4B path),
+            // so the scalar is the final step, matching `moe_ffn_block_cpu`.
             let scalar = layer.layer_scalar;
             if scalar != 0.0 && scalar != 1.0 {
                 h_post_ffn.mapv_inplace(|v| v * scalar);
@@ -203,17 +214,24 @@ impl CudaBackend {
 
         let mut h = Array2::from_shape_vec((seq_len, hidden), x.to_vec()).ok()?;
         for (li, layer) in layers.iter().enumerate() {
-            if layer.moe.is_some() || layer.ple_input_gate.is_some() || layer.ffn_is_remote {
+            // See the decode loop for the PLE / remote-FFN bail rationale.
+            if layer.ple_input_gate.is_some() || layer.ffn_is_remote {
                 return None;
             }
             let h_post_attn = self.host_prefill_attention_block(layer, &h, li, softcap_opt)?;
-            h = self.host_prefill_ffn_block(layer, &h_post_attn, hidden, inter)?;
+            let mut h_post_ffn = if layer.moe.is_some() {
+                self.host_prefill_ffn_block_moe(layer, &h_post_attn, hidden, inter)?
+            } else {
+                self.host_prefill_ffn_block(layer, &h_post_attn, hidden, inter)?
+            };
 
-            // Per-layer scalar (Gemma 4). Skip 0.0 / 1.0.
+            // Per-layer scalar (Gemma 4). Skip 0.0 / 1.0. Applied for dense
+            // + MoE (the MoE block returns the outer-combined residual).
             let scalar = layer.layer_scalar;
             if scalar != 0.0 && scalar != 1.0 {
-                h.mapv_inplace(|v| v * scalar);
+                h_post_ffn.mapv_inplace(|v| v * scalar);
             }
+            h = h_post_ffn;
         }
 
         let out: Vec<f32> = h.iter().cloned().collect();
@@ -368,7 +386,7 @@ impl CudaBackend {
 
     /// Prefill FFN block for one layer: pre-ffn norm → gate/up matmul (all
     /// seq) → activation → down matmul → post-ffn residual.
-    fn host_prefill_ffn_block(
+    pub(crate) fn host_prefill_ffn_block(
         &self,
         layer: &FullPipelineLayer<'_>,
         h_post_attn: &Array2<f32>,
@@ -651,7 +669,7 @@ impl CudaBackend {
 
     /// One FFN block: pre-ffn norm → gate/up proj → activation → down proj →
     /// post-ffn residual.
-    fn host_ffn_block(
+    pub(crate) fn host_ffn_block(
         &self,
         layer: &FullPipelineLayer<'_>,
         h_post_attn: &Array2<f32>,
@@ -732,6 +750,78 @@ impl CudaBackend {
         };
         Some(h_post_ffn)
     }
+
+    /// Hybrid-MoE FFN block for a single decode token (Gemma 4 26B-A4B
+    /// shape). Runs the dense slab via the existing [`host_ffn_block`]
+    /// (native quant matvec projections + host elementwise + post-FFN
+    /// norm + residual), the expert block via the substrate reference
+    /// [`cpu_moe_forward`], then combines the two with the Gemma-4 outer
+    /// post-norm + residual — the structure of
+    /// `larql-inference::moe_ffn_block_cpu_with_index`:
+    ///
+    ///   h1 = dense_slab - h_post_attn   (the dense delta; the slab
+    ///                                    already carries the residual)
+    ///   h2 = cpu_moe_forward(h_post_attn)  (the expert contribution)
+    ///   out = h_post_attn + outer_norm(h1 + h2)
+    ///
+    /// `None` if the dense slab or expert block can't be computed — the
+    /// caller falls back to the CPU engine path. Per-layer `layer_scalar`
+    /// is NOT applied here; the decode loop applies it uniformly for dense
+    /// and MoE (PLE is a no-op on the 26B-A4B target, so the scalar is the
+    /// final step in both cases).
+    pub(crate) fn host_ffn_block_moe_decode(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn: &Array2<f32>,
+        hidden: usize,
+        inter: usize,
+    ) -> Option<Array2<f32>> {
+        let moe = layer.moe.as_ref()?;
+        let h_post_ffn_dense = self.host_ffn_block(layer, h_post_attn, hidden, inter)?;
+        let ha = h_post_attn.as_slice()?;
+        let dense = h_post_ffn_dense.as_slice()?;
+        let outer_w = moe_outer_norm(layer);
+        let mut combined = vec![0.0f32; hidden];
+        let out = moe_combine_row(ha, dense, moe, layer, outer_w, &mut combined);
+        Some(vec_to_2d_row(out))
+    }
+
+    /// Multi-position hybrid-MoE FFN block (prefill). Same structure as
+    /// [`host_ffn_block_moe_decode`] but the dense slab uses the amortised
+    /// native quant matmul across all `seq_len` positions
+    /// ([`host_prefill_ffn_block`]), and the expert block + outer combine
+    /// run per position via [`moe_combine_row`] (the substrate
+    /// `cpu_moe_forward` is single-token). The `combined` scratch is
+    /// hoisted out of the per-position loop to avoid per-token allocation.
+    pub(crate) fn host_prefill_ffn_block_moe(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn: &Array2<f32>,
+        hidden: usize,
+        inter: usize,
+    ) -> Option<Array2<f32>> {
+        let moe = layer.moe.as_ref()?;
+        let seq_len = h_post_attn.shape()[0];
+        let h_post_ffn_dense = self.host_prefill_ffn_block(layer, h_post_attn, hidden, inter)?;
+        let ha = h_post_attn.as_slice()?;
+        let dense = h_post_ffn_dense.as_slice()?;
+        let outer_w = moe_outer_norm(layer);
+        let mut combined = vec![0.0f32; hidden];
+        let mut out = vec![0.0f32; seq_len * hidden];
+        for pos in 0..seq_len {
+            let off = pos * hidden;
+            let row = moe_combine_row(
+                &ha[off..off + hidden],
+                &dense[off..off + hidden],
+                moe,
+                layer,
+                outer_w,
+                &mut combined,
+            );
+            out[off..off + hidden].copy_from_slice(&row);
+        }
+        Array2::from_shape_vec((seq_len, hidden), out).ok()
+    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -811,6 +901,48 @@ fn rope_fraction(layer: &FullPipelineLayer<'_>) -> f64 {
     } else {
         layer.rotary_dim as f64 / layer.head_dim as f64
     }
+}
+
+/// Select the outer post-combine norm weight for a hybrid-MoE layer.
+/// When the arch ships a combined-output norm (Gemma 4 26B-A4B:
+/// `moe_combined_output_norm == true`), the outer norm is the dedicated
+/// `moe_outer_post_norm` (`post_feedforward_layernorm`, un-suffixed),
+/// falling back to `post_ffn_norm` (`_1`) when the dedicated key is
+/// absent. Mirrors `moe_ffn_block_cpu_with_index`'s outer-norm
+/// selection. `None` when the arch has no combined-output norm.
+pub(crate) fn moe_outer_norm<'a>(layer: &'a FullPipelineLayer<'a>) -> Option<&'a [f32]> {
+    if layer.moe_combined_output_norm {
+        layer.moe_outer_post_norm.or(layer.post_ffn_norm)
+    } else {
+        None
+    }
+}
+
+/// Per-row MoE combine, shared by the decode (single-row) and prefill
+/// (per-position) MoE FFN blocks so the Gemma-4 combine formula lives in
+/// exactly one place:
+///
+///   combined = (dense_row - ha_row) + cpu_moe_forward(ha_row)
+///   out      = outer_post_norm_residual(ha_row, combined, outer_w, …)
+///
+/// The dense slab already carries the residual, so subtracting `ha_row`
+/// recovers the dense delta — the outer combine re-adds the residual once
+/// (no double count). `combined` is caller-owned scratch of length
+/// `hidden`, reused across positions in prefill to avoid per-token
+/// allocation (mirrors the substrate MoE code's TLS-scratch discipline).
+pub(crate) fn moe_combine_row(
+    ha_row: &[f32],
+    dense_row: &[f32],
+    moe: &larql_compute::MoeLayerWeights<'_>,
+    layer: &FullPipelineLayer<'_>,
+    outer_w: Option<&[f32]>,
+    combined: &mut [f32],
+) -> Vec<f32> {
+    let h2 = cpu_moe_forward(ha_row, moe, layer.norm_offset, layer.eps);
+    for (i, c) in combined.iter_mut().enumerate() {
+        *c = (dense_row[i] - ha_row[i]) + h2[i];
+    }
+    outer_post_norm_residual(ha_row, combined, outer_w, layer.norm_offset, layer.eps)
 }
 
 /// `h + b_scale * x` for `[1, hidden]` arrays.
