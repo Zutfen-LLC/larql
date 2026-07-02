@@ -209,6 +209,59 @@ impl CudaBackend {
         self.runtime.is_some()
     }
 
+    /// Native RMSNorm (body norm) — the device twin of
+    /// `larql_compute::residual::rms_norm_eps`. Computes `out` in place into
+    /// the caller's buffer. Returns `Ok(true)` on a native launch, `Ok(false)`
+    /// when there's no runtime (caller falls back to the host reference), or
+    /// `Err` on a launch failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn native_rms_norm(
+        &self,
+        x: &[f32],
+        weight: Option<&[f32]>,
+        out: &mut [f32],
+        rows: usize,
+        cols: usize,
+        eps: f64,
+        offset: f32,
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_rms_norm(x, weight, out, rows, cols, eps, offset)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Native per-head RMSNorm — the device twin of
+    /// `larql_compute::residual::rms_norm_heads` / `rms_norm_heads_no_weight`.
+    /// `weight = None` selects the parameter-free path. Returns `Ok(true)` on
+    /// a native launch, `Ok(false)` when there's no runtime, or `Err` on a
+    /// launch failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn native_rms_norm_heads(
+        &self,
+        x: &[f32],
+        weight: Option<&[f32]>,
+        out: &mut [f32],
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        eps: f64,
+        offset: f32,
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_rms_norm_heads(
+                    x, weight, out, seq_len, num_heads, head_dim, eps, offset,
+                )?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Lock the KV-cache mutex, recovering from poisoning by taking the
     /// inner value (a poisoned mutex only means a prior holder panicked; the
     /// cache itself is still usable). This keeps the documented "fall back

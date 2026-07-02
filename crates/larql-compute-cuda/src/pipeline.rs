@@ -259,7 +259,7 @@ impl CudaBackend {
         let hidden = h.shape()[1];
 
         // Input norm over [seq, hidden].
-        let h_norm = norm_2d(
+        let h_norm = self.norm_2d(
             layer.norm_type,
             h,
             layer.input_norm,
@@ -302,13 +302,13 @@ impl CudaBackend {
         // QK-norm.
         let qk_off = layer.qk_norm_offset;
         if let Some(w) = layer.q_norm_weight {
-            q = rms_norm_heads(&q, w, num_q, head_dim, qk_off);
+            q = self.rms_norm_heads_array(&q, Some(w), num_q, head_dim, qk_off);
         }
         if let Some(w) = layer.k_norm_weight {
-            k = rms_norm_heads(&k, w, num_kv, head_dim, qk_off);
+            k = self.rms_norm_heads_array(&k, Some(w), num_kv, head_dim, qk_off);
         }
         if layer.has_v_norm {
-            v = rms_norm_heads_no_weight(&v, num_kv, head_dim);
+            v = self.rms_norm_heads_array(&v, None, num_kv, head_dim, 0.0);
         }
 
         // RoPE at position_offset=0 (positions 0..seq_len handled inside).
@@ -370,7 +370,7 @@ impl CudaBackend {
         // Post-attention residual (+ optional post-attn norm).
         let res_mult = layer.residual_multiplier;
         let h_post_attn = if layer.has_post_norms {
-            let normed = norm_2d(
+            let normed = self.norm_2d(
                 layer.norm_type,
                 &o,
                 layer.post_attn_norm,
@@ -401,14 +401,14 @@ impl CudaBackend {
             Some(layer.post_attn_norm)
         };
         let h_in = match pre_norm_w {
-            Some(w) => norm_2d(
+            Some(w) => self.norm_2d(
                 layer.norm_type,
                 h_post_attn,
                 w,
                 layer.norm_offset,
                 layer.eps,
             ),
-            None => rms_norm_eps(h_post_attn, None, layer.norm_offset, layer.eps as f64),
+            None => self.norm_2d_no_weight(h_post_attn, layer.norm_offset, layer.eps),
         };
         let h_in_flat: Vec<f32> = h_in.iter().cloned().collect();
         let h_in_slice = h_in_flat.as_slice();
@@ -483,8 +483,8 @@ impl CudaBackend {
         let h_post_ffn = if layer.has_post_norms {
             let norm_w = layer.post_ffn_norm;
             let normed = match norm_w {
-                Some(w) => norm_2d(layer.norm_type, &out, w, layer.norm_offset, layer.eps),
-                None => rms_norm_eps(&out, None, layer.norm_offset, layer.eps as f64),
+                Some(w) => self.norm_2d(layer.norm_type, &out, w, layer.norm_offset, layer.eps),
+                None => self.norm_2d_no_weight(&out, layer.norm_offset, layer.eps),
             };
             add_residual(h_post_attn, &normed, res_mult)
         } else {
@@ -517,7 +517,7 @@ impl CudaBackend {
         let softcap_opt: Option<f32> = None;
 
         // Input norm.
-        let h_norm = norm_1d(
+        let h_norm = self.norm_1d(
             layer.norm_type,
             h,
             layer.input_norm,
@@ -560,16 +560,16 @@ impl CudaBackend {
         // QK-norm (per-head RMSNorm) — Gemma 3/4.
         let qk_off = layer.qk_norm_offset;
         let q_normed = match layer.q_norm_weight {
-            Some(w) => rms_norm_heads(&q_full, w, num_q, head_dim, qk_off),
+            Some(w) => self.rms_norm_heads_array(&q_full, Some(w), num_q, head_dim, qk_off),
             None => q_full,
         };
         let k_normed = match layer.k_norm_weight {
-            Some(w) => rms_norm_heads(&k_full, w, num_kv, head_dim, qk_off),
+            Some(w) => self.rms_norm_heads_array(&k_full, Some(w), num_kv, head_dim, qk_off),
             None => k_full,
         };
         // V-norm (parameter-free, Gemma 4).
         if layer.has_v_norm {
-            v_full = rms_norm_heads_no_weight(&v_full, num_kv, head_dim);
+            v_full = self.rms_norm_heads_array(&v_full, None, num_kv, head_dim, 0.0);
         }
 
         // RoPE on Q and K at `abs_position`. Thread the per-layer position
@@ -652,7 +652,7 @@ impl CudaBackend {
         // Post-attention residual (+ optional post-attn norm).
         let res_mult = layer.residual_multiplier;
         let h_post_attn = if layer.has_post_norms {
-            let normed = norm_1d(
+            let normed = self.norm_1d(
                 layer.norm_type,
                 &attn_projected,
                 layer.post_attn_norm,
@@ -684,14 +684,14 @@ impl CudaBackend {
             Some(layer.post_attn_norm)
         };
         let h_in = match pre_norm_w {
-            Some(w) => norm_1d(
+            Some(w) => self.norm_1d(
                 layer.norm_type,
                 h_post_attn,
                 w,
                 layer.norm_offset,
                 layer.eps,
             ),
-            None => rms_norm_eps(h_post_attn, None, layer.norm_offset, layer.eps as f64),
+            None => self.norm_2d_no_weight(h_post_attn, layer.norm_offset, layer.eps),
         };
         let h_in_row = h_norm_row(&h_in);
 
@@ -741,8 +741,8 @@ impl CudaBackend {
         let h_post_ffn = if layer.has_post_norms {
             let norm_w = layer.post_ffn_norm;
             let normed = match norm_w {
-                Some(w) => norm_1d(layer.norm_type, &out, w, layer.norm_offset, layer.eps),
-                None => rms_norm_eps(&out, None, layer.norm_offset, layer.eps as f64),
+                Some(w) => self.norm_1d(layer.norm_type, &out, w, layer.norm_offset, layer.eps),
+                None => self.norm_2d_no_weight(&out, layer.norm_offset, layer.eps),
             };
             add_residual(h_post_attn, &normed, res_mult)
         } else {
@@ -852,32 +852,143 @@ impl CudaBackend {
     }
 }
 
-/// RMSNorm or LayerNorm for a `[rows, cols]` array using a `&[f32]` weight.
-fn norm_2d(
-    norm_type: NormType,
-    x: &Array2<f32>,
-    weight: &[f32],
-    offset: f32,
-    eps: f32,
-) -> Array2<f32> {
-    // TODO: pass &[f32] directly if rms_norm_eps accepts &[f32]
-    let w_vec: Vec<f32> = weight.to_vec();
-    match norm_type {
-        NormType::RmsNorm => rms_norm_eps(x, Some(&w_vec), offset, eps as f64),
-        NormType::LayerNorm => layer_norm_eps(x, Some(&w_vec), None, eps as f64),
-    }
-}
+impl CudaBackend {
+    /// Minimum element count for a native norm dispatch to be worth the
+    /// host→device upload + kernel launch + sync + device→host readback
+    /// round-trip. Below this, the host `rms_norm_eps` reference is faster
+    /// (the norm output is read straight back to host and re-uploaded by the
+    /// next op, so there's no fusion benefit — only transfer+sync overhead).
+    /// Mirrors the rationale of Metal's `calibration::DEFAULT_FLOP_THRESHOLD`
+    /// for the dense GEMVs: only pay the device round-trip when the op is big
+    /// enough to amortise it. Tuned conservatively for correctness-first
+    /// (the host-orchestrated path is the parity oracle); the fully-fused
+    /// single-command-buffer pipeline lifts this gate.
+    const NORM_NATIVE_MIN_ELEMS: usize = 8192;
 
-/// RMSNorm or LayerNorm for a `[1, cols]` row using a `&[f32]` weight
-/// (the `FullPipelineLayer` carries norm weights as `&[f32]`, not `&Vec<f32>`).
-fn norm_1d(
-    norm_type: NormType,
-    x: &Array2<f32>,
-    weight: &[f32],
-    offset: f32,
-    eps: f32,
-) -> Array2<f32> {
-    norm_2d(norm_type, x, weight, offset, eps)
+    /// True when a norm of `elems` elements is large enough that the native
+    /// CUDA kernel is likely to beat the host reference after the per-call
+    /// device round-trip.
+    fn native_norm_worthwhile(elems: usize) -> bool {
+        elems >= Self::NORM_NATIVE_MIN_ELEMS
+    }
+
+    /// RMSNorm or LayerNorm for a `[rows, cols]` array using a `&[f32]`
+    /// weight. Routes the RmsNorm arm through the native CUDA `rms_norm`
+    /// kernel when a runtime is present AND the norm is large enough to
+    /// amortise the device round-trip (see `NORM_NATIVE_MIN_ELEMS`); falls
+    /// back to the host reference on `Ok(false)`/`Err`, non-contiguous views,
+    /// or small norms. `weight` must be `Some` (the `None`-weight pre-ffn
+    /// path uses `norm_2d_no_weight`).
+    pub(crate) fn norm_2d(
+        &self,
+        norm_type: NormType,
+        x: &Array2<f32>,
+        weight: &[f32],
+        offset: f32,
+        eps: f32,
+    ) -> Array2<f32> {
+        let (rows, cols) = (x.shape()[0], x.shape()[1]);
+        match norm_type {
+            NormType::RmsNorm => {
+                // Non-contiguous views are rare here (the pipeline builds
+                // contiguous arrays); fall through to the host reference
+                // rather than packing into a staging buffer.
+                let x_flat = x.as_slice().unwrap_or(&[]);
+                if !x_flat.is_empty() && Self::native_norm_worthwhile(rows * cols) {
+                    let mut out = vec![0.0f32; rows * cols];
+                    if let Ok(true) = self.native_rms_norm(
+                        x_flat,
+                        Some(weight),
+                        &mut out,
+                        rows,
+                        cols,
+                        eps as f64,
+                        offset,
+                    ) {
+                        return Array2::from_shape_vec((rows, cols), out)
+                            .expect("native rms_norm output shape");
+                    }
+                }
+                let w_vec: Vec<f32> = weight.to_vec();
+                rms_norm_eps(x, Some(&w_vec), offset, eps as f64)
+            }
+            NormType::LayerNorm => {
+                let w_vec: Vec<f32> = weight.to_vec();
+                layer_norm_eps(x, Some(&w_vec), None, eps as f64)
+            }
+        }
+    }
+
+    /// `None`-weight RMSNorm (the pre-ffn norm path when `has_post_norms` is
+    /// false: `rms_norm_eps` with `weight = None`, which uses `w = 1.0`).
+    /// Routes through the native `rms_norm` kernel with `has_weight = 0`
+    /// when a runtime is present AND the norm is large enough to amortise
+    /// the device round-trip; falls back to the host reference otherwise.
+    pub(crate) fn norm_2d_no_weight(&self, x: &Array2<f32>, offset: f32, eps: f32) -> Array2<f32> {
+        let (rows, cols) = (x.shape()[0], x.shape()[1]);
+        let x_flat = x.as_slice().unwrap_or(&[]);
+        if !x_flat.is_empty() && Self::native_norm_worthwhile(rows * cols) {
+            let mut out = vec![0.0f32; rows * cols];
+            if let Ok(true) =
+                self.native_rms_norm(x_flat, None, &mut out, rows, cols, eps as f64, offset)
+            {
+                return Array2::from_shape_vec((rows, cols), out)
+                    .expect("native rms_norm output shape");
+            }
+        }
+        rms_norm_eps(x, None, offset, eps as f64)
+    }
+
+    /// RMSNorm or LayerNorm for a `[1, cols]` row using a `&[f32]` weight
+    /// (the `FullPipelineLayer` carries norm weights as `&[f32]`, not
+    /// `&Vec<f32>`). Routes the RmsNorm arm through the native kernel.
+    pub(crate) fn norm_1d(
+        &self,
+        norm_type: NormType,
+        x: &Array2<f32>,
+        weight: &[f32],
+        offset: f32,
+        eps: f32,
+    ) -> Array2<f32> {
+        self.norm_2d(norm_type, x, weight, offset, eps)
+    }
+
+    /// Per-head RMSNorm over a `[seq_len, num_heads*head_dim]` array — the
+    /// device twin of `larql_compute::residual::rms_norm_heads` (weighted)
+    /// / `rms_norm_heads_no_weight` (`weight = None`). Uses the substrate
+    /// `DEFAULT_EPS = 1e-6` (the per-head CPU references hard-code it, so the
+    /// native path must too for parity). Routes through the native
+    /// `rms_norm_heads` kernel when a runtime is present AND the norm is
+    /// large enough to amortise the device round-trip; falls back to the
+    /// host reference on `Ok(false)`/`Err`, non-contiguous views, or small
+    /// norms. The weighted kernel indexes `weight[d]` (broadcast across
+    /// heads), matching the CPU `rms_norm_heads` reference and the real
+    /// Gemma3/4 `[head_dim]`-shaped q_norm/k_norm weights.
+    pub(crate) fn rms_norm_heads_array(
+        &self,
+        x: &Array2<f32>,
+        weight: Option<&[f32]>,
+        num_heads: usize,
+        head_dim: usize,
+        offset: f32,
+    ) -> Array2<f32> {
+        let (rows, cols) = (x.shape()[0], x.shape()[1]);
+        let x_flat = x.as_slice().unwrap_or(&[]);
+        if !x_flat.is_empty() && Self::native_norm_worthwhile(rows * cols) {
+            let mut out = vec![0.0f32; rows * cols];
+            let eps = larql_compute::residual::DEFAULT_EPS;
+            if let Ok(true) = self.native_rms_norm_heads(
+                x_flat, weight, &mut out, rows, num_heads, head_dim, eps, offset,
+            ) {
+                return Array2::from_shape_vec((rows, cols), out)
+                    .expect("native rms_norm_heads output shape");
+            }
+        }
+        match weight {
+            Some(w) => rms_norm_heads(x, w, num_heads, head_dim, offset),
+            None => rms_norm_heads_no_weight(x, num_heads, head_dim),
+        }
+    }
 }
 
 fn h_norm_row(arr: &Array2<f32>) -> &[f32] {

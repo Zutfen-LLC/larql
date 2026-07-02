@@ -80,6 +80,22 @@ pub const KV_APPEND_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const RMS_NORM_KERNEL: KernelHandle = KernelHandle::new(
+    "rms_norm",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
+pub const RMS_NORM_HEADS_KERNEL: KernelHandle = KernelHandle::new(
+    "rms_norm_heads",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -777,5 +793,173 @@ extern "C" __global__ void kv_append(
         + (unsigned long long)elem;
     k_cache[slot] = new_k[tid];
     v_cache[slot] = new_v[tid];
+}
+"#;
+
+/// RMSNorm over each row of a `[rows, cols]` matrix — the device twin of
+/// `larql_compute::residual::rms_norm_eps`. One thread-block per row: a
+/// block-reduction of the sum-of-squares in f64, then
+/// `out[i,j] = x[i,j] / rms * (offset + w[j])` (or `* 1.0` when
+/// `has_weight == 0`, mirroring the `None` weight arm of the CPU reference).
+///
+/// The reduction matches the CPU reference's f64 accumulation: each thread
+/// loads its element as `double`, contributes its squared value to a
+/// warp+block reduction in `double`, broadcasts the `rms = sqrt(mean_sq +
+/// eps)` to all threads, and writes its output. `eps` is a `double` arg so
+/// the `+ eps` happens at f64 precision exactly as on the host.
+pub const RMS_NORM_CUDA_SRC: &str = r#"
+extern "C" __global__ void rms_norm(
+    const float* x,
+    const float* weight,
+    float* out,
+    unsigned int rows,
+    unsigned int cols,
+    double eps,
+    float offset,
+    int has_weight)
+{
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_dim = blockDim.x;
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    // 64-bit row offset: a large hidden (rows*cols > 2^32) would wrap a
+    // 32-bit `row * cols` and read OOB. The host launcher guards the same
+    // limit on the dims.
+    const unsigned long long row_off = (unsigned long long)row * (unsigned long long)cols;
+    const float* x_row = x + row_off;
+    float* out_row = out + row_off;
+
+    // f64 sum-of-squares, strided across the row.
+    double sq_sum = 0.0;
+    for (unsigned int j = tid; j < cols; j += block_dim) {
+        const double v = (double)x_row[j];
+        sq_sum += v * v;
+    }
+
+    // Block reduction in f64 (warp shuffle + shared memory for the cross-
+    // warp stage). 32 warps max → 1024 threads, the launcher's cap.
+    __shared__ double warp_sums[32];
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    for (unsigned int off = 16u; off > 0u; off >>= 1u) {
+        sq_sum += __shfl_down_sync(0xFFFFFFFFu, sq_sum, off);
+    }
+    if (lane == 0u) {
+        warp_sums[warp] = sq_sum;
+    }
+    __syncthreads();
+    const unsigned int num_warps = block_dim >> 5u;
+    if (warp == 0u) {
+        double w_sum = (tid < num_warps) ? warp_sums[tid] : 0.0;
+        for (unsigned int off = 16u; off > 0u; off >>= 1u) {
+            w_sum += __shfl_down_sync(0xFFFFFFFFu, w_sum, off);
+        }
+        if (lane == 0u) {
+            warp_sums[0u] = w_sum;
+        }
+    }
+    __syncthreads();
+    const double total_sq = warp_sums[0u];
+    const double mean_sq = total_sq / (double)cols;
+    const float rms = (float)sqrt(mean_sq + eps);
+
+    for (unsigned int j = tid; j < cols; j += block_dim) {
+        const float w = (has_weight != 0) ? (offset + weight[j]) : 1.0f;
+        out_row[j] = (x_row[j] / rms) * w;
+    }
+}
+"#;
+
+/// Per-head RMSNorm over each row's head blocks — the device twin of
+/// `larql_compute::residual::rms_norm_heads`. One thread-block per
+/// (sequence position, head): a block-reduction of the sum-of-squares over
+/// the `head_dim` elements of that head, then
+/// `out[s, off+d] = x[s, off+d] / rms * (offset + weight[off+d])` (or
+/// `* 1.0` when `has_weight == 0`, the parameter-free case). f64
+/// accumulation matches the CPU reference. This single entry point serves
+/// both the weighted (`rms_norm_heads`) and the no-weight
+/// (`rms_norm_heads_no_weight`) CPU references — the host launcher passes
+/// `has_weight = 0` and a dummy weight buffer for the no-weight path.
+pub const RMS_NORM_HEADS_CUDA_SRC: &str = r#"
+extern "C" __global__ void rms_norm_heads(
+    const float* x,
+    const float* weight,
+    float* out,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    double eps,
+    float offset,
+    int has_weight)
+{
+    // One block per (position, head). Flatten to a 1D grid: block index =
+    // pos * num_heads + head.
+    const unsigned int bid = blockIdx.x;
+    const unsigned int pos = bid / num_heads;
+    const unsigned int head = bid - pos * num_heads;
+    if (pos >= seq_len) {
+        return;
+    }
+    // 64-bit row stride: `num_heads * head_dim` is the per-row width. Widened
+    // before the multiply so the product can't wrap a 32-bit multiply (the
+    // host launcher additionally guards `num_heads * head_dim <= u32::MAX`).
+    const unsigned long long row_stride = (unsigned long long)num_heads
+        * (unsigned long long)head_dim;
+    const unsigned long long row_off = (unsigned long long)pos * row_stride;
+    const float* x_row = x + row_off;
+    float* out_row = out + row_off;
+    // `head_off` is the within-row offset to this head's `head_dim` block.
+    // Widened to 64-bit so `head * head_dim` can't wrap on a huge head count
+    // (the host launcher guards the product `num_heads * head_dim`, but a
+    // single head's start index `head * head_dim` is bounded by the same
+    // product and is safe in 64-bit).
+    const unsigned long long head_off = (unsigned long long)head
+        * (unsigned long long)head_dim;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_dim = blockDim.x;
+
+    double sq_sum = 0.0;
+    for (unsigned int d = tid; d < head_dim; d += block_dim) {
+        const double v = (double)x_row[head_off + d];
+        sq_sum += v * v;
+    }
+
+    __shared__ double warp_sums[32];
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    for (unsigned int off_s = 16u; off_s > 0u; off_s >>= 1u) {
+        sq_sum += __shfl_down_sync(0xFFFFFFFFu, sq_sum, off_s);
+    }
+    if (lane == 0u) {
+        warp_sums[warp] = sq_sum;
+    }
+    __syncthreads();
+    const unsigned int num_warps = block_dim >> 5u;
+    if (warp == 0u) {
+        double w_sum = (tid < num_warps) ? warp_sums[tid] : 0.0;
+        for (unsigned int off_s = 16u; off_s > 0u; off_s >>= 1u) {
+            w_sum += __shfl_down_sync(0xFFFFFFFFu, w_sum, off_s);
+        }
+        if (lane == 0u) {
+            warp_sums[0u] = w_sum;
+        }
+    }
+    __syncthreads();
+    const double total_sq = warp_sums[0u];
+    const double mean_sq = total_sq / (double)head_dim;
+    const float rms = (float)sqrt(mean_sq + eps);
+
+    for (unsigned int d = tid; d < head_dim; d += block_dim) {
+        // The CPU reference `rms_norm_heads_eps` indexes the weight as
+        // `weight[d]` — the same `head_dim`-length slice is broadcast across
+        // all heads (Gemma3/4 `q_norm.weight` is shape `[head_dim]`). Index
+        // `weight[d]`, NOT `weight[head_off + d]`.
+        const float w = (has_weight != 0) ? (offset + weight[d]) : 1.0f;
+        out_row[head_off + d] = (x_row[head_off + d] / rms) * w;
+    }
 }
 "#;

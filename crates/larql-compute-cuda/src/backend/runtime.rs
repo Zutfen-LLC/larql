@@ -11,7 +11,8 @@ use crate::ops::{
     KV_APPEND_KERNEL, Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC,
     Q4K_MATMUL_KERNEL, Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q4_MATVEC_CUDA_SRC,
     Q4_MATVEC_KERNEL, Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
-    Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL,
+    Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL, RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC,
+    RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
 };
 
 #[derive(Debug)]
@@ -32,6 +33,8 @@ pub(crate) struct CudaRuntime {
     q4_matvec: CudaFunction,
     q4_vecmat: CudaFunction,
     kv_append: CudaFunction,
+    rms_norm: CudaFunction,
+    rms_norm_heads: CudaFunction,
     summary: String,
 }
 
@@ -60,7 +63,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}"
         );
         let ptx = compile_ptx_with_opts(
             &combined_src,
@@ -103,6 +106,12 @@ impl CudaRuntime {
         let kv_append = module
             .load_function(KV_APPEND_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading kv_append CUDA function", err))?;
+        let rms_norm = module
+            .load_function(RMS_NORM_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading rms_norm CUDA function", err))?;
+        let rms_norm_heads = module
+            .load_function(RMS_NORM_HEADS_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading rms_norm_heads CUDA function", err))?;
         let stream = context.default_stream();
 
         Ok(Self {
@@ -119,8 +128,10 @@ impl CudaRuntime {
             q4_matvec,
             q4_vecmat,
             kv_append,
+            rms_norm,
+            rms_norm_heads,
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads loaded, remaining ops use CPU fallback"
             ),
         })
     }
@@ -952,6 +963,215 @@ impl CudaRuntime {
         self.stream
             .clone_dtoh(&out_dev)
             .map_err(|err| RuntimeError::context("reading CUDA q4_vecmat output", err))
+    }
+
+    /// Native RMSNorm over each row of a `[rows, cols]` matrix — the device
+    /// twin of `larql_compute::residual::rms_norm_eps`. `x` is the row-major
+    /// `[rows*cols]` flattened input. `weight` is `Some` for the learned-
+    /// weight case (the `None` arm of the CPU reference passes a zero-length
+    /// placeholder; `has_weight` distinguishes the two on the device). Returns
+    /// `out[rows*cols]`. One thread-block per row; the block size is capped
+    /// at 1024 threads (32 warps) since the device reduction uses a fixed
+    /// 32-slot shared array.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_rms_norm(
+        &self,
+        x: &[f32],
+        weight: Option<&[f32]>,
+        out: &mut [f32],
+        rows: usize,
+        cols: usize,
+        eps: f64,
+        offset: f32,
+    ) -> Result<(), RuntimeError> {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        if x.len() != rows * cols || out.len() != rows * cols {
+            return Err(RuntimeError::usage(format!(
+                "rms_norm expected x/out of length {} (rows={rows} cols={cols}), got {} / {}",
+                rows * cols,
+                x.len(),
+                out.len()
+            )));
+        }
+        if let Some(w) = weight {
+            if w.len() != cols {
+                return Err(RuntimeError::usage(format!(
+                    "rms_norm expected weight of length {cols}, got {}",
+                    w.len()
+                )));
+            }
+        }
+        // 32-bit kernel args guards (the device indexes in 64-bit, but
+        // `rows`/`cols` are passed as `unsigned int`).
+        if rows > u32::MAX as usize || cols > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "rms_norm shape ({rows}, {cols}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+
+        let x_dev = self
+            .stream
+            .clone_htod(x)
+            .map_err(|err| RuntimeError::context("uploading rms_norm input to CUDA", err))?;
+        // `cudarc` requires a non-empty host slice for `clone_htod`; pass a
+        // one-element placeholder when the weight is `None` and flag
+        // `has_weight = 0` so the device ignores the pointer.
+        let (weight_vec, has_weight) = match weight {
+            Some(w) => (w.to_vec(), 1i32),
+            None => (vec![0.0f32], 0i32),
+        };
+        let weight_dev = self
+            .stream
+            .clone_htod(&weight_vec)
+            .map_err(|err| RuntimeError::context("uploading rms_norm weight to CUDA", err))?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(rows * cols)
+            .map_err(|err| RuntimeError::context("allocating CUDA rms_norm output buffer", err))?;
+        // Cap the block size at 1024 (32 warps); the device reduction uses a
+        // fixed 32-slot shared array. Larger `cols` are handled by the
+        // strided accumulation loop.
+        let block_dim = 1024u32;
+        let rows_u = rows as u32;
+        let cols_u = cols as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows_u, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.rms_norm);
+        launch_args
+            .arg(&x_dev)
+            .arg(&weight_dev)
+            .arg(&mut out_dev)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&eps)
+            .arg(&offset)
+            .arg(&has_weight);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA rms_norm kernel", err))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing CUDA rms_norm stream", err))?;
+        let host_out = self
+            .stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading CUDA rms_norm output", err))?;
+        out.copy_from_slice(&host_out);
+        Ok(())
+    }
+
+    /// Native per-head RMSNorm — the device twin of
+    /// `larql_compute::residual::rms_norm_heads` / `rms_norm_heads_no_weight`.
+    /// `x` is the row-major `[seq_len * num_heads * head_dim]` flattened
+    /// input. One thread-block per (position, head). `has_weight = 0`
+    /// selects the parameter-free path (mirrors the `None`-weight CPU
+    /// reference `rms_norm_heads_no_weight`). The block size is capped at
+    /// 1024 threads.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_rms_norm_heads(
+        &self,
+        x: &[f32],
+        weight: Option<&[f32]>,
+        out: &mut [f32],
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        eps: f64,
+        offset: f32,
+    ) -> Result<(), RuntimeError> {
+        let total = seq_len
+            .checked_mul(num_heads)
+            .and_then(|p| p.checked_mul(head_dim));
+        let total = match total {
+            Some(t) if x.len() == t && out.len() == t => t,
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "rms_norm_heads expected x/out of length {} (seq={seq_len} heads={num_heads} dim={head_dim}), got {} / {}",
+                    seq_len * num_heads * head_dim,
+                    x.len(),
+                    out.len()
+                )))
+            }
+        };
+        if total == 0 {
+            return Ok(());
+        }
+        // The CPU reference `rms_norm_heads_eps` indexes the weight as
+        // `weight[d]` (a single `head_dim`-length slice broadcast across all
+        // heads — Gemma3/4 `q_norm.weight`/`k_norm.weight` are shape
+        // `[head_dim]`). The device kernel matches that broadcast indexing,
+        // so accept only `head_dim`-length weights.
+        if let Some(w) = weight {
+            if w.len() != head_dim {
+                return Err(RuntimeError::usage(format!(
+                    "rms_norm_heads expected weight of length {head_dim} (broadcast across heads), got {}",
+                    w.len()
+                )));
+            }
+        }
+        if seq_len > u32::MAX as usize
+            || num_heads > u32::MAX as usize
+            || head_dim > u32::MAX as usize
+            || (num_heads as u64) * (head_dim as u64) > u32::MAX as u64
+        {
+            return Err(RuntimeError::usage(format!(
+                "rms_norm_heads shape (seq={seq_len}, heads={num_heads}, dim={head_dim}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+
+        let x_dev = self
+            .stream
+            .clone_htod(x)
+            .map_err(|err| RuntimeError::context("uploading rms_norm_heads input to CUDA", err))?;
+        let (weight_vec, has_weight) = match weight {
+            Some(w) => (w.to_vec(), 1i32),
+            None => (vec![0.0f32], 0i32),
+        };
+        let weight_dev = self
+            .stream
+            .clone_htod(&weight_vec)
+            .map_err(|err| RuntimeError::context("uploading rms_norm_heads weight to CUDA", err))?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(total).map_err(|err| {
+            RuntimeError::context("allocating CUDA rms_norm_heads output buffer", err)
+        })?;
+        let block_dim = 1024u32;
+        let seq_u = seq_len as u32;
+        let heads_u = num_heads as u32;
+        let dim_u = head_dim as u32;
+        let blocks = (seq_u.checked_mul(heads_u)).ok_or_else(|| {
+            RuntimeError::usage("rms_norm_heads grid dim overflow seq*heads".to_string())
+        })?;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.rms_norm_heads);
+        launch_args
+            .arg(&x_dev)
+            .arg(&weight_dev)
+            .arg(&mut out_dev)
+            .arg(&seq_u)
+            .arg(&heads_u)
+            .arg(&dim_u)
+            .arg(&eps)
+            .arg(&offset)
+            .arg(&has_weight);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA rms_norm_heads kernel", err))?;
+        self.stream.synchronize().map_err(|err| {
+            RuntimeError::context("synchronizing CUDA rms_norm_heads stream", err)
+        })?;
+        let host_out = self
+            .stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading CUDA rms_norm_heads output", err))?;
+        out.copy_from_slice(&host_out);
+        Ok(())
     }
 }
 

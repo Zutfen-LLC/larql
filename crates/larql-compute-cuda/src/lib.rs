@@ -1588,4 +1588,272 @@ mod tests {
         assert_eq!(h_dec.len(), hidden);
         assert!(h_dec.iter().all(|v| v.is_finite()));
     }
+
+    // ── native RMSNorm elementwise kernels (Session 13) ───────────────────
+    //
+    // The body-norm + per-head-norm kernels are the first native elementwise
+    // ops (the device-kernel-fusion follow-on to Session 11's host-orchestrated
+    // pipeline). These tests pin (a) the pipeline's `norm_2d`/`norm_1d`/
+    // `norm_2d_no_weight`/`rms_norm_heads_array` fallback contract on every
+    // host (scaffold → CPU reference, host-runnable) and (b) native-vs-CPU
+    // parity when a CUDA runtime is present (runtime-gated).
+
+    /// The pipeline's `norm_2d` RmsNorm arm must match the substrate
+    /// reference on every host — on the scaffold path it delegates to the
+    /// host `rms_norm_eps`. Always runs.
+    #[test]
+    fn norm_2d_rmsnorm_matches_substrate_reference() {
+        use larql_compute::residual::rms_norm_eps;
+        use larql_compute::NormType;
+        let b = backend();
+        let rows = 3usize;
+        let cols = 256usize;
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.01).sin()).collect();
+        let x_arr = Array2::from_shape_vec((rows, cols), x.clone()).unwrap();
+        let weight: Vec<f32> = (0..cols).map(|i| 0.5 + 0.001 * i as f32).collect();
+        let offset = 0.1f32;
+        let eps = 1e-6f32;
+
+        let got = b.norm_2d(NormType::RmsNorm, &x_arr, &weight, offset, eps);
+        let w_vec = weight.clone();
+        let want = rms_norm_eps(&x_arr, Some(&w_vec), offset, eps as f64);
+        assert_eq!(got, want);
+    }
+
+    /// The pipeline's `norm_2d` LayerNorm arm has no native kernel yet, so
+    /// it always delegates to the host reference. Pins that fallback.
+    #[test]
+    fn norm_2d_layernorm_delegates_to_host_reference() {
+        use larql_compute::residual::layer_norm_eps;
+        use larql_compute::NormType;
+        let b = backend();
+        let rows = 2usize;
+        let cols = 128usize;
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.02).cos()).collect();
+        let x_arr = Array2::from_shape_vec((rows, cols), x.clone()).unwrap();
+        let weight: Vec<f32> = (0..cols).map(|i| 1.0 - 0.002 * i as f32).collect();
+        let offset = 0.0f32;
+        let eps = 1e-5f32;
+
+        let got = b.norm_2d(NormType::LayerNorm, &x_arr, &weight, offset, eps);
+        let w_vec = weight.clone();
+        let want = layer_norm_eps(&x_arr, Some(&w_vec), None, eps as f64);
+        assert_eq!(got, want);
+    }
+
+    /// The `None`-weight body-norm path must match the substrate reference
+    /// (`rms_norm_eps` with `weight = None`, i.e. `w = 1.0`). Always runs.
+    #[test]
+    fn norm_2d_no_weight_matches_substrate_reference() {
+        use larql_compute::residual::rms_norm_eps;
+        let b = backend();
+        let rows = 3usize;
+        let cols = 256usize;
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.011).sin()).collect();
+        let x_arr = Array2::from_shape_vec((rows, cols), x.clone()).unwrap();
+        let offset = 0.0f32;
+        let eps = 1e-6f32;
+
+        let got = b.norm_2d_no_weight(&x_arr, offset, eps);
+        let want = rms_norm_eps(&x_arr, None, offset, eps as f64);
+        assert_eq!(got, want);
+    }
+
+    /// Per-head norm must match the substrate references (weighted +
+    /// no-weight) on every host. Always runs.
+    #[test]
+    fn rms_norm_heads_array_matches_substrate_references() {
+        use larql_compute::residual::{rms_norm_heads, rms_norm_heads_no_weight};
+        let b = backend();
+        let seq = 2usize;
+        let num_heads = 4usize;
+        let head_dim = 64usize;
+        let cols = num_heads * head_dim;
+        let x: Vec<f32> = (0..seq * cols).map(|i| (i as f32 * 0.003).sin()).collect();
+        let x_arr = Array2::from_shape_vec((seq, cols), x.clone()).unwrap();
+        // `rms_norm_heads` indexes `weight[d]` (broadcast across heads) —
+        // the real Gemma3/4 q_norm/k_norm weight is shape `[head_dim]`.
+        let weight: Vec<f32> = (0..head_dim).map(|i| 0.8 + 0.0005 * i as f32).collect();
+        let offset = 0.05f32;
+
+        let got_w = b.rms_norm_heads_array(&x_arr, Some(&weight), num_heads, head_dim, offset);
+        let want_w = rms_norm_heads(&x_arr, &weight, num_heads, head_dim, offset);
+        assert_eq!(got_w, want_w);
+
+        let got_nw = b.rms_norm_heads_array(&x_arr, None, num_heads, head_dim, 0.0);
+        let want_nw = rms_norm_heads_no_weight(&x_arr, num_heads, head_dim);
+        assert_eq!(got_nw, want_nw);
+    }
+
+    /// Native body RMSNorm (via `native_rms_norm`) must match the substrate
+    /// `rms_norm_eps` when a CUDA runtime is present. Runtime-gated: no-op
+    /// on hosts without CUDA (like this CI host).
+    #[test]
+    fn native_rms_norm_matches_cpu_when_runtime_is_available() {
+        use larql_compute::residual::rms_norm_eps;
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let rows = 3usize;
+        let cols = 256usize;
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.013).sin()).collect();
+        let x_arr = Array2::from_shape_vec((rows, cols), x.clone()).unwrap();
+        let weight: Vec<f32> = (0..cols).map(|i| 0.3 + 0.002 * i as f32).collect();
+        let offset = 0.2f32;
+        let eps = 1e-6f32;
+
+        let mut got = vec![0.0f32; rows * cols];
+        let launched = b
+            .native_rms_norm(&x, Some(&weight), &mut got, rows, cols, eps as f64, offset)
+            .expect("native_rms_norm should not error with a runtime");
+        assert!(launched, "runtime present should launch the native kernel");
+        let w_vec = weight.clone();
+        let want = rms_norm_eps(&x_arr, Some(&w_vec), offset, eps as f64);
+        let want_flat: Vec<f32> = want.iter().cloned().collect();
+        assert_eq!(got, want_flat);
+    }
+
+    /// Native body RMSNorm, `None`-weight path (`has_weight = 0`) must
+    /// match the substrate `rms_norm_eps` with `weight = None`. Runtime-gated.
+    #[test]
+    fn native_rms_norm_no_weight_matches_cpu_when_runtime_is_available() {
+        use larql_compute::residual::rms_norm_eps;
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let rows = 2usize;
+        let cols = 512usize;
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.007).cos()).collect();
+        let x_arr = Array2::from_shape_vec((rows, cols), x.clone()).unwrap();
+        let offset = 0.0f32;
+        let eps = 1e-6f32;
+
+        let mut got = vec![0.0f32; rows * cols];
+        let launched = b
+            .native_rms_norm(&x, None, &mut got, rows, cols, eps as f64, offset)
+            .expect("native_rms_norm should not error with a runtime");
+        assert!(launched);
+        let want = rms_norm_eps(&x_arr, None, offset, eps as f64);
+        let want_flat: Vec<f32> = want.iter().cloned().collect();
+        assert_eq!(got, want_flat);
+    }
+
+    /// Native per-head RMSNorm (weighted) must match the substrate
+    /// `rms_norm_heads` when a runtime is present. Runtime-gated.
+    #[test]
+    fn native_rms_norm_heads_weighted_matches_cpu_when_runtime_is_available() {
+        use larql_compute::residual::rms_norm_heads;
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let seq = 2usize;
+        let num_heads = 4usize;
+        let head_dim = 64usize;
+        let cols = num_heads * head_dim;
+        let x: Vec<f32> = (0..seq * cols).map(|i| (i as f32 * 0.005).sin()).collect();
+        let x_arr = Array2::from_shape_vec((seq, cols), x.clone()).unwrap();
+        // The CPU reference `rms_norm_heads` indexes `weight[d]` (broadcast
+        // across heads) — the real Gemma3/4 q_norm/k_norm weight is shape
+        // `[head_dim]`. Use a `head_dim`-length weight so the native path
+        // (which now matches that broadcast indexing) is reachable and
+        // compares against the same CPU computation.
+        let weight: Vec<f32> = (0..head_dim).map(|i| 0.9 + 0.0003 * i as f32).collect();
+        let offset = 0.05f32;
+
+        let mut got = vec![0.0f32; seq * cols];
+        let launched = b
+            .native_rms_norm_heads(
+                &x,
+                Some(&weight),
+                &mut got,
+                seq,
+                num_heads,
+                head_dim,
+                larql_compute::residual::DEFAULT_EPS,
+                offset,
+            )
+            .expect("native_rms_norm_heads should not error with a runtime");
+        assert!(launched);
+        let want = rms_norm_heads(&x_arr, &weight, num_heads, head_dim, offset);
+        let want_flat: Vec<f32> = want.iter().cloned().collect();
+        assert_eq!(got, want_flat);
+    }
+
+    /// Native per-head RMSNorm (no-weight) must match the substrate
+    /// `rms_norm_heads_no_weight`. Runtime-gated.
+    #[test]
+    fn native_rms_norm_heads_no_weight_matches_cpu_when_runtime_is_available() {
+        use larql_compute::residual::rms_norm_heads_no_weight;
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let seq = 2usize;
+        let num_heads = 4usize;
+        let head_dim = 64usize;
+        let cols = num_heads * head_dim;
+        let x: Vec<f32> = (0..seq * cols).map(|i| (i as f32 * 0.009).cos()).collect();
+        let x_arr = Array2::from_shape_vec((seq, cols), x.clone()).unwrap();
+
+        let mut got = vec![0.0f32; seq * cols];
+        let launched = b
+            .native_rms_norm_heads(
+                &x,
+                None,
+                &mut got,
+                seq,
+                num_heads,
+                head_dim,
+                larql_compute::residual::DEFAULT_EPS,
+                0.0,
+            )
+            .expect("native_rms_norm_heads should not error with a runtime");
+        assert!(launched);
+        let want = rms_norm_heads_no_weight(&x_arr, num_heads, head_dim);
+        let want_flat: Vec<f32> = want.iter().cloned().collect();
+        assert_eq!(got, want_flat);
+    }
+
+    /// The pipeline's norm helpers must skip the native path for small
+    /// norms (below `NORM_NATIVE_MIN_ELEMS`) and use the host reference —
+    /// avoiding the per-call device round-trip regression on the frequent
+    /// small norms in the decode path. Always runs (host-runnable): the
+    /// gate is independent of whether a runtime is present, so on the
+    /// scaffold host the result must still match the substrate reference.
+    #[test]
+    fn norm_helpers_skip_native_for_small_norms() {
+        use larql_compute::residual::rms_norm_eps;
+        use larql_compute::NormType;
+        let b = backend();
+        // Small: rows=1, cols=256 → 256 elems (well below the 8192 gate).
+        let rows = 1usize;
+        let cols = 256usize;
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.01).sin()).collect();
+        let x_arr = Array2::from_shape_vec((rows, cols), x.clone()).unwrap();
+        let weight: Vec<f32> = (0..cols).map(|i| 0.4 + 0.001 * i as f32).collect();
+        let offset = 0.1f32;
+        let eps = 1e-6f32;
+
+        let got = b.norm_2d(NormType::RmsNorm, &x_arr, &weight, offset, eps);
+        let w_vec = weight.clone();
+        let want = rms_norm_eps(&x_arr, Some(&w_vec), offset, eps as f64);
+        assert_eq!(got, want);
+
+        // The per-head helper must also skip native for a small input and
+        // match the CPU reference.
+        let seq = 1usize;
+        let num_heads = 4usize;
+        let head_dim = 64usize;
+        let cols2 = num_heads * head_dim;
+        let x2: Vec<f32> = (0..seq * cols2).map(|i| (i as f32 * 0.003).sin()).collect();
+        let x2_arr = Array2::from_shape_vec((seq, cols2), x2.clone()).unwrap();
+        let w2: Vec<f32> = (0..head_dim).map(|i| 0.8 + 0.0005 * i as f32).collect();
+        let got2 = b.rms_norm_heads_array(&x2_arr, Some(&w2), num_heads, head_dim, 0.05);
+        let want2 =
+            larql_compute::residual::rms_norm_heads(&x2_arr, &w2, num_heads, head_dim, 0.05);
+        assert_eq!(got2, want2);
+    }
 }
