@@ -119,6 +119,22 @@ impl QuantMatVec for CpuBackend {
         Some(ops::q6k_matvec::dispatch(q6k_data, x, num_rows, hidden))
     }
 
+    fn q6k_matmul(
+        &self,
+        q6k_data: &[u8],
+        x: &[f32],
+        num_rows: usize,
+        hidden: usize,
+        seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        // Amortised Q6_K matmul — the Q6_K twin of `q4k_matmul`. Reads
+        // each Q6_K super-block once and reuses it across all `seq_len`
+        // activation columns, vs dequantising the whole matrix to f32.
+        let mut out = vec![0.0f32; seq_len * num_rows];
+        ops::q4_common::q6k_matmul_into(&mut out, x, q6k_data, num_rows, hidden, seq_len);
+        Some(out)
+    }
+
     fn q4k_dual_matvec(
         &self,
         q4k_a: &[u8],

@@ -535,7 +535,18 @@ pub struct FullPipelineLayer<'a> {
     /// Number of KV heads for this layer.
     pub num_kv_heads: usize,
     /// RoPE base frequency for this layer. Gemma 3/4: 10k (sliding) or 1M (global).
+    /// Already the `effective_rope_base_for_layer` value (override-baked).
     pub rope_base: f32,
+    /// RoPE position divisor for this layer (Gemma 3 global layers: 8.0 via
+    /// linear rope_scaling; default 1.0). Already the
+    /// `effective_rope_position_divisor_for_layer` value. Host-orchestrated
+    /// GPU pipelines (CUDA) thread this into `apply_rope_partial_at_full` so
+    /// scaled-RoPE models match the CPU reference.
+    pub rope_position_divisor: f32,
+    /// Llama-3-style RoPE frequency scaling for this layer, when the arch
+    /// applies it. Already the `effective_llama3_rope_scaling` value. `None`
+    /// for non-llama3 models. Threaded into `apply_rope_partial_at_full`.
+    pub rope_llama3_scaling: Option<larql_models::Llama3RopeScaling>,
     /// Dimensions to apply RoPE to. 0 = full head_dim. Gemma 4 global: head_dim * 0.25.
     pub rotary_dim: usize,
     /// Sliding window size. 0 = full attention (no window).
@@ -769,6 +780,8 @@ impl Default for FullPipelineLayer<'_> {
             num_q_heads: 0,
             num_kv_heads: 0,
             rope_base: ROPE_BASE_DEFAULT,
+            rope_position_divisor: 1.0,
+            rope_llama3_scaling: None,
             rotary_dim: 0,
             sliding_window: 0,
             has_v_norm: false,

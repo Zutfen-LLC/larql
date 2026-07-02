@@ -75,12 +75,16 @@ pub(super) fn run_engine(
     // probe `backend.supports_quant(Q4_K)` would otherwise see a
     // CpuBackend that advertises support but silently falls back to
     // the slow CPU path on `decode_token`.
-    let want_metal = args.backends.contains("metal");
-    let compute_backend: Box<dyn larql_inference::ComputeBackend> = if want_metal {
-        larql_inference::default_compute_backend()
-    } else {
-        larql_inference::cpu_backend()
-    };
+    let requested =
+        crate::commands::backend::backend_kinds_from_args(&args.backends, args.cpu, args.metal)
+            .map_err(|e| format!("--backends: {e}"))?;
+    let primary_kind = crate::commands::backend::primary_backend_kind(
+        &requested,
+        larql_inference::ComputeBackendKind::Cpu,
+    );
+    let compute_backend: Box<dyn larql_inference::ComputeBackend> =
+        larql_inference::compute_backend(primary_kind)
+            .map_err(|e| format!("backend selection: {e}"))?;
     let be = compute_backend.as_ref();
 
     let executor = if args.via_executor {

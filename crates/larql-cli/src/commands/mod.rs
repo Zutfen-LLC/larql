@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod dev;
 pub mod diagnostics;
 pub mod extraction;

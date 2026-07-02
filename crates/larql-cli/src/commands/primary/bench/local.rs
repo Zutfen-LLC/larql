@@ -8,12 +8,8 @@
 //! All exercised by tests in this file.
 
 /// Returns the table-row backend label for the local bench.
-pub(super) fn backend_name_for(metal: bool) -> &'static str {
-    if metal {
-        "larql-metal"
-    } else {
-        "larql-cpu"
-    }
+pub(super) fn backend_name_for(kind: larql_inference::ComputeBackendKind) -> &'static str {
+    crate::commands::backend::backend_label(kind)
 }
 
 /// Note string for the local bench row: either empty (full target reached),
@@ -68,8 +64,14 @@ mod tests {
 
     #[test]
     fn backend_name_for_picks_label() {
-        assert_eq!(backend_name_for(true), "larql-metal");
-        assert_eq!(backend_name_for(false), "larql-cpu");
+        assert_eq!(
+            backend_name_for(larql_inference::ComputeBackendKind::Metal),
+            "larql-metal"
+        );
+        assert_eq!(
+            backend_name_for(larql_inference::ComputeBackendKind::Cpu),
+            "larql-cpu"
+        );
     }
 
     #[test]

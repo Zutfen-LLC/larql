@@ -163,6 +163,8 @@ fn main() {
                 num_q_heads,
                 num_kv_heads,
                 rope_base: 10000.0,
+                rope_position_divisor: 1.0,
+                rope_llama3_scaling: None,
                 rotary_dim: 0,
                 sliding_window: 0,
                 has_v_norm: false,

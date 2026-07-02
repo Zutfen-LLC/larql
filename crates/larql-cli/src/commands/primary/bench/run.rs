@@ -17,6 +17,7 @@ use super::output::print_table;
 use super::remote_ffn_runtime::run_concurrent_ffn;
 use super::remote_moe_runtime::run_concurrent_moe;
 use super::row::{BenchJsonLatency, BenchJsonResult, BenchJsonRow, BenchJsonStages, BenchRow};
+use larql_inference::ComputeBackendKind;
 
 pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Configure rayon's global thread pool up front. Auto-select picks
@@ -43,6 +44,8 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         if args.engine.is_none() {
             args.engine = Some("standard".to_string());
         }
+    } else if args.metal {
+        args.backends = "metal".to_string();
     }
 
     // --bench-grid-lan short-circuits the normal flow: it orchestrates
@@ -82,23 +85,27 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let requested_backends: Vec<&str> = if args.cpu {
-        vec!["cpu"]
-    } else {
-        args.backends
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-    let want_metal = requested_backends.contains(&"metal");
-    let want_cpu = requested_backends.contains(&"cpu");
+    let requested_backends =
+        crate::commands::backend::backend_kinds_from_args(&args.backends, args.cpu, args.metal)
+            .map_err(|e| format!("--backends: {e}"))?;
+    let want_cpu = requested_backends.contains(&ComputeBackendKind::Cpu);
+    let accelerator_kinds: Vec<_> = requested_backends
+        .iter()
+        .copied()
+        .filter(|kind| !matches!(kind, ComputeBackendKind::Cpu))
+        .collect();
     let want_engine = args.engine.is_some();
     let want_ffn = args.ffn.is_some();
     let want_moe = args.moe_shards.is_some();
-    if !want_metal && !want_cpu && args.ollama.is_none() && !want_engine && !want_ffn && !want_moe {
+    if accelerator_kinds.is_empty()
+        && !want_cpu
+        && args.ollama.is_none()
+        && !want_engine
+        && !want_ffn
+        && !want_moe
+    {
         return Err(
-            "no backends selected: pass --backends metal,cpu, --ollama, --engine, --ffn, or --moe-shards".into(),
+            "no backends selected: pass --backends auto,cpu,metal,cuda,vulkan, --ollama, --engine, --ffn, or --moe-shards".into(),
         );
     }
 
@@ -137,16 +144,17 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     // load, cheap) so the CPU rows route correctly. `--moe-shards` keeps the
     // remote path; Metal MoE keeps its existing GPU dispatch.
     let arch_is_moe = is_q4k && vindex_is_hybrid_moe(&vindex_path);
+    let wants_accelerator = !accelerator_kinds.is_empty();
     // CPU MoE without shards → drive the in-process LocalMoeFfn engine path.
-    let want_local_moe = arch_is_moe && !want_metal && args.moe_shards.is_none();
+    let want_local_moe = arch_is_moe && !wants_accelerator && args.moe_shards.is_none();
 
-    if want_metal {
+    for kind in accelerator_kinds {
         if is_q4k {
-            rows.push(run_larql(&vindex_path, &args, /* metal */ true)?);
+            rows.push(run_larql(&vindex_path, &args, kind)?);
         } else if !want_engine {
             return Err(format!(
-                "GPU bench requires a Q4K vindex (got quant={:?}). \
-                 Use a q4k vindex for GPU bench, or omit --backends and use --engine only.",
+                "{kind} bench requires a Q4K vindex (got quant={:?}). \
+                 Use a q4k vindex for accelerator bench, or omit --backends and use --engine only.",
                 cfg.quant,
             )
             .into());
@@ -154,7 +162,7 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if want_cpu && !arch_is_moe {
         if is_q4k {
-            rows.push(run_larql(&vindex_path, &args, /* metal */ false)?);
+            rows.push(run_larql(&vindex_path, &args, ComputeBackendKind::Cpu)?);
         } else if !want_engine {
             return Err(format!(
                 "CPU bench requires a Q4K vindex (got quant={:?}).",
@@ -210,7 +218,7 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     engine_list,
                     &args,
                 )?);
-            } else if arch_is_moe && !want_metal {
+            } else if arch_is_moe && !wants_accelerator {
                 // CPU MoE with --moe-shards: the remote-MoE block below
                 // dispatches experts to the shards. The dense NullFfn engine
                 // loop would silently ignore the experts, so skip it here.
@@ -234,11 +242,12 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 for engine_name in EngineKind::split_specs(engine_list) {
                     match EngineKind::from_name(&engine_name) {
                         Some(kind) => {
-                            let backend = if want_metal {
-                                larql_inference::default_engine_backend()
-                            } else {
-                                larql_inference::cpu_engine_backend()
-                            };
+                            let backend_kind = crate::commands::backend::primary_backend_kind(
+                                &requested_backends,
+                                ComputeBackendKind::Cpu,
+                            );
+                            let backend =
+                                crate::commands::backend::engine_backend_or_err(backend_kind)?;
                             rows.push(run_engine(
                                 &mut weights,
                                 Some(&index),
@@ -279,11 +288,12 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             for engine_name in EngineKind::split_specs(engine_list) {
                 match EngineKind::from_name(&engine_name) {
                     Some(kind) => {
-                        let backend = if want_metal {
-                            larql_inference::default_engine_backend()
-                        } else {
-                            larql_inference::cpu_engine_backend()
-                        };
+                        let backend_kind = crate::commands::backend::primary_backend_kind(
+                            &requested_backends,
+                            ComputeBackendKind::Cpu,
+                        );
+                        let backend =
+                            crate::commands::backend::engine_backend_or_err(backend_kind)?;
                         rows.push(run_engine(
                             &mut weights,
                             None,

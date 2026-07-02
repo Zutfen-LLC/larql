@@ -88,6 +88,53 @@ pub use larql_compute::cpu::ops::moe::{run_single_expert, run_single_expert_with
 pub use larql_compute::QuantFormat;
 pub use larql_compute::{cpu_backend, default_backend, ComputeBackend};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComputeBackendKind {
+    Auto,
+    Cpu,
+    Metal,
+    Cuda,
+    Vulkan,
+}
+
+impl ComputeBackendKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+            Self::Vulkan => "vulkan",
+        }
+    }
+}
+
+impl std::fmt::Display for ComputeBackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug)]
+pub enum BackendSelectionError {
+    Unavailable {
+        kind: ComputeBackendKind,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for BackendSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable { kind, reason } => {
+                write!(f, "backend `{kind}` unavailable: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BackendSelectionError {}
+
 /// CPU backend boxed as `EngineBackend`. Use when you need to construct
 /// a backend that satisfies the `EngineBackend` umbrella (so engines
 /// can dispatch through both `ComputeBackend` and `KvDispatch`).
@@ -96,19 +143,6 @@ pub use larql_compute::{cpu_backend, default_backend, ComputeBackend};
 /// this factory instead.
 pub fn cpu_engine_backend() -> Box<dyn EngineBackend> {
     Box::new(larql_compute::CpuBackend)
-}
-
-/// Default backend as `Box<dyn EngineBackend>` — Metal on macOS when
-/// the `gpu` feature is enabled, CPU otherwise. Parallel to
-/// `default_backend()` but returns the wider trait object.
-pub fn default_engine_backend() -> Box<dyn EngineBackend> {
-    #[cfg(all(feature = "gpu", target_os = "macos"))]
-    {
-        if let Some(metal) = larql_compute_metal::MetalBackend::new() {
-            return Box::new(metal);
-        }
-    }
-    cpu_engine_backend()
 }
 
 /// CPU backend boxed as `AsyncComputeBackend`. Use when constructing
@@ -120,43 +154,293 @@ pub fn cpu_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
     Box::new(larql_compute::CpuBackend)
 }
 
-/// Default async backend as `Box<dyn AsyncComputeBackend>` — Metal on
-/// macOS when the `gpu` feature is enabled, CPU otherwise. Parallel
-/// to [`default_engine_backend`].
-///
-/// At A3 (scaffolding), the Metal variant delegates every async call
-/// to `CpuBackend`'s async impl — same cost as the sync path. The
-/// tok/s shape changes at A4 when `MetalBackend` lands real deferred
-/// dispatch (one `MTLCommandBuffer` per session).
-pub fn default_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
-    #[cfg(all(feature = "gpu", target_os = "macos"))]
+fn auto_backend_order() -> &'static [ComputeBackendKind] {
+    #[cfg(target_os = "macos")]
     {
-        if let Some(metal) = larql_compute_metal::MetalBackend::new() {
-            return Box::new(metal);
-        }
+        &[
+            ComputeBackendKind::Metal,
+            ComputeBackendKind::Vulkan,
+            ComputeBackendKind::Cpu,
+        ]
     }
-    cpu_async_engine_backend()
+    #[cfg(not(target_os = "macos"))]
+    {
+        &[
+            ComputeBackendKind::Cuda,
+            ComputeBackendKind::Vulkan,
+            ComputeBackendKind::Cpu,
+        ]
+    }
 }
 
-/// Default compute backend as `Box<dyn ComputeBackend>` — Metal on
-/// macOS when the `gpu` feature is enabled, CPU otherwise.
-///
-/// `larql_compute::default_backend()` lost its Metal auto-detection
-/// after the `larql-compute-metal` extraction (the comment in that
-/// function recommends callers construct `MetalBackend` directly).
-/// This factory restores the convenience for callers that want a
-/// runtime-detected GPU backend without `#[cfg(feature = "gpu")]`
-/// gating in every call site — `larql bench --backends metal` uses it,
-/// engines that want a compute backend for `fused_prefill` /
-/// `fused_decode_step` use it.
-pub fn default_compute_backend() -> Box<dyn larql_compute::ComputeBackend> {
-    #[cfg(all(feature = "gpu", target_os = "macos"))]
-    {
-        if let Some(metal) = larql_compute_metal::MetalBackend::new() {
-            return Box::new(metal);
+fn try_compute_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn larql_compute::ComputeBackend>, BackendSelectionError> {
+    match kind {
+        ComputeBackendKind::Auto => {
+            for candidate in auto_backend_order() {
+                if let Ok(backend) = try_compute_backend(*candidate) {
+                    return Ok(backend);
+                }
+            }
+            Ok(larql_compute::cpu_backend())
+        }
+        ComputeBackendKind::Cpu => Ok(larql_compute::cpu_backend()),
+        ComputeBackendKind::Metal => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                if let Some(metal) = larql_compute_metal::metal_backend() {
+                    return Ok(Box::new(metal));
+                }
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "no Metal device or pipeline initialization failed".to_string(),
+                })
+            }
+            #[cfg(all(feature = "metal", not(target_os = "macos")))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "Metal backend is only available on macOS".to_string(),
+                })
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `metal` feature".to_string(),
+                })
+            }
+        }
+        ComputeBackendKind::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                larql_compute_cuda::cuda_backend()
+                    .map(|backend| Box::new(backend) as Box<dyn larql_compute::ComputeBackend>)
+                    .map_err(|err| BackendSelectionError::Unavailable {
+                        kind,
+                        reason: err.to_string(),
+                    })
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `cuda` feature".to_string(),
+                })
+            }
+        }
+        ComputeBackendKind::Vulkan => {
+            #[cfg(feature = "vulkan")]
+            {
+                larql_compute_vulkan::vulkan_backend()
+                    .map(|backend| Box::new(backend) as Box<dyn larql_compute::ComputeBackend>)
+                    .map_err(|err| BackendSelectionError::Unavailable {
+                        kind,
+                        reason: err.to_string(),
+                    })
+            }
+            #[cfg(not(feature = "vulkan"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `vulkan` feature".to_string(),
+                })
+            }
         }
     }
-    larql_compute::cpu_backend()
+}
+
+fn try_engine_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn EngineBackend>, BackendSelectionError> {
+    match kind {
+        ComputeBackendKind::Auto => {
+            for candidate in auto_backend_order() {
+                if let Ok(backend) = try_engine_backend(*candidate) {
+                    return Ok(backend);
+                }
+            }
+            Ok(cpu_engine_backend())
+        }
+        ComputeBackendKind::Cpu => Ok(cpu_engine_backend()),
+        ComputeBackendKind::Metal => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                if let Some(metal) = larql_compute_metal::metal_backend() {
+                    return Ok(Box::new(metal));
+                }
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "no Metal device or pipeline initialization failed".to_string(),
+                })
+            }
+            #[cfg(all(feature = "metal", not(target_os = "macos")))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "Metal backend is only available on macOS".to_string(),
+                })
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `metal` feature".to_string(),
+                })
+            }
+        }
+        ComputeBackendKind::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                larql_compute_cuda::cuda_backend()
+                    .map(|backend| Box::new(backend) as Box<dyn EngineBackend>)
+                    .map_err(|err| BackendSelectionError::Unavailable {
+                        kind,
+                        reason: err.to_string(),
+                    })
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `cuda` feature".to_string(),
+                })
+            }
+        }
+        ComputeBackendKind::Vulkan => {
+            #[cfg(feature = "vulkan")]
+            {
+                larql_compute_vulkan::vulkan_backend()
+                    .map(|backend| Box::new(backend) as Box<dyn EngineBackend>)
+                    .map_err(|err| BackendSelectionError::Unavailable {
+                        kind,
+                        reason: err.to_string(),
+                    })
+            }
+            #[cfg(not(feature = "vulkan"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `vulkan` feature".to_string(),
+                })
+            }
+        }
+    }
+}
+
+fn try_async_engine_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn AsyncComputeBackend>, BackendSelectionError> {
+    match kind {
+        ComputeBackendKind::Auto => {
+            for candidate in auto_backend_order() {
+                if let Ok(backend) = try_async_engine_backend(*candidate) {
+                    return Ok(backend);
+                }
+            }
+            Ok(cpu_async_engine_backend())
+        }
+        ComputeBackendKind::Cpu => Ok(cpu_async_engine_backend()),
+        ComputeBackendKind::Metal => {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                if let Some(metal) = larql_compute_metal::metal_backend() {
+                    return Ok(Box::new(metal));
+                }
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "no Metal device or pipeline initialization failed".to_string(),
+                })
+            }
+            #[cfg(all(feature = "metal", not(target_os = "macos")))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "Metal backend is only available on macOS".to_string(),
+                })
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `metal` feature".to_string(),
+                })
+            }
+        }
+        ComputeBackendKind::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                larql_compute_cuda::cuda_backend()
+                    .map(|backend| Box::new(backend) as Box<dyn AsyncComputeBackend>)
+                    .map_err(|err| BackendSelectionError::Unavailable {
+                        kind,
+                        reason: err.to_string(),
+                    })
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `cuda` feature".to_string(),
+                })
+            }
+        }
+        ComputeBackendKind::Vulkan => {
+            #[cfg(feature = "vulkan")]
+            {
+                larql_compute_vulkan::vulkan_backend()
+                    .map(|backend| Box::new(backend) as Box<dyn AsyncComputeBackend>)
+                    .map_err(|err| BackendSelectionError::Unavailable {
+                        kind,
+                        reason: err.to_string(),
+                    })
+            }
+            #[cfg(not(feature = "vulkan"))]
+            {
+                Err(BackendSelectionError::Unavailable {
+                    kind,
+                    reason: "crate built without the `vulkan` feature".to_string(),
+                })
+            }
+        }
+    }
+}
+
+pub fn compute_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn larql_compute::ComputeBackend>, BackendSelectionError> {
+    try_compute_backend(kind)
+}
+
+pub fn engine_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn EngineBackend>, BackendSelectionError> {
+    try_engine_backend(kind)
+}
+
+pub fn async_engine_backend(
+    kind: ComputeBackendKind,
+) -> Result<Box<dyn AsyncComputeBackend>, BackendSelectionError> {
+    try_async_engine_backend(kind)
+}
+
+/// Default backend as `Box<dyn EngineBackend>`, following
+/// [`ComputeBackendKind::Auto`].
+pub fn default_engine_backend() -> Box<dyn EngineBackend> {
+    engine_backend(ComputeBackendKind::Auto).unwrap_or_else(|_| cpu_engine_backend())
+}
+
+/// Default async backend as `Box<dyn AsyncComputeBackend>`, following
+/// [`ComputeBackendKind::Auto`].
+pub fn default_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
+    async_engine_backend(ComputeBackendKind::Auto).unwrap_or_else(|_| cpu_async_engine_backend())
+}
+
+/// Default compute backend as `Box<dyn ComputeBackend>`, following
+/// [`ComputeBackendKind::Auto`].
+pub fn default_compute_backend() -> Box<dyn larql_compute::ComputeBackend> {
+    compute_backend(ComputeBackendKind::Auto).unwrap_or_else(|_| larql_compute::cpu_backend())
 }
 
 /// Map a model's activation function to the compute-layer `Activation` enum.
@@ -391,6 +675,29 @@ mod factory_tests {
     fn default_compute_backend_constructs() {
         let backend = default_compute_backend();
         assert!(!backend.name().is_empty());
+    }
+
+    #[test]
+    fn explicit_cpu_backend_kind_constructs() {
+        let backend = compute_backend(ComputeBackendKind::Cpu).expect("cpu backend");
+        assert!(backend.name().starts_with("cpu"));
+    }
+
+    #[test]
+    fn auto_backend_kind_constructs() {
+        let backend = compute_backend(ComputeBackendKind::Auto).expect("auto backend");
+        assert!(!backend.name().is_empty());
+    }
+
+    #[test]
+    fn unavailable_explicit_backend_errors_loudly() {
+        #[cfg(not(feature = "cuda"))]
+        {
+            match compute_backend(ComputeBackendKind::Cuda) {
+                Err(err) => assert!(err.to_string().contains("cuda")),
+                Ok(_) => panic!("cuda backend should be gated when the `cuda` feature is off"),
+            }
+        }
     }
 
     #[test]

@@ -950,6 +950,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42310153e06cf4cd532901f7096beb27504d681736a29ee90728ae4e2d93b2a8"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2147,7 +2156,9 @@ dependencies = [
  "image",
  "indicatif 0.17.11",
  "larql-compute",
+ "larql-compute-cuda",
  "larql-compute-metal",
+ "larql-compute-vulkan",
  "larql-core",
  "larql-inference",
  "larql-kv",
@@ -2185,6 +2196,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "larql-compute-cuda"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "half",
+ "larql-compute",
+ "larql-models",
+ "ndarray",
+]
+
+[[package]]
 name = "larql-compute-metal"
 version = "0.1.0"
 dependencies = [
@@ -2199,6 +2221,16 @@ dependencies = [
  "objc",
  "rayon",
  "serde_json",
+]
+
+[[package]]
+name = "larql-compute-vulkan"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "larql-compute",
+ "larql-models",
+ "ndarray",
 ]
 
 [[package]]
@@ -2226,7 +2258,9 @@ dependencies = [
  "futures",
  "half",
  "larql-compute",
+ "larql-compute-cuda",
  "larql-compute-metal",
+ "larql-compute-vulkan",
  "larql-core",
  "larql-kv",
  "larql-models",
@@ -2264,7 +2298,9 @@ dependencies = [
  "criterion",
  "larql-boundary",
  "larql-compute",
+ "larql-compute-cuda",
  "larql-compute-metal",
+ "larql-compute-vulkan",
  "larql-inference",
  "larql-vindex",
  "ndarray",
@@ -2443,7 +2479,9 @@ dependencies = [
  "criterion",
  "hf-hub",
  "larql-compute",
+ "larql-compute-cuda",
  "larql-compute-metal",
+ "larql-compute-vulkan",
  "larql-core",
  "larql-inference",
  "larql-models",
@@ -2497,6 +2535,16 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"

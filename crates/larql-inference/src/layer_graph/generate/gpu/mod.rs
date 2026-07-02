@@ -225,6 +225,17 @@ where
     {
         return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index, eos);
     }
+    // Hybrid-MoE models (Gemma 4 26B A4B) need per-layer expert dispatch
+    // (`decode_token_with_moe`). A backend that advertises `DecodeToken` but
+    // NOT `DecodeMoe` — e.g. the CUDA host-orchestrated path, which bails to
+    // `None` on `layer.moe.is_some()` — would hit `prefill_kquant` returning
+    // `None` → `prefill_failed` (a hard error) instead of producing output.
+    // Metal advertises `DecodeMoe` and handles MoE, so it stays on the GPU
+    // path. Route the rest to the CPU `generate_via_cpu_q4k` path, which
+    // handles hybrid MoE via the O(N²) per-step `predict_kquant_hidden` loop.
+    if weights.arch.is_hybrid_moe() && !backend.supports(larql_compute::Capability::DecodeMoe) {
+        return generate_via_cpu_q4k(weights, tokenizer, token_ids, max_tokens, index, eos);
+    }
 
     let arch = &*weights.arch;
     let norm_offset = arch.norm_weight_offset();

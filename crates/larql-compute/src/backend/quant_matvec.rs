@@ -302,6 +302,28 @@ pub trait QuantMatVec {
         None
     }
 
+    /// Q6_K matmul: `C[m, n] = sum_k W[n, k] * X[m, k]` — the Q6_K twin of
+    /// [`Self::q4k_matmul`].
+    ///
+    /// `W` is `[num_rows, hidden]` Q6_K, `X` is `[seq_len, hidden]` f32,
+    /// output is `[seq_len, num_rows]` f32 row-major. Returns `None`
+    /// when the backend doesn't implement the amortised Q6_K matmul
+    /// (callers fall back to repeated `q6k_matvec` or the CPU free
+    /// function `q6k_matmul_into`). Used by prefill where `seq_len > 1`
+    /// to amortise the Q6_K dequant cost across positions — the default
+    /// `down_proj` format in a q4k vindex is Q6_K, so this is the hot
+    /// prefill down projection.
+    fn q6k_matmul(
+        &self,
+        _q6k_data: &[u8],
+        _x: &[f32],
+        _num_rows: usize,
+        _hidden: usize,
+        _seq_len: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     /// BitNet ternary (I2_S) matvec: `out[N] = W[N, K] · x[K]` where `W` is a
     /// 1.58-bit ternary [`BitLinearWeight`] (packed trits + per-channel
     /// scales) and `x` is f32. This is the dedicated ternary entry point —
@@ -432,5 +454,37 @@ mod tests {
                 "{fmt:?} must return None from quant_matvec"
             );
         }
+    }
+
+    /// `CpuBackend::q6k_matmul` must match the CPU free function
+    /// `q6k_matmul_into` byte-for-byte (it wraps the same kernel) and the
+    /// trait default must return `None` for backends that don't override.
+    /// A stub backend with the empty `QuantMatVec` impl exercises the
+    /// default.
+    #[test]
+    fn q6k_matmul_cpu_matches_free_function_and_default_is_none() {
+        use crate::cpu::ops::q4_common::{q6k_matmul_into, quantize_q6_k};
+
+        let rows = 4usize;
+        let cols = 256usize;
+        let seq = 3usize;
+        let matrix: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.003).sin()).collect();
+        let q6k = quantize_q6_k(&matrix);
+        let x: Vec<f32> = (0..seq * cols).map(|i| (i as f32 * 0.01).cos()).collect();
+
+        let got = CpuBackend
+            .q6k_matmul(&q6k, &x, rows, cols, seq)
+            .expect("CpuBackend must implement q6k_matmul");
+        let mut want = vec![0.0f32; seq * rows];
+        q6k_matmul_into(&mut want, &x, &q6k, rows, cols, seq);
+        assert_eq!(got, want);
+
+        // Default trait impl returns None — a stub with no overrides pins it.
+        struct Stub;
+        impl QuantMatVec for Stub {}
+        assert!(
+            Stub.q6k_matmul(&q6k, &x, rows, cols, seq).is_none(),
+            "q6k_matmul default must return None"
+        );
     }
 }

@@ -176,7 +176,10 @@ where
 
     let mut sampler = Sampler::new(sampling);
     let needs_per_layer_embed = weights.arch.has_per_layer_embeddings();
-    if !backend_supports_fused_q4_pipeline(backend) || needs_per_layer_embed {
+    if !backend_supports_fused_q4_pipeline(backend)
+        || needs_per_layer_embed
+        || (weights.arch.is_hybrid_moe() && !backend.supports(larql_compute::Capability::DecodeMoe))
+    {
         return generate_constrained_via_cpu_q4k_streaming_sampled(
             weights, tokenizer, token_ids, max_tokens, index, mask_fn, on_token, sampling, eos,
         );

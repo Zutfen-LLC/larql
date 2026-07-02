@@ -133,6 +133,10 @@ pub fn build_arch_params<'a>(
         num_q_heads: layer_nq,
         num_kv_heads: layer_nkv,
         rope_base: effective_rope_base_for_layer(arch, layer) as f32,
+        rope_position_divisor: crate::forward_overrides::effective_rope_position_divisor_for_layer(
+            arch, layer,
+        ) as f32,
+        rope_llama3_scaling: crate::forward_overrides::effective_llama3_rope_scaling(arch),
         rotary_dim,
         sliding_window: sw,
         has_v_norm: arch.has_v_norm(),
