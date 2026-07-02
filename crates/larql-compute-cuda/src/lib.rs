@@ -17,6 +17,7 @@ pub mod kv_cache;
 pub mod kv_dispatch_impl;
 pub mod ops;
 pub mod options;
+pub mod pipeline;
 pub mod trait_impl;
 
 pub use backend::{BackendInitError, CudaBackend};
@@ -39,7 +40,7 @@ mod tests {
     use larql_compute::prelude::*;
     use larql_compute::KvIndex;
     use larql_compute::{CpuBackend, QuantFormat};
-    use larql_models::test_fixtures::make_test_q4k_weights;
+    use larql_models::test_fixtures::{make_test_q4k_weights, make_test_q4k_weights_rope_scaled};
     use ndarray::Array2;
 
     fn backend() -> CudaBackend {
@@ -834,5 +835,414 @@ mod tests {
         let v: Vec<f32> = (0..seq * row).map(|i| (i as f32) * 0.02).collect();
         b.populate_kv_layer(0, &k, &v, seq, num_kv, head_dim);
         assert_eq!(b.kv_cache_len(), seq);
+    }
+
+    // ── Session 11: host-orchestrated decode/prefill pipeline ──────────────
+
+    /// Build the `FullPipelineLayer` slice the fused path consumes, mirroring
+    /// `kquant_forward::cached::fused_prefill`'s setup.
+    fn build_layers<'a>(
+        weights: &'a larql_models::ModelWeights,
+        index: &'a dyn larql_compute::KvIndex,
+    ) -> Vec<larql_compute::FullPipelineLayer<'a>> {
+        let q4_ffn_mmap = index
+            .interleaved_kquant_mmap_ref()
+            .expect("fixture has interleaved kquant mmap");
+        let intermediate = index.num_features(0);
+        let ffn_format = larql_compute::QuantFormat::Q4_K;
+        let q4_ffn_per_matrix = ffn_format
+            .packed_matrix_bytes(intermediate, weights.hidden_size)
+            .expect("Q4_K per-matrix bytes");
+        larql_compute::pipeline_layer::build_pipeline_layers(
+            weights,
+            index,
+            0..weights.num_layers,
+            q4_ffn_mmap,
+            q4_ffn_per_matrix,
+            ffn_format,
+        )
+    }
+
+    fn prefill_input(
+        weights: &larql_models::ModelWeights,
+        token_ids: &[u32],
+    ) -> (Vec<f32>, usize, usize) {
+        let h_embed = larql_compute::forward::embed_tokens_pub(weights, token_ids);
+        let seq_len = token_ids.len();
+        let hidden = weights.hidden_size;
+        let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
+        (x, seq_len, hidden)
+    }
+
+    /// Scaffold path (no CUDA runtime): `decode_token` / `prefill_kquant`
+    /// return `None` so callers route through the CPU reference, and
+    /// `supports`/`supports_quant` stay false. Runs on every host.
+    #[test]
+    fn scaffold_path_fused_pipelines_return_none() {
+        let b = backend();
+        if b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let (x, seq_len, hidden) = prefill_input(&weights, &[0u32, 1, 2]);
+        let inter = index.num_features(0);
+        assert!(b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, 0.0)
+            .is_none());
+        assert!(b
+            .decode_token(&layers, &x[..hidden], hidden, inter)
+            .is_none());
+        assert!(!b.supports(larql_compute::Capability::DecodeToken));
+        assert!(!b.supports(larql_compute::Capability::PrefillQ4));
+        assert!(!b.supports_quant(larql_compute::QuantFormat::Q4_K));
+    }
+
+    /// Native runtime present: `supports`/`supports_quant` advertise the
+    /// fused capabilities. Runtime-gated.
+    #[test]
+    fn native_path_advertises_fused_capabilities() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        assert!(b.supports(larql_compute::Capability::QuantMatVec));
+        assert!(b.supports(larql_compute::Capability::DecodeToken));
+        assert!(b.supports(larql_compute::Capability::PrefillQ4));
+        assert!(b.supports_quant(larql_compute::QuantFormat::Q4_K));
+        assert!(b.supports_quant(larql_compute::QuantFormat::Q6_K));
+        // Non-k-quant formats stay unsupported (no native kernel).
+        assert!(!b.supports_quant(larql_compute::QuantFormat::Q4_0));
+    }
+
+    /// Prefill parity: CUDA's `prefill_kquant` (host-orchestrated, native
+    /// q4k matmul projections) vs the CPU direct path
+    /// `predict_kquant_prefill`. Compares the final-position hidden state.
+    /// Runtime-gated (no-op on hosts without CUDA).
+    #[test]
+    fn prefill_kquant_matches_cpu_reference_when_runtime_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let token_ids = [0u32, 1, 2, 3];
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+
+        let cuda_h = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill_kquant should succeed with a runtime");
+        assert_eq!(cuda_h.len(), seq_len * hidden);
+
+        // CPU reference (direct Q4K path).
+        let (cpu_h_2d, _cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let cpu_last: Vec<f32> = cpu_h_2d.row(seq_len - 1).to_vec();
+        let cuda_last: Vec<f32> = cuda_h[(seq_len - 1) * hidden..seq_len * hidden].to_vec();
+        assert_eq!(cpu_last.len(), cuda_last.len());
+
+        // The native CUDA q4k matvec/matmul kernels are parity-exact with
+        // their CPU twins, and the elementwise ops use the same f64
+        // accumulation as the CPU reference, so the composed pipeline should
+        // match to within a tight tolerance (RMSNorm / softmax ordering can
+        // introduce ~1e-5 drift).
+        let max_abs = cpu_last
+            .iter()
+            .zip(cuda_last.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "prefill final-position hidden diverged: max_abs={max_abs:.6e}"
+        );
+    }
+
+    /// Scaled-RoPE prefill parity: CUDA's `prefill_kquant` vs the CPU direct
+    /// path on the Gemma-3 rope-scaled fixture (linear factor 8 → position
+    /// divisor 8 on global layers). Locks the `rope_position_divisor` /
+    /// `rope_llama3_scaling` thread-through — without it the CUDA path
+    /// hardcodes divisor 1 and diverges. Runtime-gated.
+    #[test]
+    fn prefill_kquant_matches_cpu_on_rope_scaled_fixture() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights_rope_scaled();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let token_ids = [0u32, 1, 2, 3];
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+
+        let cuda_h = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill_kquant should succeed on the rope-scaled fixture");
+
+        let (cpu_h_2d, _cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let cpu_last: Vec<f32> = cpu_h_2d.row(seq_len - 1).to_vec();
+        let cuda_last: Vec<f32> = cuda_h[(seq_len - 1) * hidden..seq_len * hidden].to_vec();
+        assert_eq!(cpu_last.len(), cuda_last.len());
+        let max_abs = cpu_last
+            .iter()
+            .zip(cuda_last.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "rope-scaled prefill final-position hidden diverged: max_abs={max_abs:.6e}"
+        );
+    }
+
+    /// Decode parity: after a CPU prefill (to seed the host KV mirror via the
+    /// `populate_kv_layer`-equivalent), CUDA's `decode_token` vs the CPU
+    /// direct decode step. Runtime-gated.
+    #[test]
+    fn decode_token_matches_cpu_reference_when_runtime_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let token_ids = [0u32, 1, 2];
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        // Seed both backends with the same prefill so the KV state matches.
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill seeding should succeed");
+
+        // CPU reference: prefill then one direct decode step.
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let next_tok = 4u32;
+        let cpu_decode = larql_compute::kquant_forward::predict_kquant_decode_step_direct(
+            &weights,
+            next_tok,
+            &index,
+            &larql_compute::CpuBackend,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU direct decode step");
+
+        // CUDA decode of the same next token.
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed with a runtime + seeded KV");
+
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        assert_eq!(cpu_row.len(), cuda_decode.len());
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "decode hidden diverged: max_abs={max_abs:.6e}"
+        );
+    }
+
+    /// Multi-token decode parity: after prefill, run several decode steps and
+    /// compare each against the CPU direct decode path. This locks the RoPE
+    /// position fix — without it, the second+ token reuses the post-prefill
+    /// position and diverges. Runtime-gated.
+    #[test]
+    fn multi_token_decode_matches_cpu_reference() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let token_ids = [0u32, 1, 2];
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill seeding should succeed");
+
+        // CPU reference: prefill then a sequence of direct decode steps.
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+
+        let next_tokens = [4u32, 5, 6, 7];
+        let mut cpu_pos = seq_len;
+        for tok in next_tokens {
+            let cpu_decode = larql_compute::kquant_forward::predict_kquant_decode_step_direct(
+                &weights,
+                tok,
+                &index,
+                &larql_compute::CpuBackend,
+                &mut cpu_cache,
+                cpu_pos,
+            )
+            .expect("CPU direct decode step");
+            cpu_pos += 1;
+
+            let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
+            let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+            let cuda_decode = b
+                .decode_token(&layers, &x_dec, hidden, inter)
+                .expect("CUDA decode_token should succeed across the multi-token run");
+
+            let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+            assert_eq!(cpu_row.len(), cuda_decode.len());
+            let max_abs = cpu_row
+                .iter()
+                .zip(cuda_decode.iter())
+                .map(|(c, g)| (c - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs < 1e-3,
+                "multi-token decode (tok {tok}) diverged: max_abs={max_abs:.6e}"
+            );
+            // The position source (host KV length) must advance per step.
+            assert_eq!(
+                b.kv_cache_len(),
+                cpu_pos,
+                "kv_cache_len drifted at tok {tok}"
+            );
+        }
+    }
+
+    /// `decode_token_with_state_dump_masked` populates the state dump with
+    /// one entry per layer under `Full` and only `h_in` under `HOnly`.
+    /// Runtime-gated.
+    #[test]
+    fn decode_token_with_state_dump_respects_mask() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let token_ids = [0u32, 1, 2];
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill seeding should succeed");
+
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[4u32]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let num_layers = weights.num_layers;
+
+        // Full mask: h_in + k_new + v_new per layer.
+        let mut full_state = larql_compute::DecodeStateDump::with_capacity(num_layers);
+        let _ = b.decode_token_with_state_dump_masked(
+            &layers,
+            &x_dec,
+            hidden,
+            inter,
+            Some(&mut full_state),
+            larql_compute::StateDumpMask::Full,
+        );
+        assert!(full_state.is_complete_for(num_layers));
+        assert_eq!(full_state.h_in_per_layer.len(), num_layers);
+        assert_eq!(full_state.k_new_per_layer.len(), num_layers);
+        assert_eq!(full_state.v_new_per_layer.len(), num_layers);
+
+        // HOnly mask: h_in per layer, no k_new/v_new.
+        let mut honly_state = larql_compute::DecodeStateDump::with_capacity(num_layers);
+        let _ = b.decode_token_with_state_dump_masked(
+            &layers,
+            &x_dec,
+            hidden,
+            inter,
+            Some(&mut honly_state),
+            larql_compute::StateDumpMask::HOnly,
+        );
+        assert_eq!(honly_state.h_in_per_layer.len(), num_layers);
+        assert!(honly_state.k_new_per_layer.is_empty());
+        assert!(honly_state.v_new_per_layer.is_empty());
+        assert!(honly_state.is_complete_under(num_layers, larql_compute::StateDumpMask::HOnly));
     }
 }

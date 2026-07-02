@@ -2,6 +2,7 @@ mod runtime;
 
 use crate::kv_cache::{CudaKVCache, KvCacheError};
 use crate::options::BackendOptions;
+use crate::pipeline::HostKvType;
 use std::sync::{Arc, Mutex};
 
 pub(crate) use runtime::{CudaRuntime, RuntimeError};
@@ -15,6 +16,13 @@ pub struct CudaBackend {
     /// (scaffold path) or before the first prefill. Mirrors Metal's
     /// `kv_cache: Mutex<Option<KVCache>>`.
     kv_cache: Mutex<Option<CudaKVCache>>,
+    /// Host-side KV mirror used by the host-orchestrated decode/prefill
+    /// pipeline (`pipeline.rs`). One `[len, kv_dim]` `(K, V)` pair per layer.
+    /// Reset by `reset_host_kv` at the start of every prefill; grown by one
+    /// row per decode step. Attention reads from this mirror (the device
+    /// `kv_cache` stays populated for the `DecodeBackend` lifecycle contract
+    /// but device-side attention kernels aren't implemented yet).
+    pub(crate) host_kv: Mutex<HostKvType>,
 }
 
 impl CudaBackend {
@@ -29,12 +37,14 @@ impl CudaBackend {
                 runtime: Some(Arc::new(runtime)),
                 runtime_status: None,
                 kv_cache: Mutex::new(None),
+                host_kv: Mutex::new(Vec::new()),
             }),
             Err(err) if options.allow_cpu_delegate => Ok(Self {
                 options,
                 runtime: None,
                 runtime_status: Some(err.to_string()),
                 kv_cache: Mutex::new(None),
+                host_kv: Mutex::new(Vec::new()),
             }),
             Err(err) => Err(BackendInitError::Unavailable(err.to_string())),
         }

@@ -1,6 +1,7 @@
 use half::f16;
 use larql_compute::backend::{Capability, ComputeBackend, DecodeBackend, MatMul, QuantMatVec};
 use larql_compute::CpuBackend;
+use larql_compute::{DecodeStateDump, StateDumpMask};
 use ndarray::{Array2, ArrayView2};
 
 use crate::CudaBackend;
@@ -213,8 +214,24 @@ impl QuantMatVec for CudaBackend {
     }
 
     fn supports_quant(&self, format: larql_compute::QuantFormat) -> bool {
-        let _ = format;
-        false
+        // The host-orchestrated decode/prefill pipeline (Session 11) routes
+        // every Q4_K / Q6_K projection through the native CUDA matvec / matmul
+        // kernels (with CPU fallback when no runtime is present). Advertise
+        // only the formats `build_pipeline_layers` actually produces for the
+        // fused path — Q4_K (gate/up/O) and Q6_K (down/V in a default
+        // vindex). Q4_KF is intentionally NOT advertised: the builders reject
+        // it (`resolve_*_weights` panic on the tag), and the native CUDA
+        // q4k kernels decode the 144-byte Q4_K super-block, not Q4_KF's
+        // 160-byte layout — so advertising it would be both undeliverable and
+        // numerically wrong. The scaffold path keeps `false` so
+        // `fused_prefill` / `fused_decode_step` bail to the CPU reference.
+        if !self.native_runtime_available() {
+            return false;
+        }
+        matches!(
+            format,
+            larql_compute::QuantFormat::Q4_K | larql_compute::QuantFormat::Q6_K
+        )
     }
 }
 
@@ -228,14 +245,55 @@ impl DecodeBackend for CudaBackend {
 
     fn reset_kv_cache(&self) {
         self.reset_kv_cache_native();
+        // Also clear the host KV mirror so the next prefill starts clean.
+        // (The host mirror is the source of truth for the host-orchestrated
+        // attention path; the device cache is kept in lockstep for the
+        // `DecodeBackend` lifecycle contract.)
+        self.reset_host_kv(0);
     }
 
     fn kv_cache_len(&self) -> usize {
-        self.kv_cache_len_native()
+        // The host KV mirror is the source of truth for the host-orchestrated
+        // attention path (the device cache has no attention kernels yet, so
+        // it's only kept for the lifecycle contract). Return the host
+        // mirror's committed length so callers tracking decode position stay
+        // consistent with what attention actually sees. Falls back to the
+        // device cursor when the host mirror is empty (e.g. a caller queries
+        // length before any prefill on a backend that populated the device
+        // cache through another path).
+        let host_len = self.host_kv_len();
+        if host_len > 0 {
+            host_len
+        } else {
+            self.kv_cache_len_native()
+        }
     }
 
     fn truncate_kv_cache(&self, len: usize) {
         self.truncate_kv_cache_native(len);
+        // Mirror the truncation on the host KV so the host attention path and
+        // `kv_cache_len` see the rolled-back length. Rows below `len` are
+        // preserved (the host mirror keeps its `[len, kv_dim]` prefix).
+        let mut kv = self.lock_host_kv();
+        for (k_cache, v_cache) in kv.iter_mut() {
+            let prev = k_cache.shape()[0];
+            if len < prev {
+                // Rebuild the prefix slice (Array2 has no in-place row
+                // truncate; the per-step decode rebuild already pays this
+                // shape, and truncate is rare — only iterative predispatch).
+                let kv_dim = k_cache.shape()[1];
+                let mut k_new = Array2::zeros((len, kv_dim));
+                let mut v_new = Array2::zeros((len, kv_dim));
+                k_new
+                    .slice_mut(ndarray::s![..len, ..])
+                    .assign(&k_cache.slice(ndarray::s![..len, ..]));
+                v_new
+                    .slice_mut(ndarray::s![..len, ..])
+                    .assign(&v_cache.slice(ndarray::s![..len, ..]));
+                *k_cache = k_new;
+                *v_cache = v_new;
+            }
+        }
     }
 
     fn preallocate_kv_cache_per_layer(&self, shapes: &[(usize, usize)], max_seq: usize) {
@@ -284,12 +342,117 @@ impl DecodeBackend for CudaBackend {
         let v_block = &v_data[..block_len];
         let _ = self.native_kv_append(layer, k_block, v_block, 0, seq_len);
     }
+
+    /// Single-token fused decode. Runs the host-orchestrated pipeline
+    /// (`pipeline::host_decode_token`): every Q/K/V/O + gate/up/down
+    /// projection dispatches through the native CUDA q4k/q6k matvec kernels
+    /// (CPU fallback when no runtime), with elementwise ops + GQA attention
+    /// on host. `None` when no runtime is present (scaffold path — the caller
+    /// routes through the CPU reference) or when a layer uses a feature this
+    /// path doesn't handle (MoE / PLE / remote FFN / non-k-quant formats).
+    fn decode_token(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+    ) -> Option<Vec<f32>> {
+        if !self.native_runtime_available() {
+            return None;
+        }
+        // RoPE position from the host KV mirror (the source of truth for the
+        // host-orchestrated attention). The device cursor
+        // (`kv_cache_len_native`) is only advanced by `prefill_kquant`, NOT
+        // by decode — so using it here would freeze the position at the
+        // post-prefill length and garble multi-token RoPE. The host mirror
+        // is grown by one row per decode step inside `host_decode_token`.
+        let pos = self.host_kv_len();
+        self.host_decode_token(layers, x, hidden, inter, pos, None, StateDumpMask::None)
+    }
+
+    fn decode_token_with_state_dump(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        state: Option<&mut DecodeStateDump>,
+    ) -> Option<Vec<f32>> {
+        self.decode_token_with_state_dump_masked(
+            layers,
+            x,
+            hidden,
+            inter,
+            state,
+            StateDumpMask::Full,
+        )
+    }
+
+    fn decode_token_with_state_dump_masked(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        state: Option<&mut DecodeStateDump>,
+        mask: StateDumpMask,
+    ) -> Option<Vec<f32>> {
+        if !self.native_runtime_available() {
+            return None;
+        }
+        let pos = self.host_kv_len();
+        self.host_decode_token(layers, x, hidden, inter, pos, state, mask)
+    }
+
+    /// Multi-position prefill. Runs the host-orchestrated pipeline
+    /// (`pipeline::host_prefill_kquant`): projections use the amortised
+    /// native CUDA q4k/q6k matmul kernels across all `seq_len` positions;
+    /// causal attention + elementwise ops on host. Populates the host KV
+    /// mirror (and the device cache via `populate_kv_layer` in lockstep).
+    /// `None` on the scaffold path or for unsupported layer features.
+    fn prefill_kquant(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        seq_len: usize,
+        _use_qk_norm: bool,
+        softcap: f32,
+    ) -> Option<Vec<f32>> {
+        if !self.native_runtime_available() {
+            return None;
+        }
+        let h = self.host_prefill_kquant(layers, x, hidden, inter, seq_len, softcap)?;
+        // Populate the device KV cache in lockstep with the host mirror so
+        // `has_kv_cache` / `kv_cache_len` reflect the post-prefill state and
+        // subsequent `decode_token` calls see the right `pos`.
+        {
+            let kv = self.lock_host_kv();
+            for (li, slot) in kv.iter().enumerate() {
+                let (k_cache, v_cache) = slot;
+                let k_flat: Vec<f32> = k_cache.iter().cloned().collect();
+                let v_flat: Vec<f32> = v_cache.iter().cloned().collect();
+                if let Some(layer) = layers.get(li) {
+                    self.populate_kv_layer(
+                        li,
+                        &k_flat,
+                        &v_flat,
+                        k_cache.shape()[0],
+                        layer.num_kv_heads,
+                        layer.head_dim,
+                    );
+                }
+            }
+        }
+        Some(h)
+    }
 }
 
 impl ComputeBackend for CudaBackend {
     fn name(&self) -> &str {
         if self.native_runtime_available() {
-            "cuda (native k-quant + gemv + cpu fallback)"
+            "cuda (native k-quant + gemv + host-orchestrated decode/prefill + cpu fallback)"
         } else {
             "cuda (cpu-delegate scaffold)"
         }
@@ -300,8 +463,19 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn supports(&self, cap: Capability) -> bool {
-        let _ = cap;
-        false
+        // The host-orchestrated decode/prefill pipeline (Session 11) makes
+        // `decode_token` / `prefill_kquant` live when a native runtime is
+        // present, so advertise the corresponding capabilities. The scaffold
+        // path keeps everything `false` so callers route through the CPU
+        // reference. `QuantMatVec` is advertised because the per-format
+        // `supports_quant` reports Q4_K / Q6_K under the same gate.
+        if !self.native_runtime_available() {
+            return false;
+        }
+        matches!(
+            cap,
+            Capability::QuantMatVec | Capability::DecodeToken | Capability::PrefillQ4
+        )
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
