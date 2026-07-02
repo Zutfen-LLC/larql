@@ -14,7 +14,8 @@ use crate::ops::{
     Q4K_MATMUL_CUDA_SRC, Q4K_MATMUL_KERNEL, Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL,
     Q4_MATVEC_CUDA_SRC, Q4_MATVEC_KERNEL, Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL,
     Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL, Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL,
-    RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC, RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
+    RESIDUAL_ADD_CUDA_SRC, RESIDUAL_ADD_KERNEL, RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC,
+    RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
 };
 
 #[derive(Debug)]
@@ -41,6 +42,7 @@ pub(crate) struct CudaRuntime {
     geglu_gelu_tanh: CudaFunction,
     activation_silu: CudaFunction,
     activation_gelu_tanh: CudaFunction,
+    residual_add: CudaFunction,
     summary: String,
 }
 
@@ -69,7 +71,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}\n{RESIDUAL_ADD_CUDA_SRC}"
         );
         let ptx = compile_ptx_with_opts(
             &combined_src,
@@ -132,6 +134,9 @@ impl CudaRuntime {
             .map_err(|err| {
                 RuntimeError::context("loading activation_gelu_tanh CUDA function", err)
             })?;
+        let residual_add = module
+            .load_function(RESIDUAL_ADD_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading residual_add CUDA function", err))?;
         let stream = context.default_stream();
 
         Ok(Self {
@@ -154,8 +159,9 @@ impl CudaRuntime {
             geglu_gelu_tanh,
             activation_silu,
             activation_gelu_tanh,
+            residual_add,
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add loaded, remaining ops use CPU fallback"
             ),
         })
     }
@@ -1207,7 +1213,7 @@ impl CudaRuntime {
         out: &mut [f32],
         n: usize,
     ) -> Result<(), RuntimeError> {
-        self.launch_elementwise_binary(&self.geglu_silu, gate, up, out, n, "geglu_silu")
+        self.launch_elementwise_binary(&self.geglu_silu, gate, up, out, None, n, "geglu_silu")
     }
 
     /// Native GEGLU-GELU-tanh launch: `out[i] = gelu_tanh(gate[i]) * up[i]`.
@@ -1218,7 +1224,15 @@ impl CudaRuntime {
         out: &mut [f32],
         n: usize,
     ) -> Result<(), RuntimeError> {
-        self.launch_elementwise_binary(&self.geglu_gelu_tanh, gate, up, out, n, "geglu_gelu_tanh")
+        self.launch_elementwise_binary(
+            &self.geglu_gelu_tanh,
+            gate,
+            up,
+            out,
+            None,
+            n,
+            "geglu_gelu_tanh",
+        )
     }
 
     /// Native standard SiLU launch: `out[i] = silu(x[i])`. `up` is unused
@@ -1250,27 +1264,57 @@ impl CudaRuntime {
         )
     }
 
-    /// Shared binary elementwise dispatch (gate, up → out). All four
-    /// activation kernels take the same `(gate, up, out, n)` arg layout,
-    /// so the upload/launch/sync/readback is identical — only the function
-    /// handle + context string differ.
+    /// Native scaled residual add: `out[i] = h[i] + b_scale * x[i]`, one
+    /// thread per element. `h`, `x`, `out` are each `n` elements. The
+    /// device form fuses the `b_scale == 1.0` / `b_scale != 1.0` arms of the
+    /// host `add_residual` (the two are numerically identical, so no branch
+    /// is needed). Routed through the shared binary launcher with `b_scale`
+    /// as the extra scalar arg (the activation kernels pass `None`).
+    pub(crate) fn launch_residual_add(
+        &self,
+        h: &[f32],
+        x: &[f32],
+        out: &mut [f32],
+        b_scale: f32,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary(
+            &self.residual_add,
+            h,
+            x,
+            out,
+            Some(b_scale),
+            n,
+            "residual_add",
+        )
+    }
+
+    /// Shared binary elementwise dispatch (in_a, in_b → out). The GEGLU
+    /// activation kernels take `(a, b, out, n)`; the residual-add kernel
+    /// additionally takes a scalar `b_scale` between `out` and `n`, supplied
+    /// via `extra_scalar = Some(b_scale)` (the activation kernels pass
+    /// `None`). The upload/launch/sync/readback + overflow guard is identical
+    /// for all five callers — only the function handle, the optional scalar,
+    /// and the context string differ.
+    #[allow(clippy::too_many_arguments)]
     fn launch_elementwise_binary(
         &self,
         func: &CudaFunction,
-        gate: &[f32],
-        up: &[f32],
+        in_a: &[f32],
+        in_b: &[f32],
         out: &mut [f32],
+        extra_scalar: Option<f32>,
         n: usize,
         ctx: &'static str,
     ) -> Result<(), RuntimeError> {
         if n == 0 {
             return Ok(());
         }
-        if gate.len() != n || up.len() != n || out.len() != n {
+        if in_a.len() != n || in_b.len() != n || out.len() != n {
             return Err(RuntimeError::usage(format!(
-                "{ctx} expected gate/up/out of length {n}, got {} / {} / {}",
-                gate.len(),
-                up.len(),
+                "{ctx} expected in_a/in_b/out of length {n}, got {} / {} / {}",
+                in_a.len(),
+                in_b.len(),
                 out.len()
             )));
         }
@@ -1282,31 +1326,35 @@ impl CudaRuntime {
             )));
         }
 
-        let gate_dev = self
+        let a_dev = self
             .stream
-            .clone_htod(gate)
-            .map_err(|err| RuntimeError::context_concat("uploading ", ctx, " gate to CUDA", err))?;
-        let up_dev = self
+            .clone_htod(in_a)
+            .map_err(|err| RuntimeError::context_concat("uploading ", ctx, " in_a to CUDA", err))?;
+        let b_dev = self
             .stream
-            .clone_htod(up)
-            .map_err(|err| RuntimeError::context_concat("uploading ", ctx, " up to CUDA", err))?;
+            .clone_htod(in_b)
+            .map_err(|err| RuntimeError::context_concat("uploading ", ctx, " in_b to CUDA", err))?;
         let mut out_dev = self
             .stream
             .alloc_zeros::<f32>(n)
             .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
         let threads_x = GEGGLU_SILU_KERNEL.geometry.threads_per_group[0];
         let n_u = n as u32;
+        // Hold the optional scalar for the lifetime of `launch_args` — the
+        // builder borrows it across the (unsafe) launch, so it must outlive
+        // the launch rather than the `if let` block.
+        let extra = extra_scalar;
         let cfg = LaunchConfig {
             grid_dim: (n_u.div_ceil(threads_x), 1, 1),
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut launch_args = self.stream.launch_builder(func);
-        launch_args
-            .arg(&gate_dev)
-            .arg(&up_dev)
-            .arg(&mut out_dev)
-            .arg(&n_u);
+        launch_args.arg(&a_dev).arg(&b_dev).arg(&mut out_dev);
+        if let Some(ref scalar) = extra {
+            launch_args.arg(scalar);
+        }
+        launch_args.arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
         self.stream.synchronize().map_err(|err| {

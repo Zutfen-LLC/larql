@@ -377,9 +377,9 @@ impl CudaBackend {
                 layer.norm_offset,
                 layer.eps,
             );
-            add_residual(h, &normed, res_mult)
+            self.add_residual_native(h, &normed, res_mult)
         } else {
-            add_residual(h, &o, res_mult)
+            self.add_residual_native(h, &o, res_mult)
         };
         Some(h_post_attn)
     }
@@ -486,9 +486,9 @@ impl CudaBackend {
                 Some(w) => self.norm_2d(layer.norm_type, &out, w, layer.norm_offset, layer.eps),
                 None => self.norm_2d_no_weight(&out, layer.norm_offset, layer.eps),
             };
-            add_residual(h_post_attn, &normed, res_mult)
+            self.add_residual_native(h_post_attn, &normed, res_mult)
         } else {
-            add_residual(h_post_attn, &out, res_mult)
+            self.add_residual_native(h_post_attn, &out, res_mult)
         };
         Some(h_post_ffn)
     }
@@ -659,9 +659,9 @@ impl CudaBackend {
                 layer.norm_offset,
                 layer.eps,
             );
-            add_residual(h, &normed, res_mult)
+            self.add_residual_native(h, &normed, res_mult)
         } else {
-            add_residual(h, &attn_projected, res_mult)
+            self.add_residual_native(h, &attn_projected, res_mult)
         };
 
         Some((h_post_attn, k_new_row, v_new_row))
@@ -744,9 +744,9 @@ impl CudaBackend {
                 Some(w) => self.norm_1d(layer.norm_type, &out, w, layer.norm_offset, layer.eps),
                 None => self.norm_2d_no_weight(&out, layer.norm_offset, layer.eps),
             };
-            add_residual(h_post_attn, &normed, res_mult)
+            self.add_residual_native(h_post_attn, &normed, res_mult)
         } else {
-            add_residual(h_post_attn, &out, res_mult)
+            self.add_residual_native(h_post_attn, &out, res_mult)
         };
         Some(h_post_ffn)
     }
@@ -887,6 +887,26 @@ impl CudaBackend {
         elems >= Self::ACTIVATION_NATIVE_MIN_ELEMS
     }
 
+    /// Minimum element count for a native residual add to be worth the
+    /// host→device upload + kernel launch + sync + device→host readback
+    /// round-trip. Below this, the host `h + b_scale * x` reference is faster
+    /// (the residual output is read straight back to host and re-uploaded by
+    /// the next op, so there's no fusion benefit — only transfer+sync
+    /// overhead). Mirrors `NORM_NATIVE_MIN_ELEMS` / `ACTIVATION_NATIVE_MIN_ELEMS`.
+    /// Tuned conservatively for correctness-first (the host-orchestrated path
+    /// is the parity oracle); the fully-fused single-command-buffer pipeline
+    /// lifts this gate. The decode residual (`[1, hidden]`, ~3-9k elements)
+    /// typically stays below this gate and keeps the host path; the prefill
+    /// residual (`[seq, hidden]`) clears it once `seq * hidden >= 8192`.
+    const RESIDUAL_NATIVE_MIN_ELEMS: usize = 8192;
+
+    /// True when a residual add of `elems` elements is large enough that the
+    /// native CUDA kernel is likely to beat the host reference after the
+    /// per-call device round-trip.
+    fn native_residual_worthwhile(elems: usize) -> bool {
+        elems >= Self::RESIDUAL_NATIVE_MIN_ELEMS
+    }
+
     /// Gated activation (`out[i] = act(gate[i]) * up[i]`) routed through the
     /// native CUDA kernel when a runtime is present AND the element count is
     /// large enough to amortise the device round-trip; falls back to the host
@@ -933,6 +953,34 @@ impl CudaBackend {
             }
         }
         apply_activation_std(act, x, out);
+    }
+
+    /// Scaled residual add (`out = h + b_scale * x`) for same-shaped `[rows,
+    /// cols]` arrays — the device twin of the host `add_residual` helper.
+    /// Routes through the native CUDA `residual_add` kernel when a runtime is
+    /// present AND the element count is large enough to amortise the device
+    /// round-trip; falls back to the host reference on `Ok(false)`/`Err`,
+    /// non-contiguous views, or small inputs. The device kernel fuses the
+    /// `b_scale == 1.0` / `b_scale != 1.0` arms of the host helper (the two
+    /// are numerically identical, so no branch is needed on the device).
+    pub(crate) fn add_residual_native(
+        &self,
+        h: &Array2<f32>,
+        x: &Array2<f32>,
+        b_scale: f32,
+    ) -> Array2<f32> {
+        let (rows, cols) = (h.shape()[0], h.shape()[1]);
+        let n = rows * cols;
+        if let (Some(hs), Some(xs)) = (h.as_slice(), x.as_slice()) {
+            if n > 0 && Self::native_residual_worthwhile(n) {
+                let mut out = vec![0.0f32; n];
+                if let Ok(true) = self.native_residual_add(hs, xs, &mut out, b_scale, n) {
+                    return Array2::from_shape_vec((rows, cols), out)
+                        .expect("native residual_add output shape");
+                }
+            }
+        }
+        add_residual(h, x, b_scale)
     }
 
     /// RMSNorm or LayerNorm for a `[rows, cols]` array using a `&[f32]`
@@ -1120,7 +1168,7 @@ pub(crate) fn moe_combine_row(
 }
 
 /// `h + b_scale * x` for `[1, hidden]` arrays.
-fn add_residual(h: &Array2<f32>, x: &Array2<f32>, b_scale: f32) -> Array2<f32> {
+pub(crate) fn add_residual(h: &Array2<f32>, x: &Array2<f32>, b_scale: f32) -> Array2<f32> {
     if b_scale == 1.0 {
         h + x
     } else {

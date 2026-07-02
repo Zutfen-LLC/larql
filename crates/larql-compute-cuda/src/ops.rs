@@ -128,6 +128,14 @@ pub const ACTIVATION_GELU_TANH_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const RESIDUAL_ADD_KERNEL: KernelHandle = KernelHandle::new(
+    "residual_add",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -1092,5 +1100,27 @@ extern "C" __global__ void activation_gelu_tanh(
     y = fminf(fmaxf(y, -15.0f), 15.0f);
     const float t = tanhf(y);
     out[tid] = 0.5f * x * (1.0f + t);
+}
+"#;
+
+/// Scaled residual add: `out[i] = h[i] + b_scale * x[i]`. One thread per
+/// element. The device twin of the host `add_residual` path in
+/// `pipeline.rs` (`h + x` when `b_scale == 1.0`, else `h + b_scale * x` —
+/// numerically identical to the single fused `h + b_scale * x` form, so no
+/// branch is needed on the device). Element-wise, no reduction — no shared
+/// memory or cross-thread coordination.
+pub const RESIDUAL_ADD_CUDA_SRC: &str = r#"
+extern "C" __global__ void residual_add(
+    const float* h,
+    const float* x,
+    float* out,
+    const float b_scale,
+    unsigned int n)
+{
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) {
+        return;
+    }
+    out[tid] = h[tid] + b_scale * x[tid];
 }
 "#;

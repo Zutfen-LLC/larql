@@ -332,6 +332,27 @@ impl CudaBackend {
         }
     }
 
+    /// Native scaled residual add: `out[i] = h[i] + b_scale * x[i]`. Returns
+    /// `Ok(true)` on a native launch, `Ok(false)` when there's no runtime
+    /// (caller falls back to the host reference), or `Err` on a launch
+    /// failure. `h`, `x`, `out` must each be `n` elements.
+    pub(crate) fn native_residual_add(
+        &self,
+        h: &[f32],
+        x: &[f32],
+        out: &mut [f32],
+        b_scale: f32,
+        n: usize,
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_residual_add(h, x, out, b_scale, n)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Lock the KV-cache mutex, recovering from poisoning by taking the
     /// inner value (a poisoned mutex only means a prior holder panicked; the
     /// cache itself is still usable). This keeps the documented "fall back

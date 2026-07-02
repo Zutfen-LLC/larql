@@ -2103,4 +2103,92 @@ mod tests {
             "mismatched gate/up lengths should error, not silently launch"
         );
     }
+
+    // ── residual add (Session 15) ────────────────────────────────────────
+
+    /// The pipeline's residual helper must match the host `add_residual`
+    /// reference for small inputs (below the 8192 gate → host reference).
+    /// Exercises both the `b_scale == 1.0` arm (`h + x`) and the scaled arm
+    /// (`h + b_scale * x`). Always runs.
+    #[test]
+    fn add_residual_native_matches_host_reference_scaled_and_unit() {
+        let b = backend();
+        let rows = 4usize;
+        let cols = 512usize; // rows*cols = 2048 < 8192 gate → host reference
+        let h_flat: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.013).sin()).collect();
+        let x_flat: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.007).cos() - 0.25)
+            .collect();
+        let h = Array2::from_shape_vec((rows, cols), h_flat.clone()).unwrap();
+        let x = Array2::from_shape_vec((rows, cols), x_flat.clone()).unwrap();
+
+        // b_scale == 1.0 arm.
+        let got_unit = b.add_residual_native(&h, &x, 1.0);
+        let want_unit = crate::pipeline::add_residual(&h, &x, 1.0);
+        assert_eq!(got_unit, want_unit);
+
+        // scaled arm.
+        let b_scale = 0.5f32;
+        let got_scaled = b.add_residual_native(&h, &x, b_scale);
+        let want_scaled = crate::pipeline::add_residual(&h, &x, b_scale);
+        assert_eq!(got_scaled, want_scaled);
+    }
+
+    /// Native residual add (via `native_residual_add`) must match the host
+    /// reference when a CUDA runtime is present, for both the unit and scaled
+    /// forms. Runtime-gated: no-op on hosts without CUDA. Residual add is pure
+    /// IEEE-754 add/mul with `fmad` disabled at NVRTC compile time, so the
+    /// device and host agree exactly.
+    #[test]
+    fn native_residual_add_matches_host_when_runtime_is_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let n = 8192usize;
+        let h: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011).sin()).collect();
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.0043).cos() - 0.1).collect();
+
+        // b_scale == 1.0.
+        let mut got = vec![0.0f32; n];
+        let launched = b
+            .native_residual_add(&h, &x, &mut got, 1.0, n)
+            .expect("native_residual_add should not error with a runtime");
+        assert!(launched, "runtime present should launch the native kernel");
+        let want: Vec<f32> = (0..n).map(|i| h[i] + x[i]).collect();
+        assert_eq!(got, want, "unit residual_add diverged from host reference");
+
+        // b_scale != 1.0.
+        let b_scale = 0.3f32;
+        let launched = b
+            .native_residual_add(&h, &x, &mut got, b_scale, n)
+            .expect("native_residual_add should not error with a runtime");
+        assert!(launched);
+        let want: Vec<f32> = (0..n).map(|i| h[i] + b_scale * x[i]).collect();
+        assert_eq!(
+            got, want,
+            "scaled residual_add diverged from host reference"
+        );
+    }
+
+    /// The launcher must reject a length exceeding the 32-bit kernel index
+    /// limit instead of truncating the dispatch. Runtime-gated (needs a
+    /// runtime to reach the guard; without one the wrapper returns `Ok(false)`
+    /// before the guard). Exercised via mismatched lengths, which hit the
+    /// length check first (mirrors the activation dim-overflow test).
+    #[test]
+    fn native_residual_add_rejects_dim_exceeding_u32_index_limit() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let h = vec![0.0f32; 4];
+        let x = vec![0.0f32; 8];
+        let mut out = vec![0.0f32; 4];
+        let result = b.native_residual_add(&h, &x, &mut out, 1.0, 4);
+        assert!(
+            result.is_err(),
+            "mismatched h/x lengths should error, not silently launch"
+        );
+    }
 }
