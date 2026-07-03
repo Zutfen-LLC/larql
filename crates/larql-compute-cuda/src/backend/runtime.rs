@@ -11,9 +11,10 @@ use crate::ops::{
     ACTIVATION_SILU_KERNEL, DECODE_ATTENTION_CUDA_SRC, DECODE_ATTENTION_KERNEL, F16_GEMV_CUDA_SRC,
     F16_GEMV_KERNEL, F32_GEMV_CUDA_SRC, F32_GEMV_KERNEL, GEGGLU_GELU_TANH_CUDA_SRC,
     GEGGLU_GELU_TANH_KERNEL, GEGGLU_SILU_CUDA_SRC, GEGGLU_SILU_KERNEL, KV_APPEND_CUDA_SRC,
-    KV_APPEND_KERNEL, Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC,
-    Q4K_MATMUL_KERNEL, Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q4_MATVEC_CUDA_SRC,
-    Q4_MATVEC_KERNEL, Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
+    KV_APPEND_KERNEL, PREFILL_ATTENTION_CUDA_SRC, PREFILL_ATTENTION_KERNEL,
+    Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC, Q4K_MATMUL_KERNEL,
+    Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q4_MATVEC_CUDA_SRC, Q4_MATVEC_KERNEL,
+    Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
     Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL, RESIDUAL_ADD_CUDA_SRC, RESIDUAL_ADD_KERNEL,
     RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC, RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
     ROPE_CUDA_SRC, ROPE_KERNEL,
@@ -46,6 +47,7 @@ pub(crate) struct CudaRuntime {
     residual_add: CudaFunction,
     rope: CudaFunction,
     decode_attention: CudaFunction,
+    prefill_attention: CudaFunction,
     summary: String,
 }
 
@@ -74,7 +76,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}\n{RESIDUAL_ADD_CUDA_SRC}\n{ROPE_CUDA_SRC}\n{DECODE_ATTENTION_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}\n{RESIDUAL_ADD_CUDA_SRC}\n{ROPE_CUDA_SRC}\n{DECODE_ATTENTION_CUDA_SRC}\n{PREFILL_ATTENTION_CUDA_SRC}"
         );
         let ptx = compile_ptx_with_opts(
             &combined_src,
@@ -146,6 +148,9 @@ impl CudaRuntime {
         let decode_attention = module
             .load_function(DECODE_ATTENTION_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading decode_attention CUDA function", err))?;
+        let prefill_attention = module
+            .load_function(PREFILL_ATTENTION_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading prefill_attention CUDA function", err))?;
         let stream = context.default_stream();
 
         Ok(Self {
@@ -171,8 +176,9 @@ impl CudaRuntime {
             residual_add,
             rope,
             decode_attention,
+            prefill_attention,
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention loaded, remaining ops use CPU fallback"
             ),
         })
     }
@@ -1542,6 +1548,141 @@ impl CudaRuntime {
             .stream
             .clone_dtoh(&out_dev)
             .map_err(|err| RuntimeError::context("reading decode_attention output", err))?;
+        out.clear();
+        out.extend_from_slice(&host_out);
+        Ok(())
+    }
+
+    /// Native fused prefill (seq×seq) causal GQA attention — the device twin
+    /// of `gqa_attention_with_weights` (the symmetric `gqa_attention_capture`
+    /// path). `q` is `[seq, num_q*head_dim]`; `k`/`v` are `[seq, kv_dim]`; on
+    /// success `out` is filled with `[seq, num_q*head_dim]` (row-major). One
+    /// thread-block per `(query head, query position)`; dynamic shared memory
+    /// (`3072 + seq_len*4` bytes) holds the per-block causal `scores` scratch
+    /// + the fixed 256-slot max/sum reduction arrays.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_prefill_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut Vec<f32>,
+        scale: f32,
+        softcap: Option<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        seq_len: usize,
+    ) -> Result<(), RuntimeError> {
+        let q_dim = num_q.checked_mul(head_dim);
+        let q_len = seq_len.checked_mul(q_dim.unwrap_or(usize::MAX));
+        let kv_len = seq_len.checked_mul(kv_dim);
+        let (q_len, kv_len) = match (q_len, kv_len) {
+            (Some(ql), Some(kvl)) if q.len() == ql && k.len() == kvl && v.len() == kvl => (ql, kvl),
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "prefill_attention shape mismatch: q={} (expected {q_len:?}), k={} / v={} (expected {kv_len:?}, kv_dim={kv_dim}, seq={seq_len}), num_q={num_q}, head_dim={head_dim}",
+                    q.len(),
+                    k.len(),
+                    v.len(),
+                )))
+            }
+        };
+        if seq_len == 0 {
+            out.clear();
+            out.resize(num_q * head_dim, 0.0);
+            return Ok(());
+        }
+        if reps == 0 {
+            return Err(RuntimeError::usage(
+                "prefill_attention requires reps >= 1 (num_kv heads > 0)".to_string(),
+            ));
+        }
+        // Guard the grid + 64-bit device indices against the 32-bit limit.
+        if q_len > u32::MAX as usize
+            || kv_len > u32::MAX as usize
+            || num_q > u32::MAX as usize
+            || head_dim > u32::MAX as usize
+            || kv_dim > u32::MAX as usize
+            || seq_len > u32::MAX as usize
+        {
+            return Err(RuntimeError::usage(format!(
+                "prefill_attention shape (num_q={num_q}, head_dim={head_dim}, kv_dim={kv_dim}, seq_len={seq_len}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        // Dynamic shared budget: 256 doubles (sum) + 256 floats (max) +
+        // seq_len floats (scores). Stay within the default 48 KB dynamic
+        // shared-mem ceiling (larger needs `cudaFuncSetAttribute`, which the
+        // single-command-buffer follow-on will revisit); fall back to the host
+        // reference otherwise.
+        let shm_fixed = 256 * 8 + 256 * 4;
+        let shm_scores = seq_len.checked_mul(4);
+        let shared_mem_bytes = match shm_scores {
+            Some(ss) if shm_fixed + ss <= 48 * 1024 => shm_fixed + ss,
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "prefill_attention seq_len={seq_len} exceeds the 48 KB dynamic shared-mem budget; fall back to host"
+                )));
+            }
+        };
+
+        let q_dev = self
+            .stream
+            .clone_htod(q)
+            .map_err(|err| RuntimeError::context("uploading prefill_attention q to CUDA", err))?;
+        let k_dev = self
+            .stream
+            .clone_htod(k)
+            .map_err(|err| RuntimeError::context("uploading prefill_attention K to CUDA", err))?;
+        let v_dev = self
+            .stream
+            .clone_htod(v)
+            .map_err(|err| RuntimeError::context("uploading prefill_attention V to CUDA", err))?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(q_len)
+            .map_err(|err| RuntimeError::context("allocating prefill_attention output", err))?;
+
+        let threads = PREFILL_ATTENTION_KERNEL.geometry.threads_per_group[0];
+        let cfg = LaunchConfig {
+            // grid = (num_q query heads, seq_len query positions).
+            grid_dim: (num_q as u32, seq_len as u32, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: shared_mem_bytes as u32,
+        };
+        let (softcap_val, has_softcap) = match softcap {
+            Some(cap) => (cap, 1u32),
+            None => (0.0f32, 0u32),
+        };
+        let num_q_u = num_q as u32;
+        let head_dim_u = head_dim as u32;
+        let kv_dim_u = kv_dim as u32;
+        let reps_u = reps as u32;
+        let seq_len_u = seq_len as u32;
+        let mut launch_args = self.stream.launch_builder(&self.prefill_attention);
+        launch_args
+            .arg(&q_dev)
+            .arg(&k_dev)
+            .arg(&v_dev)
+            .arg(&mut out_dev)
+            .arg(&scale)
+            .arg(&softcap_val)
+            .arg(&has_softcap)
+            .arg(&num_q_u)
+            .arg(&head_dim_u)
+            .arg(&kv_dim_u)
+            .arg(&reps_u)
+            .arg(&seq_len_u);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA prefill_attention kernel", err))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing prefill_attention stream", err))?;
+        let host_out = self
+            .stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading prefill_attention output", err))?;
         out.clear();
         out.extend_from_slice(&host_out);
         Ok(())

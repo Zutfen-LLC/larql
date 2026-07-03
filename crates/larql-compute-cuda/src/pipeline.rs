@@ -342,10 +342,9 @@ impl CudaBackend {
 
         // Causal GQA attention over the full seq (with optional logit
         // softcap, mirroring `run_attention_with_kv_backend`).
-        let attn_out = larql_compute::attention::gqa::gqa_attention_with_weights(
-            &q_r, &k_r, &v, num_q, head_dim, reps, scale, seq_len, false, softcap,
-        )
-        .0;
+        let attn_out = self.prefill_attention_native(
+            &q_r, &k_r, &v, num_q, head_dim, kv_dim, reps, scale, seq_len, softcap,
+        );
 
         // O projection via amortised matmul: [seq, hidden].
         let attn_flat: Vec<f32> = attn_out.iter().cloned().collect();
@@ -1072,6 +1071,86 @@ impl CudaBackend {
             }
         }
         gqa_attention_decode_step(q, k_cache, v_cache, num_q, head_dim, reps, scale, softcap)
+    }
+
+    /// `PREFILL_ATTN_NATIVE_MIN_WORK` — the prefill attention is worth a
+    /// device round-trip once the work (over all query positions × heads) is
+    /// large enough to amortise the htod/launch/dtoh cost. Tuned
+    /// conservatively for correctness-first (the host-orchestrated path is
+    /// the parity oracle); the fully-fused single-command-buffer pipeline
+    /// lifts this gate.
+    const PREFILL_ATTN_NATIVE_MIN_WORK: usize = 8192;
+
+    /// True when a prefill attention over
+    /// `work = seq_len × num_q × seq_len × head_dim` (causal, so ~half the
+    /// QKᵀ + all the weighted-V) is large enough that the native CUDA kernel
+    /// is likely to beat the host reference after the per-call device
+    /// round-trip.
+    fn native_prefill_attention_worthwhile(work: usize) -> bool {
+        work >= Self::PREFILL_ATTN_NATIVE_MIN_WORK
+    }
+
+    /// Fused prefill (seq×seq) causal GQA attention — the device twin of
+    /// `gqa_attention_with_weights` (the symmetric `gqa_attention_capture`
+    /// path). Routes through the native CUDA `prefill_attention` kernel when a
+    /// runtime is present AND the attention work is large enough to amortise
+    /// the device round-trip (see `PREFILL_ATTN_NATIVE_MIN_WORK`); falls back
+    /// to the host reference on `Ok(false)`/`Err`, non-contiguous Q/K/V views,
+    /// or short prompts. `q` is `[seq, num_q * head_dim]`; `k`/`v` are
+    /// `[seq, kv_dim]`. Returns `[seq, num_q * head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_attention_native(
+        &self,
+        q: &Array2<f32>,
+        k: &Array2<f32>,
+        v: &Array2<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        scale: f64,
+        seq_len: usize,
+        softcap: Option<f32>,
+    ) -> Array2<f32> {
+        let q_dim = num_q * head_dim;
+        // Work proxy: causal QKᵀ is ~seq_len*(seq_len/2)*num_q*head_dim flops;
+        // use the full `seq_len*num_q*seq_len*head_dim` upper bound for the gate.
+        let work = seq_len
+            .saturating_mul(num_q)
+            .saturating_mul(seq_len)
+            .saturating_mul(head_dim);
+        if seq_len >= 1
+            && Self::native_prefill_attention_worthwhile(work)
+            && q.shape() == [seq_len, q_dim]
+            && k.shape() == [seq_len, kv_dim]
+            && v.shape() == [seq_len, kv_dim]
+        {
+            if let (Some(qs), Some(ks), Some(vs)) = (q.as_slice(), k.as_slice(), v.as_slice()) {
+                let mut out = Vec::with_capacity(seq_len * q_dim);
+                if let Ok(true) = self.native_prefill_attention(
+                    qs,
+                    ks,
+                    vs,
+                    &mut out,
+                    scale as f32,
+                    softcap,
+                    num_q,
+                    head_dim,
+                    kv_dim,
+                    reps,
+                    seq_len,
+                ) {
+                    if out.len() == seq_len * q_dim {
+                        return Array2::from_shape_vec((seq_len, q_dim), out)
+                            .expect("native prefill_attention output shape");
+                    }
+                }
+            }
+        }
+        larql_compute::attention::gqa::gqa_attention_with_weights(
+            q, k, v, num_q, head_dim, reps, scale, seq_len, false, softcap,
+        )
+        .0
     }
 
     /// Gated activation (`out[i] = act(gate[i]) * up[i]`) routed through the

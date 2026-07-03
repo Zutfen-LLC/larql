@@ -152,6 +152,14 @@ pub const DECODE_ATTENTION_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const PREFILL_ATTENTION_KERNEL: KernelHandle = KernelHandle::new(
+    "prefill_attention",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [256, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -1366,6 +1374,162 @@ extern "C" __global__ void decode_attention(
             acc += scores[score_base + i] * v_cache[v_base + (unsigned long long)d];
         }
         out[q_off + d] = acc;
+    }
+}
+"#;
+
+/// Native fused prefill (seq×seq) causal GQA attention — the device twin of
+/// `larql_compute::attention::gqa::gqa_attention_capture` (the symmetric path
+/// reached via `gqa_attention_with_weights`). The prefill twin of
+/// [`DECODE_ATTENTION_CUDA_SRC`]: one thread-block per `(query head h, query
+/// position qi)` (`gridDim = (num_q, seq_len)`); each block collaboratively
+/// fuses the causal QKᵀ → scale (+ optional softcap) → softmax → weighted-V
+/// over the keys `0..=qi` (the decode kernel attends over the *full* KV cache;
+/// prefill is causal so each query position only sees `causal_len = qi + 1`
+/// keys).
+///
+/// Shared-memory layout (dynamic `extern __shared__`, sized `3072 + seq_len*4`
+/// bytes by the host launcher): `shm_sum[256]` doubles at offset 0,
+/// `shm_max[256]` floats at offset `256*8`, then a `seq_len`-entry `scores`
+/// scratch (one block per `(h, qi)` so the scratch is block-local — no
+/// `seq_len*num_q*seq_len` global allocation).
+///
+/// Five phases per `(h, qi)`, mirroring `decode_attention`'s structure but
+/// bounded by `causal_len` instead of `total_len`:
+/// - QKᵀ → scale (+ optional `tanhf` softcap) → `scores[i]` (f32).
+/// - f32 max via a 256-slot `__shared__` tree reduction (stride loop over
+///   `causal_len`).
+/// - `exp((s - max) as f64)` → `scores[i]` (f32) + f64 sum reduction over a
+///   256-slot `__shared__ double` array (matches the reference's f64 sum).
+/// - normalize `scores[i] *= inv_sum` (normalize-before-dot, matching the
+///   reference's normalize-then-`v_block.t().dot` rounding order).
+/// - weighted-V `out[qi, q_off + d] = Σ_i scores[i]*V[i, kv_off + d]` in f32,
+///   `d = 0..head_dim` order.
+///
+/// With `fmad` disabled at NVRTC compile time the f32 arithmetic matches the
+/// reference; the only divergence is the device `exp`/`tanhf` libm (parity
+/// gated, ≤ a small tolerance). The kernel indexes Q/K/V/out rows in 64-bit
+/// and the host launcher guards all dims against `u32::MAX` + the shared-mem
+/// budget (≤ 48 KB, i.e. `seq_len` small enough to fit) before upload.
+pub const PREFILL_ATTENTION_CUDA_SRC: &str = r#"
+#define PREFILL_ATTN_BLOCK 256u
+
+extern "C" __global__ void prefill_attention(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    const float scale,
+    const float softcap,
+    const unsigned int has_softcap,
+    const unsigned int num_q,
+    const unsigned int head_dim,
+    const unsigned int kv_dim,
+    const unsigned int reps,
+    const unsigned int seq_len)
+{
+    const unsigned int tid = threadIdx.x;
+    const unsigned int h = blockIdx.x;
+    const unsigned int qi = blockIdx.y;
+    if (h >= num_q || qi >= seq_len) {
+        return;
+    }
+    if (seq_len == 0u) {
+        return;
+    }
+
+    const unsigned int causal_len = qi + 1u;
+    const unsigned int q_off = h * head_dim;
+    const unsigned int kv_h = h / reps;
+    const unsigned int kv_off = kv_h * head_dim;
+    // q is [seq, num_q*head_dim]; q_dim computed in 64-bit (host guards the
+    // 32-bit limit; this multiplication must not wrap).
+    const unsigned long long q_dim = (unsigned long long)num_q * (unsigned long long)head_dim;
+    const unsigned long long q_row = (unsigned long long)qi * q_dim + (unsigned long long)q_off;
+    const unsigned long long out_row = (unsigned long long)qi * q_dim + (unsigned long long)q_off;
+
+    // Dynamic shared layout: shm_sum[256] double | shm_max[256] float | scores[seq_len] float.
+    extern __shared__ unsigned char sbuf_raw[];
+    double* shm_sum = (double*)sbuf_raw;
+    float* shm_max = (float*)(sbuf_raw + 256u * 8u);
+    float* scores = (float*)(sbuf_raw + 256u * 8u + 256u * 4u);
+
+    // Phase 1: causal QK^T dot * scale (+ optional softcap) -> scores[i].
+    for (unsigned int i = tid; i < causal_len; i += PREFILL_ATTN_BLOCK) {
+        const unsigned long long k_base =
+            (unsigned long long)i * (unsigned long long)kv_dim
+            + (unsigned long long)kv_off;
+        float dot = 0.0f;
+        for (unsigned int d = 0u; d < head_dim; ++d) {
+            dot += k[k_base + (unsigned long long)d] * q[q_row + (unsigned long long)d];
+        }
+        float s = dot * scale;
+        if (has_softcap != 0u) {
+            s = tanhf(s / softcap) * softcap;
+        }
+        scores[i] = s;
+    }
+    __syncthreads();
+
+    // Phase 2: max reduction (f32) over this head's causal scores.
+    float local_max = -INFINITY;
+    for (unsigned int i = tid; i < causal_len; i += PREFILL_ATTN_BLOCK) {
+        const float s = scores[i];
+        if (s > local_max) {
+            local_max = s;
+        }
+    }
+    shm_max[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s2 = PREFILL_ATTN_BLOCK / 2u; s2 > 0u; s2 >>= 1u) {
+        if (tid < s2) {
+            const float other = shm_max[tid + s2];
+            if (other > shm_max[tid]) {
+                shm_max[tid] = other;
+            }
+        }
+        __syncthreads();
+    }
+    const float max_val = shm_max[0];
+    __syncthreads();
+
+    // Phase 3: exp((s - max) as f64) -> scores[], f64 sum reduction.
+    double local_sum = 0.0;
+    for (unsigned int i = tid; i < causal_len; i += PREFILL_ATTN_BLOCK) {
+        const float s = scores[i];
+        const double e = exp((double)(s - max_val));
+        scores[i] = (float)e;
+        local_sum += e;
+    }
+    shm_sum[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s2 = PREFILL_ATTN_BLOCK / 2u; s2 > 0u; s2 >>= 1u) {
+        if (tid < s2) {
+            shm_sum[tid] += shm_sum[tid + s2];
+        }
+        __syncthreads();
+    }
+    const double sum = shm_sum[0];
+    const float inv_sum = (sum > 0.0) ? (float)(1.0 / sum) : 0.0f;
+    __syncthreads();
+
+    // Phase 4: normalize scores *= inv_sum (matches the reference's
+    // normalize-then-dot rounding order).
+    for (unsigned int i = tid; i < causal_len; i += PREFILL_ATTN_BLOCK) {
+        scores[i] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Phase 5: weighted V (f32 accumulation) -> out[qi, q_off + d].
+    for (unsigned int d = tid; d < head_dim; d += PREFILL_ATTN_BLOCK) {
+        float acc = 0.0f;
+        for (unsigned int i = 0u; i < causal_len; ++i) {
+            const unsigned long long v_base =
+                (unsigned long long)i * (unsigned long long)kv_dim
+                + (unsigned long long)kv_off;
+            acc += scores[i] * v[v_base + (unsigned long long)d];
+        }
+        out[out_row + (unsigned long long)d] = acc;
     }
 }
 "#;

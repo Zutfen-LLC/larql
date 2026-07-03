@@ -424,7 +424,40 @@ impl CudaBackend {
         }
     }
 
-    /// Lock the KV-cache mutex, recovering from poisoning by taking the
+    /// Native fused prefill (seq×seq) causal GQA attention — the device twin
+    /// of `gqa_attention_with_weights` (the symmetric `gqa_attention_capture`
+    /// path). `q` is `[seq, num_q*head_dim]`; `k`/`v` are `[seq, kv_dim]`. On
+    /// success `out` is filled with `[seq, num_q*head_dim]` (row-major) and
+    /// `Ok(true)` is returned; `Ok(false)` when there's no runtime (caller
+    /// falls back to the host reference); `Err` on a launch failure or when
+    /// the shape exceeds the device shared-mem/index budget (caller falls
+    /// back to the host reference).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn native_prefill_attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut Vec<f32>,
+        scale: f32,
+        softcap: Option<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        seq_len: usize,
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_prefill_attention(
+                    q, k, v, out, scale, softcap, num_q, head_dim, kv_dim, reps, seq_len,
+                )?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// inner value (a poisoned mutex only means a prior holder panicked; the
     /// cache itself is still usable). This keeps the documented "fall back
     /// to the host store on failure" contract instead of aborting the

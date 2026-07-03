@@ -2516,4 +2516,177 @@ mod tests {
             "reps == 0 should error, not silently launch"
         );
     }
+
+    // ── Prefill attention (Session 18) ──────────────────────────────────
+
+    /// The pipeline's prefill-attention helper must match the host
+    /// `gqa_attention_with_weights` reference for short prompts (below the
+    /// 8192 work gate → host reference). Always runs. Exercises GQA
+    /// (`num_q > num_kv`, `reps > 1`), causal masking, and a multi-row Q/K/V.
+    #[test]
+    fn prefill_attention_native_matches_host_below_gate() {
+        let b = backend();
+        let head_dim = 16usize;
+        let num_kv = 2usize;
+        let num_q = 4usize; // reps = 2 (GQA)
+        let reps = num_q / num_kv;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let seq_len = 3usize; // work = 3*4*3*16 = 576 < 8192 gate → host reference
+
+        let q = Array2::from_shape_vec(
+            (seq_len, q_dim),
+            (0..seq_len * q_dim)
+                .map(|i| (i as f32 * 0.011).sin() * 0.4)
+                .collect(),
+        )
+        .unwrap();
+        let k = Array2::from_shape_vec(
+            (seq_len, kv_dim),
+            (0..seq_len * kv_dim)
+                .map(|i| (i as f32 * 0.013).cos() * 0.3)
+                .collect(),
+        )
+        .unwrap();
+        let v = Array2::from_shape_vec(
+            (seq_len, kv_dim),
+            (0..seq_len * kv_dim)
+                .map(|i| (i as f32 * 0.017).sin() * 0.25)
+                .collect(),
+        )
+        .unwrap();
+
+        let got = b.prefill_attention_native(
+            &q,
+            &k,
+            &v,
+            num_q,
+            head_dim,
+            kv_dim,
+            reps,
+            1.0_f64.sqrt(),
+            seq_len,
+            None,
+        );
+        let want = larql_compute::attention::gqa::gqa_attention_with_weights(
+            &q,
+            &k,
+            &v,
+            num_q,
+            head_dim,
+            reps,
+            1.0_f64.sqrt(),
+            seq_len,
+            false,
+            None,
+        )
+        .0;
+        assert_eq!(got.shape(), want.shape());
+        // Host reference path → bit-exact.
+        for (a, c) in got.iter().zip(want.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                c.to_bits(),
+                "prefill attention below-gate diverged"
+            );
+        }
+    }
+
+    /// Native prefill attention (reached through `prefill_attention_native`
+    /// above the 8192 work gate) must match the host reference when a CUDA
+    /// runtime is present. Runtime-gated: no-op on hosts without CUDA. The
+    /// causal QKᵀ/softmax/weighted-V f32 arithmetic mirrors the reference;
+    /// the only divergence is the device's `exp`/`tanhf` libm (parity gated,
+    /// ≤ 1e-4 relative). Exercises a softcap so the `tanhf` path is covered.
+    #[test]
+    fn native_prefill_attention_matches_host_when_runtime_is_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let head_dim = 32usize;
+        let num_kv = 4usize;
+        let num_q = 8usize; // reps = 2 (GQA)
+        let reps = num_q / num_kv;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let seq_len = 12usize; // work = 12*8*12*32 = 36864 > 8192 gate → native path
+
+        let q = Array2::from_shape_vec(
+            (seq_len, q_dim),
+            (0..seq_len * q_dim)
+                .map(|i| (i as f32 * 0.011).sin() * 0.4)
+                .collect(),
+        )
+        .unwrap();
+        let k = Array2::from_shape_vec(
+            (seq_len, kv_dim),
+            (0..seq_len * kv_dim)
+                .map(|i| (i as f32 * 0.013).cos() * 0.3)
+                .collect(),
+        )
+        .unwrap();
+        let v = Array2::from_shape_vec(
+            (seq_len, kv_dim),
+            (0..seq_len * kv_dim)
+                .map(|i| (i as f32 * 0.017).sin() * 0.25)
+                .collect(),
+        )
+        .unwrap();
+
+        let scale = (1.0_f64 / head_dim as f64).sqrt();
+        let softcap = Some(50.0f32);
+        let got = b.prefill_attention_native(
+            &q, &k, &v, num_q, head_dim, kv_dim, reps, scale, seq_len, softcap,
+        );
+        let want = larql_compute::attention::gqa::gqa_attention_with_weights(
+            &q, &k, &v, num_q, head_dim, reps, scale, seq_len, false, softcap,
+        )
+        .0;
+        assert_eq!(got.shape(), want.shape());
+        let denom = want
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-3);
+        let mut max_diff = 0.0f32;
+        for (a, c) in got.iter().zip(want.iter()) {
+            max_diff = max_diff.max((a - c).abs());
+        }
+        assert!(
+            max_diff <= 1e-4 * denom,
+            "prefill attention diverged from host reference by {max_diff} (> 1e-4 * {denom})"
+        );
+    }
+
+    /// The launcher must reject invalid shapes instead of silently launching a
+    /// truncated dispatch. Runtime-gated (needs a runtime to reach the guard).
+    /// Exercised via mismatched lengths and a degenerate `reps`.
+    #[test]
+    fn native_prefill_attention_rejects_invalid_shapes() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // q length disagrees with seq_len*num_q*head_dim.
+        let q = vec![0.0f32; 4];
+        let k = vec![0.0f32; 16];
+        let v = vec![0.0f32; 16];
+        let mut out = Vec::new();
+        let result = b.native_prefill_attention(&q, &k, &v, &mut out, 1.0, None, 2, 4, 4, 1, 4);
+        assert!(
+            result.is_err(),
+            "mismatched q/kv lengths should error, not silently launch"
+        );
+
+        // reps == 0 (degenerate) must error before launch.
+        let q_ok = vec![0.0f32; 32];
+        let kv_ok = vec![0.0f32; 16];
+        let result =
+            b.native_prefill_attention(&q_ok, &kv_ok, &kv_ok, &mut out, 1.0, None, 2, 4, 4, 0, 4);
+        assert!(
+            result.is_err(),
+            "reps == 0 should error, not silently launch"
+        );
+    }
 }
