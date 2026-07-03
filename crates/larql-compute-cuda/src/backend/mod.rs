@@ -209,6 +209,16 @@ impl CudaBackend {
         self.runtime.is_some()
     }
 
+    /// Snapshot the persistent weight-cache hit/miss counters. `None` on the
+    /// scaffold path (no runtime / no device); the counts are always zero
+    /// there since no weights are ever uploaded.
+    #[cfg(test)]
+    pub(crate) fn weight_cache_stats(&self) -> Option<crate::weight_cache::CacheStats> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.weight_cache_stats())
+    }
+
     /// Native RMSNorm (body norm) — the device twin of
     /// `larql_compute::residual::rms_norm_eps`. Computes `out` in place into
     /// the caller's buffer. Returns `Ok(true)` on a native launch, `Ok(false)`
@@ -574,11 +584,42 @@ impl CudaBackend {
 
     /// Reset every layer's `current_len` cursor to 0 (new prompt). The device
     /// buffers are not zeroed — subsequent appends overwrite slots in order.
+    /// Also flushes the persistent weight cache: `reset_kv_cache` is the
+    /// "start of a new prompt/generation" boundary for decode/prefill, so
+    /// dropping the cached weight buffers here bounds staleness to one
+    /// generation on that path (the cache is repopulated during the new
+    /// generation's prefill projections and reused across every decode token).
+    ///
+    /// This does **not** flush on the browse path (gate/lm-head KNN never
+    /// resets the KV cache) — see [`CudaBackend::flush_weight_cache`] for
+    /// cross-vindex reuse.
     pub(crate) fn reset_kv_cache_native(&self) {
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.flush_weight_cache();
+        }
         if let Ok(mut guard) = self.kv_cache.lock() {
             if let Some(cache) = guard.as_mut() {
                 cache.clear();
             }
+        }
+    }
+
+    /// Drop every cached device weight buffer immediately. The cache is
+    /// otherwise resident for the backend's lifetime and flushed
+    /// per-generation by [`reset_kv_cache_native`] on the decode/prefill path.
+    ///
+    /// Call this when a backend is **reused across vindex loads**: weight-cache
+    /// keying is pointer identity (`(ptr, len)`), and a recycled mmap address
+    /// could otherwise make a later vindex read an earlier model's cached
+    /// weights. The normal case (one backend per vindex, or decode/prefill
+    /// which resets per generation) needs no explicit call. The gap this closes
+    /// is the **browse** path — gate/lm-head KNN (`f16_gemv`/`f32_gemv` via
+    /// `larql-vindex` DESCRIBE/WALK/SELECT) never resets the KV cache, so a
+    /// backend handed a second vindex for browse must flush at the rebind
+    /// boundary.
+    pub fn flush_weight_cache(&self) {
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.flush_weight_cache();
         }
     }
 

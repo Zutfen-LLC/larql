@@ -19,6 +19,9 @@ use crate::ops::{
     RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC, RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
     ROPE_CUDA_SRC, ROPE_KERNEL,
 };
+#[cfg(test)]
+use crate::weight_cache::CacheStats;
+use crate::weight_cache::WeightCache;
 
 #[derive(Debug)]
 pub(crate) struct CudaRuntime {
@@ -48,6 +51,11 @@ pub(crate) struct CudaRuntime {
     rope: CudaFunction,
     decode_attention: CudaFunction,
     prefill_attention: CudaFunction,
+    /// Persistent device-resident weight cache (see `weight_cache.rs`).
+    /// Uploads each immutable weight matrix once and reuses the device buffer
+    /// across calls — the first slice of the per-projection htod round-trip
+    /// collapse. Activations stay on the fresh `clone_htod` path.
+    weight_cache: WeightCache,
     summary: String,
 }
 
@@ -177,6 +185,7 @@ impl CudaRuntime {
             rope,
             decode_attention,
             prefill_attention,
+            weight_cache: WeightCache::default(),
             summary: format!(
                 "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention loaded, remaining ops use CPU fallback"
             ),
@@ -192,6 +201,19 @@ impl CudaRuntime {
     /// so the cache outlives this borrow).
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Snapshot the weight-cache hit/miss counters (test diagnostic).
+    #[cfg(test)]
+    pub(crate) fn weight_cache_stats(&self) -> CacheStats {
+        self.weight_cache.stats()
+    }
+
+    /// Drop every cached device weight buffer. The backend calls this at each
+    /// generation boundary (`reset_kv_cache`) so a backend reused across
+    /// vindex loads can't serve a stale buffer mapped at a recycled address.
+    pub(crate) fn flush_weight_cache(&self) {
+        self.weight_cache.flush();
     }
 
     /// KV append: copy a contiguous block of `seq_len` freshly-projected
@@ -334,8 +356,8 @@ impl CudaRuntime {
         }
 
         let w_dev = self
-            .stream
-            .clone_htod(q4k_data)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q4k_data)
             .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))?;
         let x_dev = self
             .stream
@@ -354,7 +376,7 @@ impl CudaRuntime {
         };
         let mut launch_args = self.stream.launch_builder(&self.q4k_matvec);
         launch_args
-            .arg(&w_dev)
+            .arg(&*w_dev)
             .arg(&x_dev)
             .arg(&mut out_dev)
             .arg(&n)
@@ -404,8 +426,8 @@ impl CudaRuntime {
         }
 
         let w_dev = self
-            .stream
-            .clone_htod(q6k_data)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q6k_data)
             .map_err(|err| RuntimeError::context("uploading Q6_K weights to CUDA", err))?;
         let x_dev = self
             .stream
@@ -424,7 +446,7 @@ impl CudaRuntime {
         };
         let mut launch_args = self.stream.launch_builder(&self.q6k_matvec);
         launch_args
-            .arg(&w_dev)
+            .arg(&*w_dev)
             .arg(&x_dev)
             .arg(&mut out_dev)
             .arg(&n)
@@ -476,8 +498,8 @@ impl CudaRuntime {
         }
 
         let w_dev = self
-            .stream
-            .clone_htod(q4k_data)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q4k_data)
             .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))?;
         let x_dev = self
             .stream
@@ -501,7 +523,7 @@ impl CudaRuntime {
         let seq = seq_len as u32;
         let mut launch_args = self.stream.launch_builder(&self.q4k_matmul);
         launch_args
-            .arg(&w_dev)
+            .arg(&*w_dev)
             .arg(&x_dev)
             .arg(&mut out_dev)
             .arg(&n)
@@ -557,8 +579,8 @@ impl CudaRuntime {
         }
 
         let w_dev = self
-            .stream
-            .clone_htod(q6k_data)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q6k_data)
             .map_err(|err| RuntimeError::context("uploading Q6_K weights to CUDA", err))?;
         let x_dev = self
             .stream
@@ -582,7 +604,7 @@ impl CudaRuntime {
         let seq = seq_len as u32;
         let mut launch_args = self.stream.launch_builder(&self.q6k_matmul);
         launch_args
-            .arg(&w_dev)
+            .arg(&*w_dev)
             .arg(&x_dev)
             .arg(&mut out_dev)
             .arg(&n)
@@ -639,12 +661,12 @@ impl CudaRuntime {
         }
 
         let wa_dev = self
-            .stream
-            .clone_htod(q4k_a)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q4k_a)
             .map_err(|err| RuntimeError::context("uploading Q4_K w_a weights to CUDA", err))?;
         let wb_dev = self
-            .stream
-            .clone_htod(q4k_b)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q4k_b)
             .map_err(|err| RuntimeError::context("uploading Q4_K w_b weights to CUDA", err))?;
         let x_dev = self
             .stream
@@ -666,8 +688,8 @@ impl CudaRuntime {
         };
         let mut launch_args = self.stream.launch_builder(&self.q4k_dual_matvec);
         launch_args
-            .arg(&wa_dev)
-            .arg(&wb_dev)
+            .arg(&*wa_dev)
+            .arg(&*wb_dev)
             .arg(&x_dev)
             .arg(&mut out_a_dev)
             .arg(&mut out_b_dev)
@@ -727,8 +749,8 @@ impl CudaRuntime {
         }
 
         let w_dev = self
-            .stream
-            .clone_htod(w)
+            .weight_cache
+            .get_or_upload_f32(&self.stream, w)
             .map_err(|err| RuntimeError::context("uploading f32 weights to CUDA", err))?;
         let x_dev = self
             .stream
@@ -748,7 +770,7 @@ impl CudaRuntime {
         };
         let mut launch_args = self.stream.launch_builder(&self.f32_gemv);
         launch_args
-            .arg(&w_dev)
+            .arg(&*w_dev)
             .arg(&x_dev)
             .arg(&mut out_dev)
             .arg(&n)
@@ -802,8 +824,8 @@ impl CudaRuntime {
         }
 
         let w_dev = self
-            .stream
-            .clone_htod(w_f16)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, w_f16)
             .map_err(|err| RuntimeError::context("uploading f16 weights to CUDA", err))?;
         let x_dev = self
             .stream
@@ -823,7 +845,7 @@ impl CudaRuntime {
         };
         let mut launch_args = self.stream.launch_builder(&self.f16_gemv);
         launch_args
-            .arg(&w_dev)
+            .arg(&*w_dev)
             .arg(&x_dev)
             .arg(&mut out_dev)
             .arg(&n)
@@ -890,9 +912,12 @@ impl CudaRuntime {
             )));
         }
 
+        // `q4_data` is the immutable Q4_0 weight → cached. `q8_x` /
+        // `q8_scales` are the per-token Q8 quantization of the input →
+        // uploaded fresh every call (they change per token).
         let w_dev = self
-            .stream
-            .clone_htod(q4_data)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q4_data)
             .map_err(|err| RuntimeError::context("uploading Q4_0 weights to CUDA", err))?;
         let q8_dev = self
             .stream
@@ -916,7 +941,7 @@ impl CudaRuntime {
         };
         let mut launch_args = self.stream.launch_builder(&self.q4_matvec);
         launch_args
-            .arg(&w_dev)
+            .arg(&*w_dev)
             .arg(&q8_dev)
             .arg(&scales_dev)
             .arg(&mut out_dev)
@@ -979,9 +1004,10 @@ impl CudaRuntime {
             .stream
             .clone_htod(activation)
             .map_err(|err| RuntimeError::context("uploading activation to CUDA", err))?;
+        // `q4_data` is the immutable Q4_0 weight → cached.
         let w_dev = self
-            .stream
-            .clone_htod(q4_data)
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q4_data)
             .map_err(|err| RuntimeError::context("uploading Q4_0 weights to CUDA", err))?;
         let mut out_dev = self
             .stream
@@ -998,7 +1024,7 @@ impl CudaRuntime {
         let mut launch_args = self.stream.launch_builder(&self.q4_vecmat);
         launch_args
             .arg(&act_dev)
-            .arg(&w_dev)
+            .arg(&*w_dev)
             .arg(&mut out_dev)
             .arg(&n)
             .arg(&k);

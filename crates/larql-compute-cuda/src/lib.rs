@@ -19,6 +19,7 @@ pub mod ops;
 pub mod options;
 pub mod pipeline;
 pub mod trait_impl;
+pub mod weight_cache;
 
 pub use backend::{BackendInitError, CudaBackend};
 pub use kernels::{DispatchGeometry, KernelHandle};
@@ -2687,6 +2688,180 @@ mod tests {
         assert!(
             result.is_err(),
             "reps == 0 should error, not silently launch"
+        );
+    }
+
+    // ── Session 19: persistent weight cache ───────────────────────────────
+
+    /// Reusing the same weight slice across two native `q4k_matvec` launches
+    /// must produce bit-identical output (the cached device buffer holds the
+    /// exact bytes the first launch uploaded) AND register a cache hit on the
+    /// second call (no re-upload). Runtime-gated: no-ops on a no-CUDA host
+    /// (the scaffold path keeps `native_runtime_available == false`).
+    #[test]
+    fn weight_cache_reuses_bytes_across_launches() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let [(gate, _), _, _] = index.interleaved_kquant_layer_data(0).unwrap();
+        let x1 = vec![0.01f32; weights.hidden_size];
+        let x2 = vec![0.02f32; weights.hidden_size];
+        let rows = index.num_features(0);
+
+        // First launch: weight is a miss (uploaded + cached).
+        let first = backend
+            .native_q4k_matvec(gate, &x1, rows, weights.hidden_size)
+            .expect("native launch ok")
+            .expect("runtime exposes native path");
+        let stats_after_first = backend
+            .weight_cache_stats()
+            .expect("runtime present exposes stats");
+        assert!(
+            stats_after_first.bytes_misses >= 1,
+            "first launch should miss"
+        );
+        assert_eq!(stats_after_first.bytes_hits, 0, "no hits before reuse");
+
+        // Second launch with the SAME weight slice but a different activation:
+        // the weight is a hit, the output reflects the new activation (so it's
+        // not a stale cached result).
+        let second = backend
+            .native_q4k_matvec(gate, &x2, rows, weights.hidden_size)
+            .expect("native launch ok")
+            .expect("runtime exposes native path");
+        let stats_after_second = backend
+            .weight_cache_stats()
+            .expect("runtime present exposes stats");
+        assert!(
+            stats_after_second.bytes_hits >= 1,
+            "second launch with the same weight slice should hit the cache"
+        );
+
+        // Sanity: the two outputs differ (different activations), and each
+        // matches the CPU reference for its activation — proving the cached
+        // weight is correct, not stale.
+        let want_first = CpuBackend
+            .q4k_matvec(gate, &x1, rows, weights.hidden_size)
+            .unwrap();
+        let want_second = CpuBackend
+            .q4k_matvec(gate, &x2, rows, weights.hidden_size)
+            .unwrap();
+        assert_eq!(first, want_first);
+        assert_eq!(second, want_second);
+        assert_ne!(first, second, "different activations must differ");
+    }
+
+    /// `reset_kv_cache_native` (the generation boundary) flushes the weight
+    /// cache, so the next launch re-uploads (a fresh miss) — guarding against
+    /// a backend reused across models serving a stale buffer at a recycled
+    /// address. Runtime-gated.
+    #[test]
+    fn reset_kv_cache_flushes_weight_cache() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let [(gate, _), _, _] = index.interleaved_kquant_layer_data(0).unwrap();
+        let x = vec![0.01f32; weights.hidden_size];
+        let rows = index.num_features(0);
+
+        backend
+            .native_q4k_matvec(gate, &x, rows, weights.hidden_size)
+            .ok();
+        let before = backend.weight_cache_stats().expect("runtime present");
+        assert!(before.bytes_misses >= 1);
+
+        // A second launch with the same slice hits before the reset.
+        backend
+            .native_q4k_matvec(gate, &x, rows, weights.hidden_size)
+            .ok();
+        let mid = backend.weight_cache_stats().expect("runtime present");
+        assert!(mid.bytes_hits >= 1);
+
+        // Reset (new generation) flushes; the next launch is a miss again.
+        backend.reset_kv_cache_native();
+        // The stats counters are cumulative (not reset by flush — flush only
+        // clears the device buffers, not the diagnostic counters), so check
+        // that a fresh miss is recorded after the reset by snapshotting the
+        // delta.
+        let miss_before = backend
+            .weight_cache_stats()
+            .expect("runtime present")
+            .bytes_misses;
+        backend
+            .native_q4k_matvec(gate, &x, rows, weights.hidden_size)
+            .ok();
+        let miss_after = backend
+            .weight_cache_stats()
+            .expect("runtime present")
+            .bytes_misses;
+        assert!(
+            miss_after > miss_before,
+            "reset should flush the cache so the next launch re-uploads (miss)"
+        );
+    }
+
+    /// Twin of `weight_cache_reuses_bytes_across_launches` for the f32 cache
+    /// (`get_or_upload_f32`, used by `launch_f32_gemv`). Calls the direct
+    /// `native_f32_gemv` entry (bypassing the trait's flop-threshold gate so a
+    /// modest matrix exercises the path) twice with the same weight slice and
+    /// asserts a float miss then a float hit — also pinning the `float_misses`
+    /// counter that was otherwise write-only. Runtime-gated.
+    #[test]
+    fn weight_cache_reuses_floats_across_launches() {
+        let backend = backend();
+        if !backend.native_runtime_available() {
+            return;
+        }
+        let rows = 4usize;
+        let hidden = 256usize;
+        let w: Vec<f32> = (0..rows * hidden).map(|i| i as f32 * 0.001).collect();
+        let x = vec![0.5f32; hidden];
+
+        backend
+            .native_f32_gemv(&w, &x, rows, hidden)
+            .expect("native launch ok")
+            .expect("runtime exposes native path");
+        let after_first = backend.weight_cache_stats().expect("runtime present");
+        assert!(
+            after_first.float_misses >= 1,
+            "first f32 launch should miss"
+        );
+        assert_eq!(after_first.float_hits, 0, "no float hits before reuse");
+
+        backend
+            .native_f32_gemv(&w, &x, rows, hidden)
+            .expect("native launch ok")
+            .expect("runtime exposes native path");
+        let after_second = backend.weight_cache_stats().expect("runtime present");
+        assert!(
+            after_second.float_hits >= 1,
+            "second f32 launch with the same weight slice should hit"
+        );
+
+        // `pub fn flush_weight_cache` (the browse-path ABA escape hatch)
+        // drops the resident buffers; the next launch is a fresh miss.
+        backend.flush_weight_cache();
+        let miss_before = backend
+            .weight_cache_stats()
+            .expect("runtime present")
+            .float_misses;
+        backend
+            .native_f32_gemv(&w, &x, rows, hidden)
+            .expect("native launch ok")
+            .expect("runtime exposes native path");
+        let miss_after = backend
+            .weight_cache_stats()
+            .expect("runtime present")
+            .float_misses;
+        assert!(
+            miss_after > miss_before,
+            "explicit flush should drop the cache so the next launch re-uploads (miss)"
         );
     }
 }
