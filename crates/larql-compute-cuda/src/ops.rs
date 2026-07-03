@@ -136,6 +136,14 @@ pub const RESIDUAL_ADD_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const ROPE_KERNEL: KernelHandle = KernelHandle::new(
+    "rope",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [128, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -1122,5 +1130,98 @@ extern "C" __global__ void residual_add(
         return;
     }
     out[tid] = h[tid] + b_scale * x[tid];
+}
+"#;
+
+/// Rotary Position Embedding (RoPE) with split-half pairing — the device
+/// twin of `larql_compute::attention::rope::apply_rope_partial_at_full`.
+/// One thread per output element over the full `[seq_len, num_heads *
+/// head_dim]` Q/K tensor. For each element's `(row, head, channel)`:
+///
+/// - channels in `[0, half_rotary)` → first of the rotary pair:
+///   `out = x0*cos(theta) - x1*sin(theta)`
+/// - channels in `[half_rotary, 2*half_rotary)` → second of the pair:
+///   `out = x0*sin(theta) + x1*cos(theta)`
+/// - channels `>= 2*half_rotary` → pass-through (`out = x`)
+///
+/// where `x0 = x[offset + i]`, `x1 = x[offset + half_rotary + i]`,
+/// `i = channel` (first) or `channel - half_rotary` (second), and
+/// `theta = pos * inv_freq[i]` with `pos = (row + position_offset) /
+/// position_divisor`. `2*half_rotary` (not `rotary_dim`) bounds the rotary
+/// region so an odd `rotary_dim` leaves its trailing channel as
+/// pass-through, exactly mirroring the host loop (which iterates
+/// `i in 0..half_rotary` and writes two channels per `i`).
+///
+/// The `inv_freq[half_rotary]` array is precomputed on the host with the
+/// exact formula the reference uses (`1 / base^(2i/rotary_dim)`, optionally
+/// wavelength-band-rescaled by HF's `llama3` variant) and uploaded as
+/// `double`, so the per-element `theta`/`cos`/`sin` are computed in f64 and
+/// only the final cos/sin are narrowed to f32 — matching the reference's
+/// `theta.cos() as f32`. With `fmad` disabled at NVRTC compile time the
+/// f32 rotation arithmetic is identical to the host path.
+pub const ROPE_CUDA_SRC: &str = r#"
+extern "C" __global__ void rope(
+    const float* x,
+    const double* inv_freq,
+    float* out,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int half_rotary,
+    double position_offset,
+    double position_divisor,
+    unsigned long long n)
+{
+    const unsigned long long tid = (unsigned long long)blockIdx.x
+        * (unsigned long long)blockDim.x
+        + (unsigned long long)threadIdx.x;
+    if (tid >= n) {
+        return;
+    }
+    // 64-bit row/head/channel decomposition so a large vocab-head tensor
+    // (`num_heads * head_dim * seq_len > 2^32`) can't wrap the flat index
+    // (the host launcher additionally guards `n <= u32::MAX` for the grid).
+    const unsigned long long row_stride =
+        (unsigned long long)num_heads * (unsigned long long)head_dim;
+    if (row_stride == 0ULL) {
+        return;
+    }
+    const unsigned long long row = tid / row_stride;
+    if (row >= (unsigned long long)seq_len) {
+        return;
+    }
+    const unsigned long long rem = tid - row * row_stride;
+    const unsigned long long head = rem / (unsigned long long)head_dim;
+    const unsigned long long channel = rem - head * (unsigned long long)head_dim;
+    const unsigned long long base =
+        row * row_stride + head * (unsigned long long)head_dim;
+
+    // Channels beyond the rotary region pass through unchanged.
+    if (channel >= (unsigned long long)2u * (unsigned long long)half_rotary) {
+        out[base + channel] = x[base + channel];
+        return;
+    }
+
+    // `pos` in f64 for parity with the host reference; `position_divisor`
+    // is guarded `> 0.0` on the host before launch.
+    const double pos = ((double)row + position_offset) / position_divisor;
+
+    unsigned int i;
+    if (channel < (unsigned long long)half_rotary) {
+        i = (unsigned int)channel;
+    } else {
+        i = (unsigned int)(channel - (unsigned long long)half_rotary);
+    }
+    const double theta = pos * inv_freq[i];
+    const float cos_t = (float)cos(theta);
+    const float sin_t = (float)sin(theta);
+
+    const float x0 = x[base + i];
+    const float x1 = x[base + (unsigned long long)half_rotary + i];
+    if (channel < (unsigned long long)half_rotary) {
+        out[base + i] = x0 * cos_t - x1 * sin_t;
+    } else {
+        out[base + (unsigned long long)half_rotary + i] = x0 * sin_t + x1 * cos_t;
+    }
 }
 "#;

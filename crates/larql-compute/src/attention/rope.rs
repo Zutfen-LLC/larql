@@ -112,6 +112,36 @@ pub fn apply_rope_partial_at_scaled(
     )
 }
 
+/// Build the RoPE rotary geometry and the per-pair `inv_freq` table from
+/// `(rope_base, head_dim, fraction, llama3_scaling)`. Returns
+/// `(rotary_dim, half_rotary, inv_freq)` where `inv_freq` is `half_rotary`
+/// entries long. This is the single source of truth for the frequency
+/// construction — both the host reference ([`apply_rope_partial_at_full`])
+/// and device RoPE paths (e.g. the CUDA `rope` kernel) call this so the
+/// uploaded frequencies stay bit-identical to the reference and can't drift.
+///
+/// - `rotary_dim = max(2, floor(head_dim * fraction))`
+/// - `half_rotary = rotary_dim / 2`
+/// - `inv_freq[i] = 1 / rope_base^(2i/rotary_dim)`, optionally wavelength-band
+///   rescaled by HF's `llama3` variant via [`apply_llama3_inv_freq`].
+pub fn build_rope_inv_freq(
+    rope_base: f64,
+    head_dim: usize,
+    fraction: f64,
+    llama3_scaling: Option<Llama3RopeScaling>,
+) -> (usize, usize, Vec<f64>) {
+    let rotary_dim = ((head_dim as f64 * fraction) as usize).max(2);
+    let half_rotary = rotary_dim / 2;
+    let base_inv_freq: Vec<f64> = (0..half_rotary)
+        .map(|i| 1.0 / rope_base.powf(2.0 * i as f64 / rotary_dim as f64))
+        .collect();
+    let inv_freq = match llama3_scaling {
+        Some(scaling) => apply_llama3_inv_freq(&scaling, &base_inv_freq),
+        None => base_inv_freq,
+    };
+    (rotary_dim, half_rotary, inv_freq)
+}
+
 /// Most general RoPE entry point. Adds optional `llama3_scaling`: when
 /// present, replaces the standard `1 / base^(2i/rotary_dim)` frequencies
 /// with HF's `llama3` wavelength-dependent variant. `position_divisor` and
@@ -131,15 +161,8 @@ pub fn apply_rope_partial_at_full(
     let seq_len = x.shape()[0];
     let mut out = x.clone();
 
-    let rotary_dim = ((head_dim as f64 * fraction) as usize).max(2);
-    let half_rotary = rotary_dim / 2;
-    let base_inv_freq: Vec<f64> = (0..half_rotary)
-        .map(|i| 1.0 / rope_base.powf(2.0 * i as f64 / rotary_dim as f64))
-        .collect();
-    let inv_freq: Vec<f64> = match llama3_scaling {
-        Some(scaling) => apply_llama3_inv_freq(&scaling, &base_inv_freq),
-        None => base_inv_freq,
-    };
+    let (_rotary_dim, half_rotary, inv_freq) =
+        build_rope_inv_freq(rope_base, head_dim, fraction, llama3_scaling);
     let divisor = if position_divisor > 0.0 {
         position_divisor
     } else {
@@ -439,5 +462,61 @@ mod tests {
             differ,
             "llama3 scaling must change RoPE output for non-zero positions"
         );
+    }
+
+    // ── build_rope_inv_freq (shared device/host frequency construction) ────
+    //
+    // `build_rope_inv_freq` is the single source of truth for the frequency
+    // table used by both the host reference and the device RoPE kernels. These
+    // tests pin the geometry + frequency values so a refactor that changes the
+    // construction gets caught here, before the device path silently drifts.
+
+    #[test]
+    fn build_rope_inv_freq_geometry_full_fraction() {
+        // fraction = 1.0 → rotary_dim = head_dim, half = head_dim/2.
+        let (rotary_dim, half, inv_freq) = build_rope_inv_freq(10_000.0, 32, 1.0, None);
+        assert_eq!(rotary_dim, 32);
+        assert_eq!(half, 16);
+        assert_eq!(inv_freq.len(), 16);
+        // inv_freq[i] = 1 / base^(2i/rotary_dim).
+        for (i, &v) in inv_freq.iter().enumerate() {
+            let want = 1.0 / 10_000.0_f64.powf(2.0 * i as f64 / 32.0);
+            assert!((v - want).abs() < 1e-15, "inv_freq[{i}] mismatch");
+        }
+    }
+
+    #[test]
+    fn build_rope_inv_freq_partial_fraction_floors_rotary_dim() {
+        // fraction = 0.5, head_dim = 32 → rotary_dim = 16, half = 8.
+        let (rotary_dim, half, inv_freq) = build_rope_inv_freq(10_000.0, 32, 0.5, None);
+        assert_eq!(rotary_dim, 16);
+        assert_eq!(half, 8);
+        assert_eq!(inv_freq.len(), 8);
+        // Frequencies use rotary_dim (16), not head_dim (32), in the exponent.
+        for (i, &v) in inv_freq.iter().enumerate() {
+            let want = 1.0 / 10_000.0_f64.powf(2.0 * i as f64 / 16.0);
+            assert!((v - want).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn build_rope_inv_freq_floors_rotary_dim_at_two() {
+        // A near-zero fraction still yields rotary_dim >= 2 (half >= 1) so the
+        // rotary pair is well-formed.
+        let (rotary_dim, half, inv_freq) = build_rope_inv_freq(10_000.0, 32, 0.0, None);
+        assert_eq!(rotary_dim, 2);
+        assert_eq!(half, 1);
+        assert_eq!(inv_freq.len(), 1);
+    }
+
+    #[test]
+    fn build_rope_inv_freq_llama3_matches_apply_llama3_inv_freq() {
+        // The llama3 arm must compose base construction with the shared
+        // `apply_llama3_inv_freq` — pinned explicitly so the device path
+        // (which calls build_rope_inv_freq) can't drift from the reference.
+        let (_, _, base) = build_rope_inv_freq(10_000.0, 32, 1.0, None);
+        let (_, _, scaled) = build_rope_inv_freq(10_000.0, 32, 1.0, Some(llama3_default()));
+        let direct = apply_llama3_inv_freq(&llama3_default(), &base);
+        assert_eq!(scaled, direct);
     }
 }

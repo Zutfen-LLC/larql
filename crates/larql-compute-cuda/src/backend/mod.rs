@@ -353,6 +353,44 @@ impl CudaBackend {
         }
     }
 
+    /// Native RoPE — the device twin of
+    /// `larql_compute::attention::rope::apply_rope_partial_at_full`. `inv_freq`
+    /// is the caller-precomputed `half_rotary`-length frequency array (built
+    /// identically to the reference, including the `llama3` variant). Returns
+    /// `Ok(true)` on a native launch, `Ok(false)` when there's no runtime
+    /// (caller falls back to the host reference), or `Err` on a launch failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn native_rope(
+        &self,
+        x: &[f32],
+        inv_freq: &[f64],
+        out: &mut [f32],
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        half_rotary: usize,
+        position_offset: usize,
+        position_divisor: f64,
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_rope(
+                    x,
+                    inv_freq,
+                    out,
+                    seq_len,
+                    num_heads,
+                    head_dim,
+                    half_rotary,
+                    position_offset,
+                    position_divisor,
+                )?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Lock the KV-cache mutex, recovering from poisoning by taking the
     /// inner value (a poisoned mutex only means a prior holder panicked; the
     /// cache itself is still usable). This keeps the documented "fall back

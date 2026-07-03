@@ -32,6 +32,7 @@
 //! fully-fused pipeline. Folding the elementwise ops into device kernels +
 //! collapsing the round-trips is the follow-on work.
 
+use larql_compute::attention::build_rope_inv_freq;
 use larql_compute::attention::decode::gqa_attention_decode_step;
 use larql_compute::attention::rope::apply_rope_partial_at_full;
 use larql_compute::cpu::ops::moe::cpu_moe_forward;
@@ -318,7 +319,7 @@ impl CudaBackend {
         let frac = rope_fraction(layer);
         let pos_div = layer.rope_position_divisor as f64;
         let llama3 = layer.rope_llama3_scaling;
-        let q_r = apply_rope_partial_at_full(
+        let q_r = self.rope_native(
             &q,
             num_q,
             head_dim,
@@ -328,7 +329,7 @@ impl CudaBackend {
             pos_div,
             llama3,
         );
-        let k_r = apply_rope_partial_at_full(
+        let k_r = self.rope_native(
             &k,
             num_kv,
             head_dim,
@@ -336,7 +337,7 @@ impl CudaBackend {
             frac,
             0,
             pos_div,
-            llama3,
+            layer.rope_llama3_scaling,
         );
 
         // Causal GQA attention over the full seq (with optional logit
@@ -577,7 +578,7 @@ impl CudaBackend {
         let frac = rope_fraction(layer);
         let pos_div = layer.rope_position_divisor as f64;
         let llama3 = layer.rope_llama3_scaling;
-        let q_rope = apply_rope_partial_at_full(
+        let q_rope = self.rope_native(
             &q_normed,
             num_q,
             head_dim,
@@ -587,7 +588,7 @@ impl CudaBackend {
             pos_div,
             llama3,
         );
-        let k_rope = apply_rope_partial_at_full(
+        let k_rope = self.rope_native(
             &k_normed,
             num_kv,
             head_dim,
@@ -595,7 +596,7 @@ impl CudaBackend {
             frac,
             abs_position,
             pos_div,
-            llama3,
+            layer.rope_llama3_scaling,
         );
 
         let k_new_row: Vec<f32> = k_rope.row(0).to_vec();
@@ -905,6 +906,96 @@ impl CudaBackend {
     /// per-call device round-trip.
     fn native_residual_worthwhile(elems: usize) -> bool {
         elems >= Self::RESIDUAL_NATIVE_MIN_ELEMS
+    }
+
+    /// Minimum element count for a native RoPE dispatch to be worth the
+    /// host→device upload + kernel launch + sync + device→host readback
+    /// round-trip. Below this, the host `apply_rope_partial_at_full`
+    /// reference is faster (the RoPE output is read straight back to host and
+    /// re-uploaded by the attention dispatch, so there's no fusion benefit —
+    /// only transfer+sync overhead). Mirrors `NORM_NATIVE_MIN_ELEMS` /
+    /// `ACTIVATION_NATIVE_MIN_ELEMS` / `RESIDUAL_NATIVE_MIN_ELEMS`. Tuned
+    /// conservatively for correctness-first (the host-orchestrated path is
+    /// the parity oracle); the fully-fused single-command-buffer pipeline
+    /// lifts this gate. The decode Q/K tensor (`[1, q_dim]`, typically a few
+    /// thousand elements) often stays below this gate and keeps the host path;
+    /// the prefill Q/K tensor (`[seq, q_dim]`) clears it once
+    /// `seq * q_dim >= 8192`.
+    const ROPE_NATIVE_MIN_ELEMS: usize = 8192;
+
+    /// True when a RoPE over `elems` elements is large enough that the native
+    /// CUDA kernel is likely to beat the host reference after the per-call
+    /// device round-trip.
+    fn native_rope_worthwhile(elems: usize) -> bool {
+        elems >= Self::ROPE_NATIVE_MIN_ELEMS
+    }
+
+    /// RoPE with split-half pairing — the device twin of
+    /// `larql_compute::attention::rope::apply_rope_partial_at_full`. Routes
+    /// through the native CUDA `rope` kernel when a runtime is present AND
+    /// the tensor is large enough to amortise the device round-trip (see
+    /// `ROPE_NATIVE_MIN_ELEMS`); falls back to the host reference on
+    /// `Ok(false)`/`Err`, non-contiguous views, or small inputs.
+    ///
+    /// The `inv_freq[half_rotary]` frequency array is built via the shared
+    /// substrate [`build_rope_inv_freq`] — the single source of truth also
+    /// used by the host reference — so the device computes `theta`/`cos`/
+    /// `sin` identically and the f32 rotation arithmetic matches the host
+    /// path with `fmad` disabled at NVRTC compile time (the two paths can't
+    /// drift on the frequency construction).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rope_native(
+        &self,
+        x: &Array2<f32>,
+        num_heads: usize,
+        head_dim: usize,
+        rope_base: f64,
+        fraction: f64,
+        position_offset: usize,
+        position_divisor: f64,
+        llama3_scaling: Option<larql_models::Llama3RopeScaling>,
+    ) -> Array2<f32> {
+        let (rows, cols) = (x.shape()[0], x.shape()[1]);
+        let n = rows * cols;
+        let x_flat = x.as_slice().unwrap_or(&[]);
+        if !x_flat.is_empty() && Self::native_rope_worthwhile(n) {
+            // Use the shared `build_rope_inv_freq` so the uploaded
+            // `inv_freq`/`half_rotary` are bit-identical to the reference's
+            // (including the `llama3` wavelength-band variant). `rotary_dim`
+            // is floored at 2 so `half_rotary >= 1`.
+            let (_rotary_dim, half_rotary, inv_freq) =
+                build_rope_inv_freq(rope_base, head_dim, fraction, llama3_scaling);
+            let divisor = if position_divisor > 0.0 {
+                position_divisor
+            } else {
+                1.0
+            };
+            let mut out = vec![0.0f32; n];
+            if let Ok(true) = self.native_rope(
+                x_flat,
+                &inv_freq,
+                &mut out,
+                rows,
+                num_heads,
+                head_dim,
+                half_rotary,
+                position_offset,
+                divisor,
+            ) {
+                return Array2::from_shape_vec((rows, cols), out)
+                    .expect("native rope output shape");
+            }
+        }
+        apply_rope_partial_at_full(
+            x,
+            num_heads,
+            head_dim,
+            rope_base,
+            fraction,
+            position_offset,
+            position_divisor,
+            llama3_scaling,
+        )
     }
 
     /// Gated activation (`out[i] = act(gate[i]) * up[i]`) routed through the

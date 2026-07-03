@@ -2191,4 +2191,170 @@ mod tests {
             "mismatched h/x lengths should error, not silently launch"
         );
     }
+
+    // ── RoPE (Session 16) ────────────────────────────────────────────────
+
+    /// The pipeline's RoPE helper must match the host
+    /// `apply_rope_partial_at_full` reference for small inputs (below the
+    /// 8192 gate → host reference). Exercises a partial-rotation fraction
+    /// (so both the rotary region and the pass-through tail are covered) and
+    /// a non-zero position offset. Always runs.
+    #[test]
+    fn rope_native_matches_host_reference_below_gate() {
+        let b = backend();
+        let seq = 2usize;
+        let heads = 2usize;
+        let head_dim = 64usize; // seq*heads*dim = 256 < 8192 gate → host reference
+        let n = seq * heads * head_dim;
+        let x_flat: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017).sin() * 0.5).collect();
+        let x = Array2::from_shape_vec((seq, heads * head_dim), x_flat).unwrap();
+        let fraction = 0.5; // rotary_dim = 32 → tail [32,64) passes through
+        let rope_base = 10_000.0_f64;
+        let position_offset = 3usize;
+        let position_divisor = 1.0_f64;
+
+        let got = b.rope_native(
+            &x,
+            heads,
+            head_dim,
+            rope_base,
+            fraction,
+            position_offset,
+            position_divisor,
+            None,
+        );
+        let want = larql_compute::attention::apply_rope_partial_at_full(
+            &x,
+            heads,
+            head_dim,
+            rope_base,
+            fraction,
+            position_offset,
+            position_divisor,
+            None,
+        );
+        assert_eq!(got, want);
+    }
+
+    /// Native RoPE (via `native_rope`, reached through `rope_native` above the
+    /// 8192 gate) must match the host reference when a CUDA runtime is
+    /// present. Runtime-gated: no-op on hosts without CUDA. The pass-through
+    /// tail is bit-identical; the rotary channels can differ by ≤ a few ULP
+    /// because the device's double-precision `cos`/`sin` are a different
+    /// libm than the host's (both compute `theta`/`cos`/`sin` in f64 and
+    /// narrow to f32, so the f32 rotation arithmetic is otherwise identical).
+    #[test]
+    fn native_rope_matches_host_when_runtime_is_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let seq = 8usize;
+        let heads = 8usize;
+        let head_dim = 256usize; // seq*heads*dim = 16384 > 8192 gate → native path
+        let n = seq * heads * head_dim;
+        let x_flat: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011).sin() * 0.4).collect();
+        let x = Array2::from_shape_vec((seq, heads * head_dim), x_flat).unwrap();
+        let fraction = 0.5; // rotary_dim = 128 → tail [128,256) passes through
+        let rope_base = 10_000.0_f64;
+        let position_offset = 7usize;
+        let position_divisor = 1.0_f64;
+
+        let got = b.rope_native(
+            &x,
+            heads,
+            head_dim,
+            rope_base,
+            fraction,
+            position_offset,
+            position_divisor,
+            None,
+        );
+        let want = larql_compute::attention::apply_rope_partial_at_full(
+            &x,
+            heads,
+            head_dim,
+            rope_base,
+            fraction,
+            position_offset,
+            position_divisor,
+            None,
+        );
+
+        let rotary_dim = ((head_dim as f64 * fraction) as usize).max(2);
+        // 2*half_rotary bounds the rotary region; the tail is pass-through.
+        let rotary_region = 2 * (rotary_dim / 2);
+        let mut max_rotary_diff = 0.0f32;
+        let mut max_passthrough_diff = 0.0f32;
+        let got_slice = got.as_slice().expect("rope output contiguous");
+        let want_slice = want.as_slice().expect("rope reference contiguous");
+        for row in 0..seq {
+            for head in 0..heads {
+                let off = (row * heads + head) * head_dim;
+                for ch in 0..head_dim {
+                    let g = got_slice[off + ch];
+                    let w = want_slice[off + ch];
+                    let d = (g - w).abs();
+                    if ch < rotary_region {
+                        max_rotary_diff = max_rotary_diff.max(d);
+                    } else {
+                        max_passthrough_diff = max_passthrough_diff.max(d);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            max_passthrough_diff, 0.0,
+            "RoPE pass-through tail diverged from host reference"
+        );
+        assert!(
+            max_rotary_diff <= 1e-5,
+            "RoPE rotary channels diverged from host reference by {max_rotary_diff} (> 1e-5)"
+        );
+    }
+
+    /// The launcher must reject a shape whose total element count exceeds the
+    /// 32-bit kernel index limit, and reject a mismatched `inv_freq` length,
+    /// instead of silently launching a truncated dispatch. Runtime-gated (needs
+    /// a runtime to reach the guard). Exercised via mismatched lengths.
+    #[test]
+    fn native_rope_rejects_invalid_shapes() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let seq = 2usize;
+        let heads = 2usize;
+        let head_dim = 8usize;
+        let n = seq * heads * head_dim;
+        let x = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+
+        // Mismatched inv_freq length (half_rotary=4 but 3 frequencies).
+        let inv_freq = vec![0.1f64; 3];
+        let result = b.native_rope(&x, &inv_freq, &mut out, seq, heads, head_dim, 4, 0, 1.0);
+        assert!(
+            result.is_err(),
+            "mismatched inv_freq length should error, not silently launch"
+        );
+
+        // x/out length mismatch vs the declared shape.
+        let short = vec![0.0f32; 4];
+        let inv_freq_ok = vec![0.1f64; 4];
+        let result = b.native_rope(
+            &short,
+            &inv_freq_ok,
+            &mut out,
+            seq,
+            heads,
+            head_dim,
+            4,
+            0,
+            1.0,
+        );
+        assert!(
+            result.is_err(),
+            "mismatched x length should error, not silently launch"
+        );
+    }
 }

@@ -15,7 +15,7 @@ use crate::ops::{
     Q4_MATVEC_CUDA_SRC, Q4_MATVEC_KERNEL, Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL,
     Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL, Q6K_MATVEC_CUDA_SRC, Q6K_MATVEC_KERNEL,
     RESIDUAL_ADD_CUDA_SRC, RESIDUAL_ADD_KERNEL, RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC,
-    RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
+    RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL, ROPE_CUDA_SRC, ROPE_KERNEL,
 };
 
 #[derive(Debug)]
@@ -43,6 +43,7 @@ pub(crate) struct CudaRuntime {
     activation_silu: CudaFunction,
     activation_gelu_tanh: CudaFunction,
     residual_add: CudaFunction,
+    rope: CudaFunction,
     summary: String,
 }
 
@@ -71,7 +72,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}\n{RESIDUAL_ADD_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}\n{RESIDUAL_ADD_CUDA_SRC}\n{ROPE_CUDA_SRC}"
         );
         let ptx = compile_ptx_with_opts(
             &combined_src,
@@ -137,6 +138,9 @@ impl CudaRuntime {
         let residual_add = module
             .load_function(RESIDUAL_ADD_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading residual_add CUDA function", err))?;
+        let rope = module
+            .load_function(ROPE_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading rope CUDA function", err))?;
         let stream = context.default_stream();
 
         Ok(Self {
@@ -160,8 +164,9 @@ impl CudaRuntime {
             activation_silu,
             activation_gelu_tanh,
             residual_add,
+            rope,
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope loaded, remaining ops use CPU fallback"
             ),
         })
     }
@@ -1287,6 +1292,121 @@ impl CudaRuntime {
             n,
             "residual_add",
         )
+    }
+
+    /// Native RoPE launch over a `[seq_len, num_heads * head_dim]` Q/K tensor.
+    /// `inv_freq` is `half_rotary = rotary_dim/2` precomputed `f64`
+    /// frequencies (the host builds them identically to the reference, so the
+    /// `llama3` wavelength-band variant is handled before upload). `n =
+    /// seq_len * num_heads * head_dim` is the element count; the kernel is one
+    /// thread per element.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_rope(
+        &self,
+        x: &[f32],
+        inv_freq: &[f64],
+        out: &mut [f32],
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        half_rotary: usize,
+        position_offset: usize,
+        position_divisor: f64,
+    ) -> Result<(), RuntimeError> {
+        let total = seq_len
+            .checked_mul(num_heads)
+            .and_then(|p| p.checked_mul(head_dim));
+        let total = match total {
+            Some(t) if x.len() == t && out.len() == t => t,
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "rope expected x/out of length {} (seq={seq_len} heads={num_heads} dim={head_dim}), got {} / {}",
+                    seq_len * num_heads * head_dim,
+                    x.len(),
+                    out.len()
+                )))
+            }
+        };
+        if total == 0 {
+            return Ok(());
+        }
+        if inv_freq.len() != half_rotary {
+            return Err(RuntimeError::usage(format!(
+                "rope expected inv_freq of length {half_rotary}, got {}",
+                inv_freq.len()
+            )));
+        }
+        if half_rotary == 0 {
+            return Err(RuntimeError::usage(
+                "rope requires half_rotary >= 1 (rotary_dim >= 2)".to_string(),
+            ));
+        }
+        // Guard the grid + flat-index against the 32-bit limit. The kernel
+        // indexes in 64-bit, but the element count drives a 1D grid whose
+        // width must fit a `u32` (matching the other elementwise launchers).
+        if total > u32::MAX as usize
+            || seq_len > u32::MAX as usize
+            || num_heads > u32::MAX as usize
+            || head_dim > u32::MAX as usize
+        {
+            return Err(RuntimeError::usage(format!(
+                "rope shape (seq={seq_len}, heads={num_heads}, dim={head_dim}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        let divisor = if position_divisor > 0.0 {
+            position_divisor
+        } else {
+            1.0
+        };
+
+        let x_dev = self
+            .stream
+            .clone_htod(x)
+            .map_err(|err| RuntimeError::context("uploading rope input to CUDA", err))?;
+        let inv_freq_dev = self
+            .stream
+            .clone_htod(inv_freq)
+            .map_err(|err| RuntimeError::context("uploading rope inv_freq to CUDA", err))?;
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(total)
+            .map_err(|err| RuntimeError::context("allocating CUDA rope output buffer", err))?;
+        let threads_x = ROPE_KERNEL.geometry.threads_per_group[0];
+        let total_u = total as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total_u.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_u = seq_len as u32;
+        let heads_u = num_heads as u32;
+        let dim_u = head_dim as u32;
+        let half_u = half_rotary as u32;
+        let pos_off = position_offset as f64;
+        let n_u64 = total as u64;
+        let mut launch_args = self.stream.launch_builder(&self.rope);
+        launch_args
+            .arg(&x_dev)
+            .arg(&inv_freq_dev)
+            .arg(&mut out_dev)
+            .arg(&seq_u)
+            .arg(&heads_u)
+            .arg(&dim_u)
+            .arg(&half_u)
+            .arg(&pos_off)
+            .arg(&divisor)
+            .arg(&n_u64);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA rope kernel", err))?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing CUDA rope stream", err))?;
+        let host_out = self
+            .stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading CUDA rope output", err))?;
+        out.copy_from_slice(&host_out);
+        Ok(())
     }
 
     /// Shared binary elementwise dispatch (in_a, in_b → out). The GEGLU
