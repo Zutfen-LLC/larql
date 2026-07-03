@@ -624,12 +624,13 @@ impl CudaBackend {
             }
         };
 
-        let attn_out = gqa_attention_decode_step(
+        let attn_out = self.decode_attention_native(
             &q_rope,
             &k_concat,
             &v_concat,
             num_q,
             head_dim,
+            kv_dim,
             reps,
             scale,
             softcap_opt,
@@ -930,6 +931,24 @@ impl CudaBackend {
         elems >= Self::ROPE_NATIVE_MIN_ELEMS
     }
 
+    /// Minimum attention work (num_q × total_len × head_dim) for a native
+    /// decode-attention dispatch to be worth the host→device upload + kernel
+    /// launch + sync + device→host readback round-trip. Below this the host
+    /// `gqa_attention_decode_step` reference (rayon/spin-pool parallel over
+    /// heads) is faster — there's no fusion benefit, only transfer+sync
+    /// overhead, when the context is short. Mirrors the other
+    /// `*_NATIVE_MIN_ELEMS` gates; tuned conservatively for correctness-first
+    /// (the host-orchestrated path is the parity oracle); the fully-fused
+    /// single-command-buffer pipeline lifts this gate.
+    const DECODE_ATTN_NATIVE_MIN_WORK: usize = 8192;
+
+    /// True when a decode-attention over `work = num_q × total_len × head_dim`
+    /// is large enough that the native CUDA kernel is likely to beat the host
+    /// reference after the per-call device round-trip.
+    fn native_decode_attention_worthwhile(work: usize) -> bool {
+        work >= Self::DECODE_ATTN_NATIVE_MIN_WORK
+    }
+
     /// RoPE with split-half pairing — the device twin of
     /// `larql_compute::attention::rope::apply_rope_partial_at_full`. Routes
     /// through the native CUDA `rope` kernel when a runtime is present AND
@@ -996,6 +1015,63 @@ impl CudaBackend {
             position_divisor,
             llama3_scaling,
         )
+    }
+
+    /// Fused decode-step GQA attention — the device twin of
+    /// `gqa_attention_decode_step`. Routes through the native CUDA
+    /// `decode_attention` kernel when a runtime is present AND the attention
+    /// work (`num_q × total_len × head_dim`) is large enough to amortise the
+    /// device round-trip (see `DECODE_ATTN_NATIVE_MIN_WORK`); falls back to the
+    /// host reference on `Ok(false)`/`Err`, non-contiguous Q/K/V views, or
+    /// short contexts. `q` is `[1, num_q * head_dim]`; `k_cache`/`v_cache` are
+    /// `[total_len, kv_dim]`. Returns `[1, num_q * head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_attention_native(
+        &self,
+        q: &Array2<f32>,
+        k_cache: &Array2<f32>,
+        v_cache: &Array2<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        scale: f64,
+        softcap: Option<f32>,
+    ) -> Array2<f32> {
+        let total_len = k_cache.shape()[0];
+        let work = num_q.saturating_mul(total_len).saturating_mul(head_dim);
+        let q_dim = num_q * head_dim;
+        if total_len >= 1
+            && Self::native_decode_attention_worthwhile(work)
+            && q.shape() == [1, q_dim]
+            && k_cache.shape() == [total_len, kv_dim]
+            && v_cache.shape() == [total_len, kv_dim]
+        {
+            if let (Some(qs), Some(ks), Some(vs)) =
+                (q.as_slice(), k_cache.as_slice(), v_cache.as_slice())
+            {
+                let mut out = Vec::with_capacity(q_dim);
+                if let Ok(true) = self.native_decode_attention(
+                    qs,
+                    ks,
+                    vs,
+                    &mut out,
+                    scale as f32,
+                    softcap,
+                    num_q,
+                    head_dim,
+                    kv_dim,
+                    reps,
+                    total_len,
+                ) {
+                    if out.len() == q_dim {
+                        return Array2::from_shape_vec((1, q_dim), out)
+                            .expect("native decode_attention output shape");
+                    }
+                }
+            }
+        }
+        gqa_attention_decode_step(q, k_cache, v_cache, num_q, head_dim, reps, scale, softcap)
     }
 
     /// Gated activation (`out[i] = act(gate[i]) * up[i]`) routed through the

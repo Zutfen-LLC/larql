@@ -144,6 +144,14 @@ pub const ROPE_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+pub const DECODE_ATTENTION_KERNEL: KernelHandle = KernelHandle::new(
+    "decode_attention",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [256, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -1222,6 +1230,142 @@ extern "C" __global__ void rope(
         out[base + i] = x0 * cos_t - x1 * sin_t;
     } else {
         out[base + (unsigned long long)half_rotary + i] = x0 * sin_t + x1 * cos_t;
+    }
+}
+"#;
+
+/// Fused decode-step GQA attention — the device twin of
+/// `larql_compute::attention::decode::gqa_attention_decode_step`. One
+/// thread-block per query head; the block collaboratively computes
+/// QKᵀ → scale (+ optional softcap) → softmax → weighted-V, all in a single
+/// launch (collapsing the host `k_block.dot(&q_row)` + softmax + `v_block.t().
+/// dot(&scores)` into one kernel over the full KV cache).
+///
+/// Numerics mirror the reference exactly:
+/// - QKᵀ dot + scale: f32 accumulation in `d = 0..head_dim` order.
+/// - softcap (when `has_softcap != 0`): `tanhf(s / softcap) * softcap` (f32,
+///   matching the reference's `(s / cap).tanh() * cap`).
+/// - softmax: `max_val` (f32), `exp((s - max) as f64)` narrowed to f32 for
+///   storage, f64 sum reduction, `inv_sum = (1.0 / sum) as f32`, then
+///   `scores[i] *= inv_sum` (normalize-before-dot, matching the reference's
+///   normalize-then-`v_block.t().dot` rounding order).
+/// - weighted-V: f32 accumulation in `i = 0..total_len` order.
+///
+/// With `fmad` disabled at NVRTC compile time the f32 arithmetic matches the
+/// host path; the only divergence is `exp`/`tanhf` libm differences (parity
+/// gated, ≤ a small tolerance). The kernel indexes K/V/scores rows in 64-bit
+/// and the host launcher guards all dims against `u32::MAX` before upload.
+pub const DECODE_ATTENTION_CUDA_SRC: &str = r#"
+#define DECODE_ATTN_BLOCK 256u
+
+extern "C" __global__ void decode_attention(
+    const float* q,
+    const float* k_cache,
+    const float* v_cache,
+    float* scores,
+    float* out,
+    const float scale,
+    const float softcap,
+    const unsigned int has_softcap,
+    const unsigned int num_q,
+    const unsigned int head_dim,
+    const unsigned int kv_dim,
+    const unsigned int reps,
+    const unsigned int total_len)
+{
+    const unsigned int tid = threadIdx.x;
+    const unsigned int h = blockIdx.x;
+    if (h >= num_q) {
+        return;
+    }
+    if (total_len == 0u) {
+        return;
+    }
+
+    const unsigned int q_off = h * head_dim;
+    const unsigned int kv_h = h / reps;
+    const unsigned int kv_off = kv_h * head_dim;
+    const unsigned int score_base = h * total_len;
+
+    __shared__ float shm_max[DECODE_ATTN_BLOCK];
+    __shared__ double shm_sum[DECODE_ATTN_BLOCK];
+
+    // Phase 1: QK^T dot * scale (+ optional softcap) -> scores[].
+    for (unsigned int i = tid; i < total_len; i += DECODE_ATTN_BLOCK) {
+        const unsigned long long k_base =
+            (unsigned long long)i * (unsigned long long)kv_dim
+            + (unsigned long long)kv_off;
+        float dot = 0.0f;
+        for (unsigned int d = 0u; d < head_dim; ++d) {
+            dot += k_cache[k_base + (unsigned long long)d] * q[q_off + d];
+        }
+        float s = dot * scale;
+        if (has_softcap != 0u) {
+            s = tanhf(s / softcap) * softcap;
+        }
+        scores[score_base + i] = s;
+    }
+    __syncthreads();
+
+    // Phase 2: max reduction (f32) over this head's scores.
+    float local_max = -INFINITY;
+    for (unsigned int i = tid; i < total_len; i += DECODE_ATTN_BLOCK) {
+        const float s = scores[score_base + i];
+        if (s > local_max) {
+            local_max = s;
+        }
+    }
+    shm_max[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s2 = DECODE_ATTN_BLOCK / 2u; s2 > 0u; s2 >>= 1u) {
+        if (tid < s2) {
+            const float other = shm_max[tid + s2];
+            if (other > shm_max[tid]) {
+                shm_max[tid] = other;
+            }
+        }
+        __syncthreads();
+    }
+    const float max_val = shm_max[0];
+    __syncthreads();
+
+    // Phase 3: exp((s - max) as f64) -> scores[], f64 sum reduction.
+    double local_sum = 0.0;
+    for (unsigned int i = tid; i < total_len; i += DECODE_ATTN_BLOCK) {
+        const float s = scores[score_base + i];
+        const double e = exp((double)(s - max_val));
+        scores[score_base + i] = (float)e;
+        local_sum += e;
+    }
+    shm_sum[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s2 = DECODE_ATTN_BLOCK / 2u; s2 > 0u; s2 >>= 1u) {
+        if (tid < s2) {
+            shm_sum[tid] += shm_sum[tid + s2];
+        }
+        __syncthreads();
+    }
+    const double sum = shm_sum[0];
+    const float inv_sum = (sum > 0.0) ? (float)(1.0 / sum) : 0.0f;
+    __syncthreads();
+
+    // Phase 4: normalize scores *= inv_sum (matches the reference's
+    // normalize-then-dot rounding order).
+    for (unsigned int i = tid; i < total_len; i += DECODE_ATTN_BLOCK) {
+        scores[score_base + i] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Phase 5: weighted V (f32 accumulation) -> out[q_off + d].
+    for (unsigned int d = tid; d < head_dim; d += DECODE_ATTN_BLOCK) {
+        float acc = 0.0f;
+        for (unsigned int i = 0u; i < total_len; ++i) {
+            const unsigned long long v_base =
+                (unsigned long long)i * (unsigned long long)kv_dim
+                + (unsigned long long)kv_off;
+            acc += scores[score_base + i] * v_cache[v_base + (unsigned long long)d];
+        }
+        out[q_off + d] = acc;
     }
 }
 "#;

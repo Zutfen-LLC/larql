@@ -391,6 +391,39 @@ impl CudaBackend {
         }
     }
 
+    /// Native fused decode-step GQA attention — the device twin of
+    /// `gqa_attention_decode_step`. `q` is `[num_q * head_dim]` (the new
+    /// token's RoPE'd Q); `k_cache`/`v_cache` are `[total_len * kv_dim]`.
+    /// On success `out` is filled with `[num_q * head_dim]` and `Ok(true)` is
+    /// returned; `Ok(false)` when there's no runtime (caller falls back to the
+    /// host reference); `Err` on a launch failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn native_decode_attention(
+        &self,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        out: &mut Vec<f32>,
+        scale: f32,
+        softcap: Option<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        total_len: usize,
+    ) -> Result<bool, RuntimeError> {
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                runtime.launch_decode_attention(
+                    q, k_cache, v_cache, out, scale, softcap, num_q, head_dim, kv_dim, reps,
+                    total_len,
+                )?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Lock the KV-cache mutex, recovering from poisoning by taking the
     /// inner value (a poisoned mutex only means a prior holder panicked; the
     /// cache itself is still usable). This keeps the documented "fall back
