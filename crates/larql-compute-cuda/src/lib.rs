@@ -1218,6 +1218,208 @@ mod tests {
             .is_none());
     }
 
+    // ── prefill-path device-resident attention chain (Session 22) ───────
+
+    /// Scaffold path (no CUDA runtime): the device-resident prefill attention
+    /// chain ([`CudaBackend::host_prefill_attention_block_device`]) returns
+    /// `None` so the dispatcher falls through to the host-orchestrated path,
+    /// and that path matches the explicit host-only reference. The small
+    /// fixture's attention work (`seq=1 → num_q*head_dim`) is below the gate,
+    /// so the device chain bails on every host regardless of runtime — the
+    /// dispatch↔hostonly match is therefore valid everywhere. Runs on every host.
+    #[test]
+    fn prefill_device_attention_chain_bails_on_scaffold() {
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        // seq=1 → attention work well below the gate (num_q*head_dim < 8192).
+        let (x, seq_len, _) = prefill_input(&weights, &[0u32]);
+        let h = Array2::from_shape_vec((seq_len, hidden), x).unwrap();
+        let layer = &layers[0];
+
+        let device_out = b.host_prefill_attention_block_device(layer, &h, 0, None);
+        if b.native_runtime_available() {
+            // On a real device the small fixture still bails: hidden=16 isn't
+            // a multiple of 256 so the device matmul rejects it (`Err`→`None`),
+            // and the attention work is below the gate. The runtime-gated
+            // parity test below covers a gate-clearing large fixture.
+            return;
+        }
+        assert!(
+            device_out.is_none(),
+            "device attention chain must bail without a runtime"
+        );
+
+        // The dispatcher falls through to the host-only path; it must match
+        // the explicit host-only reference exactly.
+        let via_dispatch = b.host_prefill_attention_block(layer, &h, 0, None);
+        let via_hostonly = b.host_prefill_attention_block_hostonly(layer, &h, 0, None);
+        match (via_dispatch, via_hostonly) {
+            (Some(d), Some(ho)) => assert_eq!(d.as_slice().unwrap(), ho.as_slice().unwrap()),
+            (a, b2) => panic!("dispatch/hostonly disagreed: {a:?} vs {b2:?}"),
+        }
+    }
+
+    /// The device-resident prefill attention chain must match the
+    /// host-orchestrated reference when a runtime is present. The q4k/q6k
+    /// matmul + norm + RoPE kernels are bit-exact with their CPU twins; the
+    /// only divergence is the attention softmax's device `expf` (≤ 1e-4
+    /// relative, see the Session 18 prefill-attention parity test), amplified
+    /// by the O matmul's linear contraction. Runtime-gated.
+    #[test]
+    fn prefill_device_attention_chain_matches_host_when_runtime_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let hidden: usize = 256;
+        let num_q: usize = 8;
+        let num_kv: usize = 2;
+        let head_dim: usize = 32;
+        let layer = build_large_q4k_attention_layer(hidden, num_q, num_kv, head_dim);
+        // seq clears the attention work gate (seq*num_q*seq*head_dim >= 8192)
+        // and the q_dim=256 contraction for the O matmul (multiple of 256).
+        let seq: usize = 8;
+        let h = Array2::from_shape_vec((seq, hidden), vec![0.5f32; seq * hidden]).unwrap();
+
+        let device_out = b
+            .host_prefill_attention_block_device(&layer, &h, 0, None)
+            .expect("device attention chain should run with a runtime on a gate-clearing fixture");
+        let host_out = b
+            .host_prefill_attention_block_hostonly(&layer, &h, 0, None)
+            .expect("host-only attention path should always run");
+
+        assert_eq!(device_out.shape(), host_out.shape());
+        let max_abs = device_out
+            .iter()
+            .zip(host_out.iter())
+            .map(|(d, ho)| (d - ho).abs())
+            .fold(0.0f32, f32::max);
+        // Tolerance accommodates the attention softmax-libm divergence
+        // amplified by the O matmul; a wiring bug would diverge by O(1).
+        assert!(
+            max_abs < 1e-3,
+            "device-resident attention chain diverged from host reference: max_abs={max_abs:.6e}"
+        );
+    }
+
+    /// The device-resident prefill attention chain bails to `None` when the
+    /// attention work is below the gate (`seq*num_q*seq*head_dim < threshold`),
+    /// regardless of runtime availability — the host path is faster for short
+    /// prompts. Runs on every host.
+    #[test]
+    fn prefill_device_attention_chain_bails_below_attention_gate() {
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        // seq=1 → work = num_q*head_dim (well below 8192).
+        let (x, seq_len, _) = prefill_input(&weights, &[0u32]);
+        let h = Array2::from_shape_vec((seq_len, hidden), x).unwrap();
+        let layer = &layers[0];
+        assert!(b
+            .host_prefill_attention_block_device(layer, &h, 0, None)
+            .is_none());
+    }
+
+    /// Build a synthetic large Q4_K attention `FullPipelineLayer`
+    /// (`hidden=hidden`, `num_q_heads`, `num_kv_heads`, `head_dim`) with
+    /// deterministic LCG-ramp Q/K/V/O weights, leaked to `'static` so the
+    /// returned owned layer can borrow them. `hidden` and
+    /// `q_dim = num_q*head_dim` must be multiples of 256 (the Q4_K matmul
+    /// contraction dimension must align to the 256-element super-block). The
+    /// FFN projections are empty (the attention block doesn't touch them).
+    /// Test-only; never runs in prod.
+    fn build_large_q4k_attention_layer(
+        hidden: usize,
+        num_q: usize,
+        num_kv: usize,
+        head_dim: usize,
+    ) -> larql_compute::FullPipelineLayer<'static> {
+        use larql_compute::{FfnType, NormType, QuantWeight};
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        assert!(hidden.is_multiple_of(256) && q_dim.is_multiple_of(256));
+        let lcg_f32 = |seed: u32, rows: usize, cols: usize| -> Vec<f32> {
+            let mut s = seed.wrapping_mul(2654435761);
+            (0..rows * cols)
+                .map(|_| {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((s >> 8) & 0xffff) as f32 / 65535.0
+                })
+                .collect()
+        };
+        let wq_f32 = lcg_f32(1, q_dim, hidden);
+        let wk_f32 = lcg_f32(2, kv_dim, hidden);
+        let wv_f32 = lcg_f32(3, kv_dim, hidden);
+        let wo_f32 = lcg_f32(4, hidden, q_dim);
+        let wq: &'static [u8] = Box::leak(quantize_q4_k(&wq_f32).into_boxed_slice());
+        let wk: &'static [u8] = Box::leak(quantize_q4_k(&wk_f32).into_boxed_slice());
+        let wv: &'static [u8] = Box::leak(quantize_q4_k(&wv_f32).into_boxed_slice());
+        let wo: &'static [u8] = Box::leak(quantize_q4_k(&wo_f32).into_boxed_slice());
+        let norm_w: &'static [f32] = Box::leak(vec![1.0f32; hidden].into_boxed_slice());
+        let qk_norm_w: &'static [f32] = Box::leak(vec![1.0f32; head_dim].into_boxed_slice());
+        let empty_qw = QuantWeight {
+            data: &[],
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
+        let qw = |d: &'static [u8]| QuantWeight {
+            data: d,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
+        larql_compute::FullPipelineLayer {
+            wq: qw(wq),
+            wk: qw(wk),
+            wv: qw(wv),
+            wo: qw(wo),
+            gate: empty_qw,
+            up: empty_qw,
+            down: empty_qw,
+            input_norm: norm_w,
+            post_attn_norm: norm_w,
+            pre_ffn_norm: Some(norm_w),
+            post_ffn_norm: Some(norm_w),
+            input_norm_bias: None,
+            post_attn_norm_bias: None,
+            norm_offset: 0.0,
+            qk_norm_offset: 0.0,
+            eps: 1e-6,
+            has_post_norms: true,
+            norm_type: NormType::RmsNorm,
+            ffn_type: FfnType::Gated,
+            activation: larql_compute::Activation::Silu,
+            attn_scale: (1.0 / (head_dim as f64).sqrt()) as f32,
+            head_dim,
+            num_q_heads: num_q,
+            num_kv_heads: num_kv,
+            rope_base: 10000.0,
+            rope_position_divisor: 1.0,
+            rope_llama3_scaling: None,
+            rotary_dim: head_dim,
+            sliding_window: 0,
+            has_v_norm: false,
+            layer_scalar: 0.0,
+            q_norm_weight: Some(qk_norm_w),
+            k_norm_weight: Some(qk_norm_w),
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+            moe: None,
+            ffn_is_remote: false,
+            moe_combined_output_norm: false,
+            moe_outer_post_norm: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
+            kv_shared_source: None,
+            residual_multiplier: 1.0,
+        }
+    }
+
     /// Build a synthetic large Q4_K FFN `FullPipelineLayer` (`hidden=hidden`,
     /// `inter=inter`) with deterministic LCG-ramp gate/up/down weights, leaked
     /// to `'static` so the returned owned layer can borrow them. Test-only;

@@ -876,48 +876,15 @@ impl CudaRuntime {
             )));
         }
 
+        // Delegate the kernel-arg layout + launch to `launch_rms_norm_dev`
+        // (the single source of truth) so this host-readback path and the
+        // device-resident attention chain share one launch implementation and
+        // can't drift on arg order.
         let x_dev = self
             .stream
             .clone_htod(x)
             .map_err(|err| RuntimeError::context("uploading rms_norm input to CUDA", err))?;
-        // `cudarc` requires a non-empty host slice for `clone_htod`; pass a
-        // one-element placeholder when the weight is `None` and flag
-        // `has_weight = 0` so the device ignores the pointer.
-        let (weight_vec, has_weight) = match weight {
-            Some(w) => (w.to_vec(), 1i32),
-            None => (vec![0.0f32], 0i32),
-        };
-        let weight_dev = self
-            .stream
-            .clone_htod(&weight_vec)
-            .map_err(|err| RuntimeError::context("uploading rms_norm weight to CUDA", err))?;
-        let mut out_dev = self
-            .stream
-            .alloc_zeros::<f32>(rows * cols)
-            .map_err(|err| RuntimeError::context("allocating CUDA rms_norm output buffer", err))?;
-        // Cap the block size at 1024 (32 warps); the device reduction uses a
-        // fixed 32-slot shared array. Larger `cols` are handled by the
-        // strided accumulation loop.
-        let block_dim = 1024u32;
-        let rows_u = rows as u32;
-        let cols_u = cols as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (rows_u, 1, 1),
-            block_dim: (block_dim, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch_args = self.stream.launch_builder(&self.rms_norm);
-        launch_args
-            .arg(&x_dev)
-            .arg(&weight_dev)
-            .arg(&mut out_dev)
-            .arg(&rows_u)
-            .arg(&cols_u)
-            .arg(&eps)
-            .arg(&offset)
-            .arg(&has_weight);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA rms_norm kernel", err))?;
+        let out_dev = self.launch_rms_norm_dev(&x_dev, weight, rows, cols, eps, offset)?;
         self.stream
             .synchronize()
             .map_err(|err| RuntimeError::context("synchronizing CUDA rms_norm stream", err))?;
@@ -992,42 +959,10 @@ impl CudaRuntime {
             .stream
             .clone_htod(x)
             .map_err(|err| RuntimeError::context("uploading rms_norm_heads input to CUDA", err))?;
-        let (weight_vec, has_weight) = match weight {
-            Some(w) => (w.to_vec(), 1i32),
-            None => (vec![0.0f32], 0i32),
-        };
-        let weight_dev = self
-            .stream
-            .clone_htod(&weight_vec)
-            .map_err(|err| RuntimeError::context("uploading rms_norm_heads weight to CUDA", err))?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(total).map_err(|err| {
-            RuntimeError::context("allocating CUDA rms_norm_heads output buffer", err)
-        })?;
-        let block_dim = 1024u32;
-        let seq_u = seq_len as u32;
-        let heads_u = num_heads as u32;
-        let dim_u = head_dim as u32;
-        let blocks = (seq_u.checked_mul(heads_u)).ok_or_else(|| {
-            RuntimeError::usage("rms_norm_heads grid dim overflow seq*heads".to_string())
-        })?;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (block_dim, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch_args = self.stream.launch_builder(&self.rms_norm_heads);
-        launch_args
-            .arg(&x_dev)
-            .arg(&weight_dev)
-            .arg(&mut out_dev)
-            .arg(&seq_u)
-            .arg(&heads_u)
-            .arg(&dim_u)
-            .arg(&eps)
-            .arg(&offset)
-            .arg(&has_weight);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA rms_norm_heads kernel", err))?;
+        // Delegate the kernel-arg layout + launch to `launch_rms_norm_heads_dev`
+        // (single source of truth) — see `launch_rms_norm`.
+        let out_dev = self
+            .launch_rms_norm_heads_dev(&x_dev, weight, seq_len, num_heads, head_dim, eps, offset)?;
         self.stream.synchronize().map_err(|err| {
             RuntimeError::context("synchronizing CUDA rms_norm_heads stream", err)
         })?;
@@ -1183,51 +1118,26 @@ impl CudaRuntime {
                 "rope shape (seq={seq_len}, heads={num_heads}, dim={head_dim}) exceeds the 32-bit kernel index limit"
             )));
         }
-        let divisor = if position_divisor > 0.0 {
-            position_divisor
-        } else {
-            1.0
-        };
+        // The `position_divisor > 0` clamp and the kernel-arg layout live in
+        // `launch_rope_dev` (single source of truth); the host guards above
+        // only cheap-reject obviously-bad host slices before the upload.
 
         let x_dev = self
             .stream
             .clone_htod(x)
             .map_err(|err| RuntimeError::context("uploading rope input to CUDA", err))?;
-        let inv_freq_dev = self
-            .stream
-            .clone_htod(inv_freq)
-            .map_err(|err| RuntimeError::context("uploading rope inv_freq to CUDA", err))?;
-        let mut out_dev = self
-            .stream
-            .alloc_zeros::<f32>(total)
-            .map_err(|err| RuntimeError::context("allocating CUDA rope output buffer", err))?;
-        let threads_x = ROPE_KERNEL.geometry.threads_per_group[0];
-        let total_u = total as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (total_u.div_ceil(threads_x), 1, 1),
-            block_dim: (threads_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let seq_u = seq_len as u32;
-        let heads_u = num_heads as u32;
-        let dim_u = head_dim as u32;
-        let half_u = half_rotary as u32;
-        let pos_off = position_offset as f64;
-        let n_u64 = total as u64;
-        let mut launch_args = self.stream.launch_builder(&self.rope);
-        launch_args
-            .arg(&x_dev)
-            .arg(&inv_freq_dev)
-            .arg(&mut out_dev)
-            .arg(&seq_u)
-            .arg(&heads_u)
-            .arg(&dim_u)
-            .arg(&half_u)
-            .arg(&pos_off)
-            .arg(&divisor)
-            .arg(&n_u64);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA rope kernel", err))?;
+        // Delegate the kernel-arg layout + launch to `launch_rope_dev` (single
+        // source of truth) — see `launch_rms_norm`.
+        let out_dev = self.launch_rope_dev(
+            &x_dev,
+            inv_freq,
+            seq_len,
+            num_heads,
+            head_dim,
+            half_rotary,
+            position_offset,
+            position_divisor,
+        )?;
         self.stream
             .synchronize()
             .map_err(|err| RuntimeError::context("synchronizing CUDA rope stream", err))?;
@@ -1393,57 +1303,26 @@ impl CudaRuntime {
         reps: usize,
         seq_len: usize,
     ) -> Result<(), RuntimeError> {
-        let q_dim = num_q.checked_mul(head_dim);
-        let q_len = seq_len.checked_mul(q_dim.unwrap_or(usize::MAX));
-        let kv_len = seq_len.checked_mul(kv_dim);
-        let (q_len, kv_len) = match (q_len, kv_len) {
-            (Some(ql), Some(kvl)) if q.len() == ql && k.len() == kvl && v.len() == kvl => (ql, kvl),
-            _ => {
-                return Err(RuntimeError::usage(format!(
-                    "prefill_attention shape mismatch: q={} (expected {q_len:?}), k={} / v={} (expected {kv_len:?}, kv_dim={kv_dim}, seq={seq_len}), num_q={num_q}, head_dim={head_dim}",
-                    q.len(),
-                    k.len(),
-                    v.len(),
-                )))
-            }
-        };
+        // Cheap host-slice length validation (the deep shape/u32/shared-mem
+        // guards live in `launch_prefill_attention_dev` — single source of
+        // truth — so this host-readback path and the device-resident attention
+        // chain share one launch implementation).
+        let q_dim = num_q.saturating_mul(head_dim);
+        let q_len = seq_len.saturating_mul(q_dim);
+        let kv_len = seq_len.saturating_mul(kv_dim);
+        if q.len() != q_len || k.len() != kv_len || v.len() != kv_len {
+            return Err(RuntimeError::usage(format!(
+                "prefill_attention shape mismatch: q={} (expected {q_len}), k={} / v={} (expected {kv_len}, kv_dim={kv_dim}, seq={seq_len}), num_q={num_q}, head_dim={head_dim}",
+                q.len(),
+                k.len(),
+                v.len(),
+            )));
+        }
         if seq_len == 0 {
             out.clear();
             out.resize(num_q * head_dim, 0.0);
             return Ok(());
         }
-        if reps == 0 {
-            return Err(RuntimeError::usage(
-                "prefill_attention requires reps >= 1 (num_kv heads > 0)".to_string(),
-            ));
-        }
-        // Guard the grid + 64-bit device indices against the 32-bit limit.
-        if q_len > u32::MAX as usize
-            || kv_len > u32::MAX as usize
-            || num_q > u32::MAX as usize
-            || head_dim > u32::MAX as usize
-            || kv_dim > u32::MAX as usize
-            || seq_len > u32::MAX as usize
-        {
-            return Err(RuntimeError::usage(format!(
-                "prefill_attention shape (num_q={num_q}, head_dim={head_dim}, kv_dim={kv_dim}, seq_len={seq_len}) exceeds the 32-bit kernel index limit"
-            )));
-        }
-        // Dynamic shared budget: 256 doubles (sum) + 256 floats (max) +
-        // seq_len floats (scores). Stay within the default 48 KB dynamic
-        // shared-mem ceiling (larger needs `cudaFuncSetAttribute`, which the
-        // single-command-buffer follow-on will revisit); fall back to the host
-        // reference otherwise.
-        let shm_fixed = 256 * 8 + 256 * 4;
-        let shm_scores = seq_len.checked_mul(4);
-        let shared_mem_bytes = match shm_scores {
-            Some(ss) if shm_fixed + ss <= 48 * 1024 => shm_fixed + ss,
-            _ => {
-                return Err(RuntimeError::usage(format!(
-                    "prefill_attention seq_len={seq_len} exceeds the 48 KB dynamic shared-mem budget; fall back to host"
-                )));
-            }
-        };
 
         let q_dev = self
             .stream
@@ -1457,43 +1336,9 @@ impl CudaRuntime {
             .stream
             .clone_htod(v)
             .map_err(|err| RuntimeError::context("uploading prefill_attention V to CUDA", err))?;
-        let mut out_dev = self
-            .stream
-            .alloc_zeros::<f32>(q_len)
-            .map_err(|err| RuntimeError::context("allocating prefill_attention output", err))?;
-
-        let threads = PREFILL_ATTENTION_KERNEL.geometry.threads_per_group[0];
-        let cfg = LaunchConfig {
-            // grid = (num_q query heads, seq_len query positions).
-            grid_dim: (num_q as u32, seq_len as u32, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: shared_mem_bytes as u32,
-        };
-        let (softcap_val, has_softcap) = match softcap {
-            Some(cap) => (cap, 1u32),
-            None => (0.0f32, 0u32),
-        };
-        let num_q_u = num_q as u32;
-        let head_dim_u = head_dim as u32;
-        let kv_dim_u = kv_dim as u32;
-        let reps_u = reps as u32;
-        let seq_len_u = seq_len as u32;
-        let mut launch_args = self.stream.launch_builder(&self.prefill_attention);
-        launch_args
-            .arg(&q_dev)
-            .arg(&k_dev)
-            .arg(&v_dev)
-            .arg(&mut out_dev)
-            .arg(&scale)
-            .arg(&softcap_val)
-            .arg(&has_softcap)
-            .arg(&num_q_u)
-            .arg(&head_dim_u)
-            .arg(&kv_dim_u)
-            .arg(&reps_u)
-            .arg(&seq_len_u);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA prefill_attention kernel", err))?;
+        let out_dev = self.launch_prefill_attention_dev(
+            &q_dev, &k_dev, &v_dev, scale, softcap, num_q, head_dim, kv_dim, reps, seq_len,
+        )?;
         self.stream
             .synchronize()
             .map_err(|err| RuntimeError::context("synchronizing prefill_attention stream", err))?;
@@ -1622,6 +1467,17 @@ impl CudaRuntime {
         self.stream
             .clone_htod(x)
             .map_err(|err| RuntimeError::context("uploading activation to CUDA", err))
+    }
+
+    /// Upload an f64 array (e.g. a RoPE `inv_freq` table) to the device once,
+    /// returning a device-resident handle. The attention device chain uploads
+    /// `inv_freq` once and shares the device buffer across the Q and K RoPE
+    /// launches (the host slice is identical), avoiding a redundant
+    /// per-launch htod of the frequency table.
+    pub(crate) fn upload_f64(&self, x: &[f64]) -> Result<CudaSlice<f64>, RuntimeError> {
+        self.stream
+            .clone_htod(x)
+            .map_err(|err| RuntimeError::context("uploading f64 buffer to CUDA", err))
     }
 
     /// Synchronize the stream and read a device-resident f32 buffer back to the
@@ -2069,6 +1925,426 @@ impl CudaRuntime {
         launch_args.arg(input).arg(&mut out_dev).arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
+        Ok(out_dev)
+    }
+
+    // ── device-resident norm / RoPE / attention launch variants ──────────
+    //
+    // These extend the per-projection round-trip collapse (Sessions 20/21
+    // covered the FFN block) into the **attention** block: the norm →
+    // Q/K/V → QK-norm → RoPE → attention → O chain. Like the matmul/matvec
+    // /activation `_dev` twins, they take an input already on the device and
+    // return a device-resident output with no internal upload/sync/readback,
+    // so a caller chains several on one stream and reads back once.
+
+    /// Device-resident body RMSNorm: `x_dev` is the already-uploaded
+    /// `[rows*cols]` row-major input; `weight` is a host `[cols]` slice (or
+    /// `None` for the parameter-free `w = 1.0` path, uploaded as a one-element
+    /// placeholder). Returns the `[rows*cols]` output as a device buffer (no
+    /// sync, no readback). Owns the kernel-arg layout + `LaunchConfig` so the
+    /// host-readback [`launch_rms_norm`] delegates here and the two can't
+    /// drift on arg order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_rms_norm_dev(
+        &self,
+        x_dev: &CudaSlice<f32>,
+        weight: Option<&[f32]>,
+        rows: usize,
+        cols: usize,
+        eps: f64,
+        offset: f32,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        if rows == 0 || cols == 0 {
+            return self
+                .stream
+                .alloc_zeros::<f32>(0)
+                .map_err(|err| RuntimeError::context("allocating CUDA rms_norm_dev output", err));
+        }
+        if x_dev.len() != rows * cols {
+            return Err(RuntimeError::usage(format!(
+                "rms_norm_dev expected x_dev.len() == rows*cols ({rows}*{cols}={}), got {}",
+                rows * cols,
+                x_dev.len()
+            )));
+        }
+        if let Some(w) = weight {
+            if w.len() != cols {
+                return Err(RuntimeError::usage(format!(
+                    "rms_norm_dev expected weight of length {cols}, got {}",
+                    w.len()
+                )));
+            }
+        }
+        if rows > u32::MAX as usize || cols > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "rms_norm_dev shape ({rows}, {cols}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        // Upload the weight without a per-call heap alloc: the `Some` arm
+        // uploads the caller's slice directly (clone_htod takes &[f32]); the
+        // `None` arm uploads a one-element placeholder and flags
+        // `has_weight = 0` so the device ignores the pointer (cudarc requires
+        // a non-empty host slice for clone_htod).
+        let placeholder = [0.0f32];
+        let (weight_slice, has_weight): (&[f32], i32) = match weight {
+            Some(w) => (w, 1),
+            None => (&placeholder[..], 0),
+        };
+        let weight_dev = self
+            .stream
+            .clone_htod(weight_slice)
+            .map_err(|err| RuntimeError::context("uploading rms_norm_dev weight to CUDA", err))?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(rows * cols).map_err(|err| {
+            RuntimeError::context("allocating CUDA rms_norm_dev output buffer", err)
+        })?;
+        let block_dim = 1024u32;
+        let rows_u = rows as u32;
+        let cols_u = cols as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows_u, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.rms_norm);
+        launch_args
+            .arg(x_dev)
+            .arg(&weight_dev)
+            .arg(&mut out_dev)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&eps)
+            .arg(&offset)
+            .arg(&has_weight);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA rms_norm_dev kernel", err))?;
+        Ok(out_dev)
+    }
+
+    /// Device-resident per-head RMSNorm twin of [`launch_rms_norm_dev`].
+    /// `x_dev` is the `[seq*num_heads*head_dim]` row-major input; `weight` is a
+    /// host `[head_dim]` slice broadcast across heads (or `None` for the
+    /// parameter-free path). Returns the output as a device buffer. Owns the
+    /// kernel-arg layout so [`launch_rms_norm_heads`] delegates here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_rms_norm_heads_dev(
+        &self,
+        x_dev: &CudaSlice<f32>,
+        weight: Option<&[f32]>,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        eps: f64,
+        offset: f32,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let total = seq_len
+            .checked_mul(num_heads)
+            .and_then(|p| p.checked_mul(head_dim));
+        let total = match total {
+            Some(t) if x_dev.len() == t => t,
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "rms_norm_heads_dev expected x_dev of length {} (seq={seq_len} heads={num_heads} dim={head_dim}), got {}",
+                    seq_len * num_heads * head_dim,
+                    x_dev.len()
+                )))
+            }
+        };
+        if total == 0 {
+            return self.stream.alloc_zeros::<f32>(0).map_err(|err| {
+                RuntimeError::context("allocating CUDA rms_norm_heads_dev output", err)
+            });
+        }
+        if let Some(w) = weight {
+            if w.len() != head_dim {
+                return Err(RuntimeError::usage(format!(
+                    "rms_norm_heads_dev expected weight of length {head_dim} (broadcast across heads), got {}",
+                    w.len()
+                )));
+            }
+        }
+        if seq_len > u32::MAX as usize
+            || num_heads > u32::MAX as usize
+            || head_dim > u32::MAX as usize
+            || (num_heads as u64) * (head_dim as u64) > u32::MAX as u64
+        {
+            return Err(RuntimeError::usage(format!(
+                "rms_norm_heads_dev shape (seq={seq_len}, heads={num_heads}, dim={head_dim}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        let placeholder = [0.0f32];
+        let (weight_slice, has_weight): (&[f32], i32) = match weight {
+            Some(w) => (w, 1),
+            None => (&placeholder[..], 0),
+        };
+        let weight_dev = self.stream.clone_htod(weight_slice).map_err(|err| {
+            RuntimeError::context("uploading rms_norm_heads_dev weight to CUDA", err)
+        })?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(total).map_err(|err| {
+            RuntimeError::context("allocating CUDA rms_norm_heads_dev output buffer", err)
+        })?;
+        let block_dim = 1024u32;
+        let seq_u = seq_len as u32;
+        let heads_u = num_heads as u32;
+        let dim_u = head_dim as u32;
+        let blocks = (seq_u.checked_mul(heads_u)).ok_or_else(|| {
+            RuntimeError::usage("rms_norm_heads_dev grid dim overflow seq*heads".to_string())
+        })?;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.rms_norm_heads);
+        launch_args
+            .arg(x_dev)
+            .arg(&weight_dev)
+            .arg(&mut out_dev)
+            .arg(&seq_u)
+            .arg(&heads_u)
+            .arg(&dim_u)
+            .arg(&eps)
+            .arg(&offset)
+            .arg(&has_weight);
+        unsafe { launch_args.launch(cfg) }.map_err(|err| {
+            RuntimeError::context("launching CUDA rms_norm_heads_dev kernel", err)
+        })?;
+        Ok(out_dev)
+    }
+
+    /// Device-resident RoPE: `x_dev` is the already-uploaded
+    /// `[seq*num_heads*head_dim]` Q/K tensor; `inv_freq` is the host
+    /// `half_rotary`-length frequency array (built identically to the
+    /// reference). Uploads `inv_freq` once then delegates to
+    /// [`launch_rope_dev_with_invfreq`] (single source of truth for the
+    /// kernel-arg layout). Callers that share `inv_freq` across multiple RoPE
+    /// launches (the attention device chain's Q + K) should upload it once via
+    /// [`upload_f64`] and call [`launch_rope_dev_with_invfreq`] directly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_rope_dev(
+        &self,
+        x_dev: &CudaSlice<f32>,
+        inv_freq: &[f64],
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        half_rotary: usize,
+        position_offset: usize,
+        position_divisor: f64,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let inv_freq_dev = self
+            .stream
+            .clone_htod(inv_freq)
+            .map_err(|err| RuntimeError::context("uploading rope_dev inv_freq to CUDA", err))?;
+        self.launch_rope_dev_with_invfreq(
+            &inv_freq_dev,
+            x_dev,
+            seq_len,
+            num_heads,
+            head_dim,
+            half_rotary,
+            position_offset,
+            position_divisor,
+        )
+    }
+
+    /// Device-resident RoPE with an already-uploaded `inv_freq` device buffer
+    /// — the twin of [`launch_rope_dev`] for chains that reuse the frequency
+    /// table across multiple RoPE launches (the prefill attention chain's Q +
+    /// K share one `inv_freq`). Owns the kernel-arg layout + `LaunchConfig` so
+    /// [`launch_rope`] and [`launch_rope_dev`] delegate here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_rope_dev_with_invfreq(
+        &self,
+        inv_freq_dev: &CudaSlice<f64>,
+        x_dev: &CudaSlice<f32>,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        half_rotary: usize,
+        position_offset: usize,
+        position_divisor: f64,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let total = seq_len
+            .checked_mul(num_heads)
+            .and_then(|p| p.checked_mul(head_dim));
+        let total = match total {
+            Some(t) if x_dev.len() == t => t,
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "rope_dev expected x_dev of length {} (seq={seq_len} heads={num_heads} dim={head_dim}), got {}",
+                    seq_len * num_heads * head_dim,
+                    x_dev.len()
+                )))
+            }
+        };
+        if total == 0 {
+            return self
+                .stream
+                .alloc_zeros::<f32>(0)
+                .map_err(|err| RuntimeError::context("allocating CUDA rope_dev output", err));
+        }
+        if inv_freq_dev.len() != half_rotary {
+            return Err(RuntimeError::usage(format!(
+                "rope_dev expected inv_freq of length {half_rotary}, got {}",
+                inv_freq_dev.len()
+            )));
+        }
+        if half_rotary == 0 {
+            return Err(RuntimeError::usage(
+                "rope_dev requires half_rotary >= 1 (rotary_dim >= 2)".to_string(),
+            ));
+        }
+        if total > u32::MAX as usize
+            || seq_len > u32::MAX as usize
+            || num_heads > u32::MAX as usize
+            || head_dim > u32::MAX as usize
+        {
+            return Err(RuntimeError::usage(format!(
+                "rope_dev shape (seq={seq_len}, heads={num_heads}, dim={head_dim}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        let divisor = if position_divisor > 0.0 {
+            position_divisor
+        } else {
+            1.0
+        };
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(total)
+            .map_err(|err| RuntimeError::context("allocating CUDA rope_dev output buffer", err))?;
+        let threads_x = ROPE_KERNEL.geometry.threads_per_group[0];
+        let total_u = total as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total_u.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_u = seq_len as u32;
+        let heads_u = num_heads as u32;
+        let dim_u = head_dim as u32;
+        let half_u = half_rotary as u32;
+        let pos_off = position_offset as f64;
+        let n_u64 = total as u64;
+        let mut launch_args = self.stream.launch_builder(&self.rope);
+        launch_args
+            .arg(x_dev)
+            .arg(inv_freq_dev)
+            .arg(&mut out_dev)
+            .arg(&seq_u)
+            .arg(&heads_u)
+            .arg(&dim_u)
+            .arg(&half_u)
+            .arg(&pos_off)
+            .arg(&divisor)
+            .arg(&n_u64);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA rope_dev kernel", err))?;
+        Ok(out_dev)
+    }
+
+    /// Device-resident fused prefill (seq×seq) causal GQA attention.
+    /// `q_dev`/`k_dev`/`v_dev` are already-resident: `q` is
+    /// `[seq, num_q*head_dim]`, `k`/`v` are `[seq, kv_dim]`. Returns the
+    /// `[seq, num_q*head_dim]` output as a device buffer. Owns the kernel-arg
+    /// layout + shared-mem budget guard so [`launch_prefill_attention`]
+    /// delegates here. `Err` (mapped to `None` by the pipeline) when the shape
+    /// exceeds the device shared-mem/index budget.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_prefill_attention_dev(
+        &self,
+        q_dev: &CudaSlice<f32>,
+        k_dev: &CudaSlice<f32>,
+        v_dev: &CudaSlice<f32>,
+        scale: f32,
+        softcap: Option<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        seq_len: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let q_dim = num_q.checked_mul(head_dim);
+        let q_len = seq_len.checked_mul(q_dim.unwrap_or(usize::MAX));
+        let kv_len = seq_len.checked_mul(kv_dim);
+        let (q_len, kv_len) = match (q_len, kv_len) {
+            (Some(ql), Some(kvl)) if q_dev.len() == ql && k_dev.len() == kvl && v_dev.len() == kvl => {
+                (ql, kvl)
+            }
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "prefill_attention_dev shape mismatch: q={} (expected {q_len:?}), k={} / v={} (expected {kv_len:?}, kv_dim={kv_dim}, seq={seq_len}), num_q={num_q}, head_dim={head_dim}",
+                    q_dev.len(),
+                    k_dev.len(),
+                    v_dev.len(),
+                )))
+            }
+        };
+        if seq_len == 0 {
+            return self.stream.alloc_zeros::<f32>(0).map_err(|err| {
+                RuntimeError::context("allocating CUDA prefill_attention_dev output", err)
+            });
+        }
+        if reps == 0 {
+            return Err(RuntimeError::usage(
+                "prefill_attention_dev requires reps >= 1 (num_kv heads > 0)".to_string(),
+            ));
+        }
+        if q_len > u32::MAX as usize
+            || kv_len > u32::MAX as usize
+            || num_q > u32::MAX as usize
+            || head_dim > u32::MAX as usize
+            || kv_dim > u32::MAX as usize
+            || seq_len > u32::MAX as usize
+        {
+            return Err(RuntimeError::usage(format!(
+                "prefill_attention_dev shape (num_q={num_q}, head_dim={head_dim}, kv_dim={kv_dim}, seq_len={seq_len}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+        let shm_fixed = 256 * 8 + 256 * 4;
+        let shm_scores = seq_len.checked_mul(4);
+        let shared_mem_bytes = match shm_scores {
+            Some(ss) if shm_fixed + ss <= 48 * 1024 => shm_fixed + ss,
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "prefill_attention_dev seq_len={seq_len} exceeds the 48 KB dynamic shared-mem budget; fall back to host"
+                )));
+            }
+        };
+        let mut out_dev = self.stream.alloc_zeros::<f32>(q_len).map_err(|err| {
+            RuntimeError::context("allocating CUDA prefill_attention_dev output", err)
+        })?;
+        let threads = PREFILL_ATTENTION_KERNEL.geometry.threads_per_group[0];
+        let cfg = LaunchConfig {
+            grid_dim: (num_q as u32, seq_len as u32, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: shared_mem_bytes as u32,
+        };
+        let (softcap_val, has_softcap) = match softcap {
+            Some(cap) => (cap, 1u32),
+            None => (0.0f32, 0u32),
+        };
+        let num_q_u = num_q as u32;
+        let head_dim_u = head_dim as u32;
+        let kv_dim_u = kv_dim as u32;
+        let reps_u = reps as u32;
+        let seq_len_u = seq_len as u32;
+        let mut launch_args = self.stream.launch_builder(&self.prefill_attention);
+        launch_args
+            .arg(q_dev)
+            .arg(k_dev)
+            .arg(v_dev)
+            .arg(&mut out_dev)
+            .arg(&scale)
+            .arg(&softcap_val)
+            .arg(&has_softcap)
+            .arg(&num_q_u)
+            .arg(&head_dim_u)
+            .arg(&kv_dim_u)
+            .arg(&reps_u)
+            .arg(&seq_len_u);
+        unsafe { launch_args.launch(cfg) }.map_err(|err| {
+            RuntimeError::context("launching CUDA prefill_attention_dev kernel", err)
+        })?;
         Ok(out_dev)
     }
 }
