@@ -1325,6 +1325,148 @@ mod tests {
             .is_none());
     }
 
+    /// The device-resident decode attention chain
+    /// ([`CudaBackend::host_attention_block_device`]) returns `None` so the
+    /// dispatcher falls through to the host-orchestrated path, and that path
+    /// matches the explicit host-only reference. The small fixture's
+    /// attention work (`total_len=1 → num_q*head_dim`) is below the gate, so
+    /// the device chain bails on every host regardless of runtime — the
+    /// dispatch↔hostonly match is therefore valid everywhere. Runs on every host.
+    #[test]
+    fn decode_device_attention_chain_bails_on_scaffold() {
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        let x = decode_residual_input(&weights);
+        let h = Array2::from_shape_vec((1, hidden), x).unwrap();
+        let layer = &layers[0];
+
+        // Initialise the host KV mirror with one empty layer slot so the
+        // attention block can read `prev = 0`.
+        b.reset_host_kv(1);
+
+        let device_out = b.host_attention_block_device(layer, &h, 0, 0);
+        if b.native_runtime_available() {
+            // On a real device the small fixture still bails: hidden=16 isn't
+            // a multiple of 256 so the device matvec rejects it, and the
+            // attention work is below the gate. The runtime-gated parity test
+            // below covers a gate-clearing large fixture.
+            return;
+        }
+        assert!(
+            device_out.is_none(),
+            "device decode attention chain must bail without a runtime"
+        );
+
+        // The dispatcher falls through to the host-only path; it must match
+        // the explicit host-only reference exactly.
+        let via_dispatch = b.host_attention_block(layer, &h, 0, 0);
+        let via_hostonly = b.host_attention_block_hostonly(layer, &h, 0, 0);
+        match (via_dispatch, via_hostonly) {
+            (Some((dh, dk, dv)), Some((hh, hk, hv))) => {
+                assert_eq!(dh.as_slice().unwrap(), hh.as_slice().unwrap());
+                assert_eq!(dk, hk);
+                assert_eq!(dv, hv);
+            }
+            (a, b2) => panic!("dispatch/hostonly disagreed: {a:?} vs {b2:?}"),
+        }
+    }
+
+    /// The device-resident decode attention chain must match the
+    /// host-orchestrated reference when a runtime is present AND the attention
+    /// work clears the gate. The host KV mirror is pre-populated with `prev`
+    /// rows so `total_len = prev + 1` clears the gate
+    /// (`num_q × total_len × head_dim >= 8192`). The q4k matvec + norm + RoPE
+    /// kernels are bit-exact with their CPU twins; the only divergence is the
+    /// attention softmax's device `expf` (≤ 1e-4 relative), amplified by the O
+    /// matvec's linear contraction. Runtime-gated.
+    #[test]
+    fn decode_device_attention_chain_matches_host_when_runtime_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let hidden: usize = 256;
+        let num_q: usize = 8;
+        let num_kv: usize = 2;
+        let head_dim: usize = 32;
+        let kv_dim = num_kv * head_dim;
+        let layer = build_large_q4k_attention_layer(hidden, num_q, num_kv, head_dim);
+        // total_len = 32 → work = 8*32*32 = 8192 clears the gate; q_dim=256
+        // (multiple of 256) clears the device matvec contraction.
+        let prev: usize = 31;
+
+        // Populate the host KV mirror with `prev` synthetic rows.
+        b.reset_host_kv(1);
+        {
+            let mut kv = b.lock_host_kv();
+            let k_vals: Vec<f32> = (0..prev * kv_dim)
+                .map(|i| (i as f32) / (prev * kv_dim) as f32)
+                .collect();
+            let v_vals = vec![0.3f32; prev * kv_dim];
+            let k = Array2::from_shape_vec((prev, kv_dim), k_vals).unwrap();
+            let v = Array2::from_shape_vec((prev, kv_dim), v_vals).unwrap();
+            kv[0] = (k, v);
+        }
+
+        let h = Array2::from_shape_vec((1, hidden), vec![0.5f32; hidden]).unwrap();
+        let (d_h, d_k, d_v) = b.host_attention_block_device(&layer, &h, 0, prev).expect(
+            "device decode attention chain should run with a runtime on a gate-clearing fixture",
+        );
+        let (h_h, h_k, h_v) = b
+            .host_attention_block_hostonly(&layer, &h, 0, prev)
+            .expect("host-only attention path should always run");
+
+        // h_post_attn: tolerate the softmax-libm divergence amplified by the O
+        // matvec; a wiring bug would diverge by O(1).
+        assert_eq!(d_h.shape(), h_h.shape());
+        let max_abs = d_h
+            .iter()
+            .zip(h_h.iter())
+            .map(|(d, ho)| (d - ho).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "device-resident decode attention chain diverged from host reference: max_abs={max_abs:.6e}"
+        );
+        // The new K/V rows must match (post-RoPE K / post-V-norm V).
+        assert_eq!(d_k.len(), h_k.len());
+        assert_eq!(d_v.len(), h_v.len());
+        let kv_max = d_k
+            .iter()
+            .zip(h_k.iter())
+            .chain(d_v.iter().zip(h_v.iter()))
+            .map(|(d, ho)| (d - ho).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            kv_max < 1e-4,
+            "device-resident decode K/V rows diverged from host reference: max_abs={kv_max:.6e}"
+        );
+    }
+
+    /// The device-resident decode attention chain bails to `None` when the
+    /// attention work is below the gate (`num_q × total_len × head_dim <
+    /// threshold`), regardless of runtime availability — the host path is
+    /// faster for short contexts. With an empty KV mirror (`prev = 0`,
+    /// `total_len = 1`) the work is `num_q * head_dim`, well below 8192. Runs
+    /// on every host.
+    #[test]
+    fn decode_device_attention_chain_bails_below_attention_gate() {
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        let x = decode_residual_input(&weights);
+        let h = Array2::from_shape_vec((1, hidden), x).unwrap();
+        let layer = &layers[0];
+        b.reset_host_kv(1);
+        // total_len = 1 → work = num_q*head_dim (well below 8192).
+        assert!(b.host_attention_block_device(layer, &h, 0, 0).is_none());
+    }
+
     /// Build a synthetic large Q4_K attention `FullPipelineLayer`
     /// (`hidden=hidden`, `num_q_heads`, `num_kv_heads`, `head_dim`) with
     /// deterministic LCG-ramp Q/K/V/O weights, leaked to `'static` so the

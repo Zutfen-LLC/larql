@@ -959,10 +959,290 @@ impl CudaBackend {
         }
     }
 
+    /// Device-resident decode-step attention chain — the decode twin of
+    /// [`host_prefill_attention_block_device`]. Keeps the Q/K/V matvec →
+    /// QK-norm/V-norm/RoPE → decode-attention → O matvec chain resident on
+    /// the device with a single final readback, collapsing the per-op
+    /// upload/launch/sync/readback round trips the host-orchestrated path
+    /// ([`host_attention_block_hostonly`]) pays for each native kernel. The
+    /// three Q/K/V projections share one upload of the normed input; the
+    /// elementwise ops + the decode attention read resident buffers; the O
+    /// projection consumes the resident attention output.
+    ///
+    /// Two device syncs remain (vs ~8 per-op round trips on the host path):
+    /// one to read back the new post-RoPE K / post-V-norm V row (needed to
+    /// build the full `[prev+1, kv_dim]` KV the decode-attention kernel
+    /// attends over, and also the row the caller appends to the host mirror),
+    /// and one final readback of the O projection. Bails to `None` (caller
+    /// falls back to [`host_attention_block_hostonly`]) when there's no
+    /// runtime, the attention work is below the gate, the projections aren't
+    /// all Q4_K/Q6_K, or the input isn't a contiguous `[1, hidden]` slice.
+    pub(crate) fn host_attention_block_device(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h: &Array2<f32>,
+        li: usize,
+        abs_position: usize,
+    ) -> Option<(Array2<f32>, Vec<f32>, Vec<f32>)> {
+        let runtime = self.runtime()?;
+        let head_dim = layer.head_dim;
+        let num_q = layer.num_q_heads;
+        let num_kv = layer.num_kv_heads;
+        let reps = num_q.checked_div(num_kv)?;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let scale = layer.attn_scale as f64;
+        let hidden = h.shape()[1];
+        // The `DecodeBackend::decode_token` trait signature carries no
+        // attention logit softcap (Gemma 4's attention softcap is 0; the host
+        // path applies none either) — mirrors `host_attention_block_hostonly`.
+        let softcap_opt: Option<f32> = None;
+
+        // Single decode token.
+        if h.shape() != [1, hidden] {
+            return None;
+        }
+        // Prior KV length from the host mirror (the source of truth for the
+        // host-orchestrated attention); total_len = prev + 1 (the new row).
+        let prev = self
+            .lock_host_kv()
+            .get(li)
+            .map(|(k, _)| k.shape()[0])
+            .unwrap_or(0);
+        let total_len = prev + 1;
+        // Gate the whole chain on the decode-attention work (same proxy as
+        // `decode_attention_native`). Below it the host path is faster.
+        let work = num_q.saturating_mul(total_len).saturating_mul(head_dim);
+        if !Self::native_decode_attention_worthwhile(work) {
+            return None;
+        } // All four attention projections must be a k-quant the device matvec
+          // handles (`matvec_dev_by_fmt` only routes Q4_K/Q6_K).
+        let qf = layer.wq.format;
+        let kf = layer.wk.format;
+        let vf = layer.wv.format;
+        let of = layer.wo.format;
+        let k_quant = |f: QuantFormat| matches!(f, QuantFormat::Q4_K | QuantFormat::Q6_K);
+        if !(k_quant(qf) && k_quant(kf) && k_quant(vf) && k_quant(of)) {
+            return None;
+        }
+        // The input must be contiguous to slice for the norm + upload.
+        let h_slice = h.as_slice()?;
+        if h_slice.len() != hidden {
+            return None;
+        }
+
+        // Input norm on host (matches the prefill attention device chain:
+        // the norm weight is f32 and the residual it feeds is host-resident).
+        let h_norm = self.norm_1d(
+            layer.norm_type,
+            h,
+            layer.input_norm,
+            layer.norm_offset,
+            layer.eps,
+        );
+        let h_norm_slice = h_norm.as_slice()?;
+        if h_norm_slice.len() != hidden {
+            return None;
+        }
+
+        // RoPE inv_freq via the shared substrate helper — single source of
+        // truth, bit-identical to the host reference.
+        let frac = rope_fraction(layer);
+        let pos_div = layer.rope_position_divisor as f64;
+        let llama3 = layer.rope_llama3_scaling;
+        let (_rotary_dim, half_rotary, inv_freq) =
+            build_rope_inv_freq(layer.rope_base as f64, head_dim, frac, llama3);
+        // Per-head RMSNorm eps matches the CPU reference hard-coding.
+        let qk_eps = larql_compute::residual::DEFAULT_EPS;
+        let qk_off = layer.qk_norm_offset;
+
+        // Drive the device chain. Any launch error maps to `None` so the
+        // caller falls back to the host-orchestrated path. All launches run
+        // on the same stream (stream-ordered). Each intermediate is bound to
+        // its own name and kept alive until the block-end readback so per-step
+        // `CudaSlice` drops happen AFTER the final sync (on pool-less devices
+        // a `CudaSlice::drop` forces a stream sync — distinct bindings keep
+        // the sync count minimal, the same discipline the other chains use).
+        let (o_vec, k_new_row, v_new_row): (Vec<f32>, Vec<f32>, Vec<f32>) = {
+            let h_dev = runtime.upload_f32(h_norm_slice).ok()?;
+            // Q/K/V projections share the normed input resident.
+            let q_proj =
+                matvec_dev_by_fmt(runtime, qf, layer.wq.data, &h_dev, q_dim, hidden).ok()?;
+            let k_proj =
+                matvec_dev_by_fmt(runtime, kf, layer.wk.data, &h_dev, kv_dim, hidden).ok()?;
+            let v_proj =
+                matvec_dev_by_fmt(runtime, vf, layer.wv.data, &h_dev, kv_dim, hidden).ok()?;
+            // QK-norm (per-head RMSNorm; Gemma 3/4). seq_len = 1 (decode).
+            let q_normed = match layer.q_norm_weight {
+                Some(w) => runtime
+                    .launch_rms_norm_heads_dev(&q_proj, Some(w), 1, num_q, head_dim, qk_eps, qk_off)
+                    .ok()?,
+                None => q_proj,
+            };
+            let k_normed = match layer.k_norm_weight {
+                Some(w) => runtime
+                    .launch_rms_norm_heads_dev(
+                        &k_proj,
+                        Some(w),
+                        1,
+                        num_kv,
+                        head_dim,
+                        qk_eps,
+                        qk_off,
+                    )
+                    .ok()?,
+                None => k_proj,
+            };
+            // V-norm (parameter-free, Gemma 4). Optional.
+            let v_normed = if layer.has_v_norm {
+                runtime
+                    .launch_rms_norm_heads_dev(&v_proj, None, 1, num_kv, head_dim, qk_eps, 0.0)
+                    .ok()?
+            } else {
+                v_proj
+            };
+            // RoPE on Q and K at `abs_position`. The `inv_freq` table is
+            // uploaded once and shared by both RoPE launches.
+            let inv_freq_dev = runtime.upload_f64(&inv_freq).ok()?;
+            let q_rope = runtime
+                .launch_rope_dev_with_invfreq(
+                    &inv_freq_dev,
+                    &q_normed,
+                    1,
+                    num_q,
+                    head_dim,
+                    half_rotary,
+                    abs_position,
+                    pos_div,
+                )
+                .ok()?;
+            let k_rope = runtime
+                .launch_rope_dev_with_invfreq(
+                    &inv_freq_dev,
+                    &k_normed,
+                    1,
+                    num_kv,
+                    head_dim,
+                    half_rotary,
+                    abs_position,
+                    pos_div,
+                )
+                .ok()?;
+            // Read back the new post-RoPE K / post-V-norm V row (one sync).
+            // Needed to build the full KV the decode-attention kernel attends
+            // over; also the row the caller appends to the host mirror.
+            let k_new_row = runtime.sync_dtoh_f32(&k_rope).ok()?;
+            let v_new_row = runtime.sync_dtoh_f32(&v_normed).ok()?;
+            if k_new_row.len() != kv_dim || v_new_row.len() != kv_dim {
+                return None;
+            }
+            // Build the full KV [total_len, kv_dim] from the prior host
+            // mirror + the new row (the host reference concatenates the same
+            // way). The mirror holds post-RoPE K / post-V-norm V.
+            let (k_full, v_full): (Vec<f32>, Vec<f32>) = {
+                let kv = self.lock_host_kv();
+                match kv.get(li) {
+                    Some((k_cache, v_cache)) if prev > 0 => {
+                        let kc = k_cache.as_slice().unwrap_or(&[]);
+                        let vc = v_cache.as_slice().unwrap_or(&[]);
+                        let need = prev * kv_dim;
+                        if kc.len() < need || vc.len() < need {
+                            return None;
+                        }
+                        let mut k_full = Vec::with_capacity(total_len * kv_dim);
+                        let mut v_full = Vec::with_capacity(total_len * kv_dim);
+                        k_full.extend_from_slice(&kc[..need]);
+                        v_full.extend_from_slice(&vc[..need]);
+                        k_full.extend_from_slice(&k_new_row);
+                        v_full.extend_from_slice(&v_new_row);
+                        (k_full, v_full)
+                    }
+                    _ => (k_new_row.clone(), v_new_row.clone()),
+                }
+            };
+            // Decode attention over the full KV. The resident Q stays on the
+            // device; the full KV is uploaded fresh (the mirror grows each
+            // token, so a resident device KV buffer would need an append step
+            // — the single-command-buffer follow-on). The scores scratch is
+            // owned by this scope so it drops after the final readback.
+            let score_len = num_q.checked_mul(total_len)?;
+            let k_dev = runtime.upload_f32(&k_full).ok()?;
+            let v_dev = runtime.upload_f32(&v_full).ok()?;
+            // Kernel-write-only scratch: device-local zero alloc, no htod.
+            let mut scores_dev = runtime.alloc_zeros_f32(score_len).ok()?;
+            let attn_dev = runtime
+                .launch_decode_attention_dev(
+                    &q_rope,
+                    &k_dev,
+                    &v_dev,
+                    &mut scores_dev,
+                    scale as f32,
+                    softcap_opt,
+                    num_q,
+                    head_dim,
+                    kv_dim,
+                    reps,
+                    total_len,
+                )
+                .ok()?;
+            // O projection: resident attention output → [1, hidden].
+            let o_dev =
+                matvec_dev_by_fmt(runtime, of, layer.wo.data, &attn_dev, hidden, q_dim).ok()?;
+            // Single final readback of O.
+            let o_vec = runtime.sync_dtoh_f32(&o_dev).ok()?;
+            if o_vec.len() != hidden {
+                return None;
+            }
+            (o_vec, k_new_row, v_new_row)
+        };
+
+        let attn_projected = vec_to_2d_row(o_vec);
+
+        // Post-attention residual (+ optional post-attn norm) on host.
+        let res_mult = layer.residual_multiplier;
+        let h_post_attn = if layer.has_post_norms {
+            let normed = self.norm_1d(
+                layer.norm_type,
+                &attn_projected,
+                layer.post_attn_norm,
+                layer.norm_offset,
+                layer.eps,
+            );
+            self.add_residual_native(h, &normed, res_mult)
+        } else {
+            self.add_residual_native(h, &attn_projected, res_mult)
+        };
+        Some((h_post_attn, k_new_row, v_new_row))
+    }
+
     /// One attention block for a single decode step:
     /// norm → Q/K/V proj → QK-norm → RoPE → GQA attend → O proj → residual.
-    /// Returns `(h_post_attn, k_new_row, v_new_row)`.
-    fn host_attention_block(
+    /// Returns `(h_post_attn, k_new_row, v_new_row)`. Tries the device-resident
+    /// chain first ([`host_attention_block_device`], which keeps the Q/K/V →
+    /// QK-norm/V-norm/RoPE → decode-attention → O chain resident on the device
+    /// with a single readback); falls back to the host-orchestrated path
+    /// ([`host_attention_block_hostonly`]) when the device path is unavailable
+    /// or the layer features aren't supported.
+    pub(crate) fn host_attention_block(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h: &Array2<f32>,
+        li: usize,
+        abs_position: usize,
+    ) -> Option<(Array2<f32>, Vec<f32>, Vec<f32>)> {
+        if let Some(out) = self.host_attention_block_device(layer, h, li, abs_position) {
+            return Some(out);
+        }
+        self.host_attention_block_hostonly(layer, h, li, abs_position)
+    }
+
+    /// Host-orchestrated decode-step attention block
+    /// Host-orchestrated decode-step attention block — the parity oracle +
+    /// fallback for [`host_attention_block_device`]. Each native kernel
+    /// (quant matvec, QK-norm/V-norm, RoPE, decode-attention, residual) runs
+    /// its own upload/launch/sync/readback round trip; the device-resident
+    /// chain collapses these into a single readback.
+    pub(crate) fn host_attention_block_hostonly(
         &self,
         layer: &FullPipelineLayer<'_>,
         h: &Array2<f32>,

@@ -1231,10 +1231,108 @@ impl CudaRuntime {
         let mut scores_dev = self.stream.alloc_zeros::<f32>(score_len).map_err(|err| {
             RuntimeError::context("allocating decode_attention scores scratch", err)
         })?;
+        let out_dev = self.launch_decode_attention_dev(
+            &q_dev,
+            &k_dev,
+            &v_dev,
+            &mut scores_dev,
+            scale,
+            softcap,
+            num_q,
+            head_dim,
+            kv_dim,
+            reps,
+            total_len,
+        )?;
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing decode_attention stream", err))?;
+        let host_out = self
+            .stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context("reading decode_attention output", err))?;
+        out.clear();
+        out.extend_from_slice(&host_out);
+        Ok(())
+    }
+
+    /// Native fused decode-step GQA attention, device-resident variant — the
+    /// twin of [`launch_decode_attention`] used by the device-resident decode
+    /// attention chain. `q_dev`/`k_dev`/`v_dev` are already on the device
+    /// (the chain's resident Q after RoPE + the full uploaded KV cache);
+    /// `scores_dev` is a caller-owned scratch of length `num_q * total_len`
+    /// (owned by the chain scope so its drop happens after the final readback,
+    /// not mid-chain — on pool-less devices a mid-chain `CudaSlice::drop`
+    /// forces a stream sync). The returned `CudaSlice<f32>` stays resident
+    /// with NO internal sync/dtoh, so the O projection can consume it on the
+    /// same stream without a round trip. All shape/u32-index guards live here
+    /// (single source of truth — the host-readback
+    /// [`launch_decode_attention`] delegates to this).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_decode_attention_dev(
+        &self,
+        q_dev: &CudaSlice<f32>,
+        k_dev: &CudaSlice<f32>,
+        v_dev: &CudaSlice<f32>,
+        scores_dev: &mut CudaSlice<f32>,
+        scale: f32,
+        softcap: Option<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        total_len: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let q_len = num_q.checked_mul(head_dim);
+        let kv_len = total_len.checked_mul(kv_dim);
+        let score_len = num_q.checked_mul(total_len);
+        let (q_len, kv_len, score_len) = match (q_len, kv_len, score_len) {
+            (Some(ql), Some(kvl), Some(sl))
+                if q_dev.len() == ql
+                    && k_dev.len() == kvl
+                    && v_dev.len() == kvl
+                    && scores_dev.len() == sl =>
+            {
+                (ql, kvl, sl)
+            }
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "decode_attention_dev shape mismatch: q={} (expected {q_len:?}), k={} / v={} (expected {kv_len:?}, kv_dim={kv_dim}, total={total_len}), scores={} (expected {score_len:?}), num_q={num_q}, head_dim={head_dim}",
+                    q_dev.len(),
+                    k_dev.len(),
+                    v_dev.len(),
+                    scores_dev.len(),
+                )))
+            }
+        };
+        if total_len == 0 {
+            // Empty context: attention output is zero (no keys to attend to).
+            return self.stream.alloc_zeros::<f32>(q_len).map_err(|err| {
+                RuntimeError::context("allocating decode_attention_dev output", err)
+            });
+        }
+        if reps == 0 {
+            return Err(RuntimeError::usage(
+                "decode_attention_dev requires reps >= 1 (num_kv heads > 0)".to_string(),
+            ));
+        }
+        if q_len > u32::MAX as usize
+            || kv_len > u32::MAX as usize
+            || score_len > u32::MAX as usize
+            || num_q > u32::MAX as usize
+            || head_dim > u32::MAX as usize
+            || kv_dim > u32::MAX as usize
+            || total_len > u32::MAX as usize
+        {
+            return Err(RuntimeError::usage(format!(
+                "decode_attention_dev shape (num_q={num_q}, head_dim={head_dim}, kv_dim={kv_dim}, total_len={total_len}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+
         let mut out_dev = self
             .stream
             .alloc_zeros::<f32>(q_len)
-            .map_err(|err| RuntimeError::context("allocating decode_attention output", err))?;
+            .map_err(|err| RuntimeError::context("allocating decode_attention_dev output", err))?;
 
         let threads = DECODE_ATTENTION_KERNEL.geometry.threads_per_group[0];
         let cfg = LaunchConfig {
@@ -1254,10 +1352,10 @@ impl CudaRuntime {
         let total_len_u = total_len as u32;
         let mut launch_args = self.stream.launch_builder(&self.decode_attention);
         launch_args
-            .arg(&q_dev)
-            .arg(&k_dev)
-            .arg(&v_dev)
-            .arg(&mut scores_dev)
+            .arg(q_dev)
+            .arg(k_dev)
+            .arg(v_dev)
+            .arg(scores_dev)
             .arg(&mut out_dev)
             .arg(&scale)
             .arg(&softcap_val)
@@ -1267,18 +1365,10 @@ impl CudaRuntime {
             .arg(&kv_dim_u)
             .arg(&reps_u)
             .arg(&total_len_u);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA decode_attention kernel", err))?;
-        self.stream
-            .synchronize()
-            .map_err(|err| RuntimeError::context("synchronizing decode_attention stream", err))?;
-        let host_out = self
-            .stream
-            .clone_dtoh(&out_dev)
-            .map_err(|err| RuntimeError::context("reading decode_attention output", err))?;
-        out.clear();
-        out.extend_from_slice(&host_out);
-        Ok(())
+        unsafe { launch_args.launch(cfg) }.map_err(|err| {
+            RuntimeError::context("launching CUDA decode_attention_dev kernel", err)
+        })?;
+        Ok(out_dev)
     }
 
     /// Native fused prefill (seq×seq) causal GQA attention — the device twin
@@ -1467,6 +1557,19 @@ impl CudaRuntime {
         self.stream
             .clone_htod(x)
             .map_err(|err| RuntimeError::context("uploading activation to CUDA", err))
+    }
+
+    /// Allocate a zero-initialised device-resident f32 buffer of length `n`
+    /// with NO host→device transfer. Used for kernel-write-only scratch (e.g.
+    /// the decode-attention `scores` buffer, which the kernel fills during the
+    /// softmax pass) so the chain pays a device-local allocation instead of a
+    /// host `Vec` alloc + htod of zeros on every call. Mirrors the per-launch
+    /// `self.stream.alloc_zeros::<f32>(n)` discipline; exposed so the pipeline
+    /// (which can't reach the private `stream`) can use it from a device chain.
+    pub(crate) fn alloc_zeros_f32(&self, n: usize) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.stream.alloc_zeros::<f32>(n).map_err(|err| {
+            RuntimeError::context("allocating zeroed CUDA device scratch buffer", err)
+        })
     }
 
     /// Upload an f64 array (e.g. a RoPE `inv_freq` table) to the device once,
