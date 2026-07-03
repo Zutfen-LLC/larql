@@ -1113,6 +1113,195 @@ mod tests {
             .is_none());
     }
 
+    // ── decode-path device-resident FFN chain (Session 21) ──────────────
+
+    /// Build a synthetic `[1, hidden]` residual input from the small Q4_K
+    /// fixture's embed step (one token). The decode FFN device chain reads
+    /// `h_post_attn` (the post-attention residual) directly.
+    fn decode_residual_input(weights: &larql_models::ModelWeights) -> Vec<f32> {
+        let (x, _seq, _hidden) = prefill_input(weights, &[0u32]);
+        x
+    }
+
+    /// Scaffold path (no CUDA runtime): the device-resident decode FFN chain
+    /// ([`CudaBackend::host_ffn_block_device`]) returns `None` so the
+    /// dispatcher falls through to the host-orchestrated path, and that path
+    /// matches the explicit host-only reference. The small fixture's
+    /// `inter` (256) is below the activation gate, so the device chain bails
+    /// on every host regardless of runtime — the dispatch↔hostonly match is
+    /// therefore valid everywhere. Runs on every host.
+    #[test]
+    fn decode_device_ffn_chain_bails_on_scaffold() {
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        let inter = index.num_features(0);
+        let x = decode_residual_input(&weights);
+        let h_post_attn = Array2::from_shape_vec((1, hidden), x).unwrap();
+        let layer = &layers[0];
+
+        let device_out = b.host_ffn_block_device(layer, &h_post_attn, hidden, inter);
+        // On the small fixture the device chain bails on every host (gate +
+        // scaffold), so this holds unconditionally.
+        assert!(
+            device_out.is_none(),
+            "device decode chain must bail below the activation gate / without a runtime"
+        );
+
+        // The dispatcher falls through to the host-only path; it must match
+        // the explicit host-only reference exactly (same code path).
+        let via_dispatch = b.host_ffn_block(layer, &h_post_attn, hidden, inter);
+        let via_hostonly = b.host_ffn_block_hostonly(layer, &h_post_attn, hidden, inter);
+        match (via_dispatch, via_hostonly) {
+            (Some(d), Some(h)) => assert_eq!(d.as_slice().unwrap(), h.as_slice().unwrap()),
+            (a, b2) => panic!("dispatch/hostonly disagreed: {a:?} vs {b2:?}"),
+        }
+    }
+
+    /// The device-resident decode FFN chain must match the host-orchestrated
+    /// reference when a runtime is present AND the work clears the activation
+    /// gate (`inter >= ACTIVATION_NATIVE_MIN_ELEMS`). The small fixtures cap
+    /// `inter` at 256, so this builds a synthetic large Q4_K FFN
+    /// (`hidden=256, inter=8192`) with a deterministic LCG ramp. Runtime-gated.
+    #[test]
+    fn decode_device_ffn_chain_matches_host_when_runtime_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let hidden: usize = 256;
+        let inter: usize = 8192;
+        let layer = build_large_q4k_ffn_layer(hidden, inter);
+        let h_post_attn = Array2::from_shape_vec((1, hidden), vec![0.5f32; hidden]).unwrap();
+
+        let device_out = b
+            .host_ffn_block_device(&layer, &h_post_attn, hidden, inter)
+            .expect("device decode chain should run with a runtime on a gate-clearing fixture");
+        let host_out = b
+            .host_ffn_block_hostonly(&layer, &h_post_attn, hidden, inter)
+            .expect("host-only path should always run");
+
+        assert_eq!(device_out.shape(), host_out.shape());
+        let max_abs = device_out
+            .iter()
+            .zip(host_out.iter())
+            .map(|(d, h)| (d - h).abs())
+            .fold(0.0f32, f32::max);
+        // Tolerance accommodates the activation-libm divergence amplified by
+        // the down matvec; a wiring bug would diverge by O(1).
+        assert!(
+            max_abs < 1e-3,
+            "device-resident decode FFN chain diverged from host reference: max_abs={max_abs:.6e}"
+        );
+    }
+
+    /// The device-resident decode chain bails to `None` when the work is below
+    /// the activation gate (`inter < ACTIVATION_NATIVE_MIN_ELEMS`), regardless
+    /// of runtime availability — the host path is faster for small inputs.
+    /// Runs on every host.
+    #[test]
+    fn decode_device_ffn_chain_bails_below_activation_gate() {
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        let inter = index.num_features(0);
+        // inter (256) is well below the 8192 gate.
+        let x = decode_residual_input(&weights);
+        let h_post_attn = Array2::from_shape_vec((1, hidden), x).unwrap();
+        let layer = &layers[0];
+        assert!(b
+            .host_ffn_block_device(layer, &h_post_attn, hidden, inter)
+            .is_none());
+    }
+
+    /// Build a synthetic large Q4_K FFN `FullPipelineLayer` (`hidden=hidden`,
+    /// `inter=inter`) with deterministic LCG-ramp gate/up/down weights, leaked
+    /// to `'static` so the returned owned layer can borrow them. Test-only;
+    /// never runs in prod.
+    fn build_large_q4k_ffn_layer(
+        hidden: usize,
+        inter: usize,
+    ) -> larql_compute::FullPipelineLayer<'static> {
+        use larql_compute::{FfnType, NormType, QuantWeight};
+        assert!(hidden.is_multiple_of(256) && inter.is_multiple_of(256));
+        let lcg_f32 = |seed: u32, rows: usize, cols: usize| -> Vec<f32> {
+            let mut s = seed.wrapping_mul(2654435761);
+            (0..rows * cols)
+                .map(|_| {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((s >> 8) & 0xffff) as f32 / 65535.0
+                })
+                .collect()
+        };
+        let gate_f32 = lcg_f32(1, inter, hidden);
+        let up_f32 = lcg_f32(2, inter, hidden);
+        let down_f32 = lcg_f32(3, hidden, inter);
+        let gate: &'static [u8] = Box::leak(quantize_q4_k(&gate_f32).into_boxed_slice());
+        let up: &'static [u8] = Box::leak(quantize_q4_k(&up_f32).into_boxed_slice());
+        let down: &'static [u8] = Box::leak(quantize_q4_k(&down_f32).into_boxed_slice());
+        let norm_w: &'static [f32] = Box::leak(vec![1.0f32; hidden].into_boxed_slice());
+        let empty_qw = QuantWeight {
+            data: &[],
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
+        let qw = |d: &'static [u8]| QuantWeight {
+            data: d,
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
+        larql_compute::FullPipelineLayer {
+            wq: empty_qw,
+            wk: empty_qw,
+            wv: empty_qw,
+            wo: empty_qw,
+            gate: qw(gate),
+            up: qw(up),
+            down: qw(down),
+            input_norm: norm_w,
+            post_attn_norm: norm_w,
+            pre_ffn_norm: Some(norm_w),
+            post_ffn_norm: Some(norm_w),
+            input_norm_bias: None,
+            post_attn_norm_bias: None,
+            norm_offset: 0.0,
+            qk_norm_offset: 0.0,
+            eps: 1e-6,
+            has_post_norms: true,
+            norm_type: NormType::RmsNorm,
+            ffn_type: FfnType::Gated,
+            activation: larql_compute::Activation::Silu,
+            attn_scale: 0.0,
+            head_dim: hidden,
+            num_q_heads: 0,
+            num_kv_heads: 0,
+            rope_base: 10000.0,
+            rope_position_divisor: 1.0,
+            rope_llama3_scaling: None,
+            rotary_dim: 0,
+            sliding_window: 0,
+            has_v_norm: false,
+            layer_scalar: 0.0,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+            moe: None,
+            ffn_is_remote: false,
+            moe_combined_output_norm: false,
+            moe_outer_post_norm: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
+            kv_shared_source: None,
+            residual_multiplier: 1.0,
+        }
+    }
+
     /// Scaled-RoPE prefill parity: CUDA's `prefill_kquant` vs the CPU direct
     /// path on the Gemma-3 rope-scaled fixture (linear factor 8 → position
     /// divisor 8 on global layers). Locks the `rope_position_divisor` /

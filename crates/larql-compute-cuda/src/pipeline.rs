@@ -502,7 +502,7 @@ impl CudaBackend {
         )?;
         let out = Array2::from_shape_vec((seq_len, hidden), down_vec).ok()?;
 
-        Some(self.apply_post_ffn_residual_prefill(layer, h_post_attn, &out))
+        Some(self.apply_post_ffn_residual(layer, h_post_attn, &out))
     }
 
     /// Device-resident prefill FFN chain: pre-ffn norm (host) → gate/up matmul
@@ -641,15 +641,18 @@ impl CudaBackend {
             return None;
         }
         let out = Array2::from_shape_vec((seq_len, hidden), down_vec).ok()?;
-        Some(self.apply_post_ffn_residual_prefill(layer, h_post_attn, &out))
+        Some(self.apply_post_ffn_residual(layer, h_post_attn, &out))
     }
 
-    /// Post-FFN norm + residual for the prefill block, shared by the
-    /// host-orchestrated and device-resident paths so the two can't drift.
-    /// When `has_post_norms`, normalise `out` with `post_ffn_norm` (or the
+    /// Post-FFN norm + residual, shared by every decode/prefill
+    /// host-orchestrated and device-resident FFN block so they can't drift.
+    /// `out` may be `[1, hidden]` (decode) or `[seq, hidden]` (prefill) — both
+    /// route through `norm_2d` (the per-row `norm_1d` is itself a delegate to
+    /// `norm_2d`, so a single entry point is correct for both shapes). When
+    /// `has_post_norms`, normalise `out` with `post_ffn_norm` (or the
     /// no-weight path when absent) before the scaled residual add; otherwise
     /// add `out` straight onto `h_post_attn`.
-    fn apply_post_ffn_residual_prefill(
+    fn apply_post_ffn_residual(
         &self,
         layer: &FullPipelineLayer<'_>,
         h_post_attn: &Array2<f32>,
@@ -844,8 +847,32 @@ impl CudaBackend {
     }
 
     /// One FFN block: pre-ffn norm → gate/up proj → activation → down proj →
-    /// post-ffn residual.
+    /// post-ffn residual. Tries the device-resident chain first
+    /// ([`host_ffn_block_device`], which keeps the gate/up/activation/down
+    /// activations on the device across the whole chain and reads back exactly
+    /// once); falls back to the host-orchestrated path
+    /// ([`host_ffn_block_hostonly`]) when the device path is unavailable or
+    /// the layer features aren't supported.
     pub(crate) fn host_ffn_block(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn: &Array2<f32>,
+        hidden: usize,
+        inter: usize,
+    ) -> Option<Array2<f32>> {
+        if let Some(out) = self.host_ffn_block_device(layer, h_post_attn, hidden, inter) {
+            return Some(out);
+        }
+        self.host_ffn_block_hostonly(layer, h_post_attn, hidden, inter)
+    }
+
+    /// Decode FFN block, host-orchestrated reference path: pre-ffn norm →
+    /// gate/up proj → activation → down proj → post-ffn residual. Each
+    /// projection is a separate htod/launch/dtoh round-trip (the elementwise
+    /// ops run on host). This is the parity oracle for the device-resident
+    /// chain ([`host_ffn_block_device`]) and the fallback when the device path
+    /// bails.
+    pub(crate) fn host_ffn_block_hostonly(
         &self,
         layer: &FullPipelineLayer<'_>,
         h_post_attn: &Array2<f32>,
@@ -912,19 +939,137 @@ impl CudaBackend {
         )?;
         let out = vec_to_2d_row(down_vec);
 
-        // Post-FFN residual (+ optional post-ffn norm).
-        let res_mult = layer.residual_multiplier;
-        let h_post_ffn = if layer.has_post_norms {
-            let norm_w = layer.post_ffn_norm;
-            let normed = match norm_w {
-                Some(w) => self.norm_1d(layer.norm_type, &out, w, layer.norm_offset, layer.eps),
-                None => self.norm_2d_no_weight(&out, layer.norm_offset, layer.eps),
-            };
-            self.add_residual_native(h_post_attn, &normed, res_mult)
+        // Post-FFN residual (+ optional post-ffn norm) — shared with the
+        // device-resident path via `apply_post_ffn_residual`.
+        Some(self.apply_post_ffn_residual(layer, h_post_attn, &out))
+    }
+
+    /// Device-resident decode FFN chain: pre-ffn norm (host) → gate/up matvec
+    /// → activation → down matvec (all on the device, chained via
+    /// device-resident buffers) → single `sync_dtoh` readback → post-ffn norm
+    /// + residual (host).
+    ///
+    /// The decode twin of [`host_prefill_ffn_block_device`]: it collapses the
+    /// per-projection round-trips the host-orchestrated path pays between the
+    /// gate/up matvecs, the activation, and the down matvec. Instead of 3
+    /// separate htod(input)+dtoh(output) cycles the chain uploads the normed
+    /// input once, chains four kernels on the same CUDA stream (stream-ordered,
+    /// so no inter-kernel sync), and reads the `[hidden]` down output back
+    /// exactly once. The norm + post-ffn residual stay on the host (the
+    /// residual needs `h_post_attn`, which is host-resident from the attention
+    /// block; threading it onto the device too is a later collapse slice).
+    ///
+    /// Returns `None` (caller falls back to the host-only path) when: no
+    /// runtime; the work is below the activation gate (`inter <
+    /// ACTIVATION_NATIVE_MIN_ELEMS`); the gate/up/down formats aren't
+    /// Q4_K/Q6_K; the down matrix's stored width is padded beyond `inter; the
+    /// input isn't a contiguous `[1, hidden]` row; or the activation/ffn-type
+    /// combination isn't one of the native kernels. `Err` from any chained
+    /// launch also maps to `None` (the host path is the documented fallback).
+    pub(crate) fn host_ffn_block_device(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn: &Array2<f32>,
+        hidden: usize,
+        inter: usize,
+    ) -> Option<Array2<f32>> {
+        let runtime = self.runtime()?;
+        // Decode is a single token: the work is `inter` (the gate/up/down
+        // contraction width). Below the activation gate the host path is
+        // faster (no fusion benefit, only transfer+sync overhead) — mirrors
+        // the other `*_NATIVE_MIN_ELEMS` gates and the prefill device chain.
+        if !Self::native_activation_worthwhile(inter) {
+            return None;
+        }
+        // All three FFN projections must be a k-quant the device matvec handles.
+        let gate_fmt = layer.gate.format;
+        let up_fmt = layer.up.format;
+        let down_fmt = layer.down.format;
+        if !matches!(
+            (gate_fmt, up_fmt, down_fmt),
+            (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K)
+                | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
+        ) {
+            return None;
+        }
+        // The down matvec must contract exactly `inter` columns — a padded
+        // stored width would need a device-side zero-pad step the chain
+        // doesn't perform, so bail to the host path (which pads on host).
+        let stored_cols = down_stored_cols(layer, hidden, inter)?;
+        if stored_cols != inter {
+            return None;
+        }
+        // The norm path needs a contiguous `[1, hidden]` input to slice.
+        if h_post_attn.shape() != [1, hidden] {
+            return None;
+        }
+
+        // Pre-FFN norm on the host (the norm weight is f32; threading it onto
+        // the device + chaining norm→gate/up is the next collapse slice).
+        let pre_norm_w = if layer.has_post_norms {
+            layer.pre_ffn_norm
         } else {
-            self.add_residual_native(h_post_attn, &out, res_mult)
+            Some(layer.post_attn_norm)
         };
-        Some(h_post_ffn)
+        let h_in = match pre_norm_w {
+            Some(w) => self.norm_1d(
+                layer.norm_type,
+                h_post_attn,
+                w,
+                layer.norm_offset,
+                layer.eps,
+            ),
+            None => self.norm_2d_no_weight(h_post_attn, layer.norm_offset, layer.eps),
+        };
+        let h_in_slice = h_in.as_slice()?;
+
+        // Drive the device chain. Any launch error maps to `None` so the
+        // caller falls back to the host-orchestrated path (the documented
+        // contract for every native dispatch in this backend).
+        let down_vec: Vec<f32> = {
+            let x_dev = runtime.upload_f32(h_in_slice).ok()?;
+            let gate_dev =
+                matvec_dev_by_fmt(runtime, gate_fmt, layer.gate.data, &x_dev, inter, hidden)
+                    .ok()?;
+            let up_dev =
+                matvec_dev_by_fmt(runtime, up_fmt, layer.up.data, &x_dev, inter, hidden).ok()?;
+            let act_dev = match layer.ffn_type {
+                larql_compute::FfnType::Gated => match layer.activation {
+                    Activation::Silu => runtime
+                        .launch_geglu_silu_dev(&gate_dev, &up_dev, inter)
+                        .ok()?,
+                    Activation::GeluTanh => runtime
+                        .launch_geglu_gelu_tanh_dev(&gate_dev, &up_dev, inter)
+                        .ok()?,
+                    _ => return None,
+                },
+                larql_compute::FfnType::Standard => match layer.activation {
+                    Activation::Silu => runtime.launch_activation_silu_dev(&up_dev, inter).ok()?,
+                    Activation::GeluTanh => runtime
+                        .launch_activation_gelu_tanh_dev(&up_dev, inter)
+                        .ok()?,
+                    _ => return None,
+                },
+            };
+            let down_dev = matvec_dev_by_fmt(
+                runtime,
+                down_fmt,
+                layer.down.data,
+                &act_dev,
+                hidden,
+                stored_cols,
+            )
+            .ok()?;
+            runtime.sync_dtoh_f32(&down_dev).ok()?
+        };
+        if down_vec.len() != hidden {
+            return None;
+        }
+        let out = vec_to_2d_row(down_vec);
+
+        // Post-FFN norm + residual on the host — shared with the host-only
+        // path via `apply_post_ffn_residual` so the two can't drift.
+        Some(self.apply_post_ffn_residual(layer, h_post_attn, &out))
     }
 
     /// Hybrid-MoE FFN block for a single decode token (Gemma 4 26B-A4B
@@ -1763,6 +1908,30 @@ fn matmul_dev_by_fmt(
 // `HostKv` is held under a `Mutex` on `CudaBackend`; re-export the type alias
 // for the backend module.
 pub(crate) type HostKvType = HostKv;
+
+/// Device-resident quant matvec dispatch by quant format: Q4_K →
+/// `launch_q4k_matvec_dev`, Q6_K → `launch_q6k_matvec_dev`. The decode twin
+/// of [`matmul_dev_by_fmt`]: used by the device-resident decode FFN chain so
+/// the gate/up/down projections share one upload of the input and keep their
+/// outputs on the device. `None` (as `Err`) for other formats — the chain's
+/// gate condition rejects them before reaching here, but the exhaustive match
+/// keeps a future format loud rather than silently skipping a projection.
+fn matvec_dev_by_fmt(
+    runtime: &crate::backend::CudaRuntime,
+    format: QuantFormat,
+    weights: &[u8],
+    x_dev: &cudarc::driver::CudaSlice<f32>,
+    num_rows: usize,
+    hidden: usize,
+) -> Result<cudarc::driver::CudaSlice<f32>, crate::backend::RuntimeError> {
+    match format {
+        QuantFormat::Q4_K => runtime.launch_q4k_matvec_dev(weights, x_dev, num_rows, hidden),
+        QuantFormat::Q6_K => runtime.launch_q6k_matvec_dev(weights, x_dev, num_rows, hidden),
+        _ => Err(crate::backend::RuntimeError::usage(format!(
+            "matvec_dev_by_fmt: unsupported device-chain format {format:?}"
+        ))),
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -329,66 +329,23 @@ impl CudaRuntime {
         num_rows: usize,
         hidden: usize,
     ) -> Result<Vec<f32>, RuntimeError> {
+        // Delegate to the device-resident variant so the shape validation,
+        // weight-cache upload, and kernel-arg layout live in exactly one
+        // place — the fused device-resident decode FFN chain and this
+        // host-readback path share a single launch implementation and can't
+        // drift on arg order (a drift would be silent UB in the unsafe
+        // launch). Mirrors `launch_q4k_matmul`'s delegation pattern.
+        //
+        // Short-circuit the degenerate shape before touching the device:
+        // cudarc rejects empty `clone_htod`/`alloc_zeros` (see the rms_norm
+        // placeholder workaround), and the original host launcher returned
+        // `Ok(vec![])` here with no device work — preserve that contract.
         if num_rows == 0 {
             return Ok(Vec::new());
         }
-        if x.len() != hidden {
-            return Err(RuntimeError::usage(format!(
-                "q4k_matvec expected x.len() == hidden ({hidden}), got {}",
-                x.len()
-            )));
-        }
-        if !hidden.is_multiple_of(256) {
-            return Err(RuntimeError::usage(format!(
-                "q4k_matvec hidden size must be a multiple of 256, got {hidden}"
-            )));
-        }
-
-        let expected_bytes = num_rows
-            .checked_mul(hidden / 256)
-            .and_then(|blocks| blocks.checked_mul(144))
-            .ok_or_else(|| RuntimeError::usage("q4k_matvec byte-size overflow".to_string()))?;
-        if q4k_data.len() != expected_bytes {
-            return Err(RuntimeError::usage(format!(
-                "q4k_matvec expected {expected_bytes} Q4_K bytes for shape ({num_rows}, {hidden}), got {}",
-                q4k_data.len()
-            )));
-        }
-
-        let w_dev = self
-            .weight_cache
-            .get_or_upload_bytes(&self.stream, q4k_data)
-            .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))?;
-        let x_dev = self
-            .stream
-            .clone_htod(x)
-            .map_err(|err| RuntimeError::context("uploading activation vector to CUDA", err))?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
-            RuntimeError::context("allocating CUDA q4k_matvec output buffer", err)
-        })?;
-        let threads_x = Q4K_MATVEC_KERNEL.geometry.threads_per_group[0];
-        let n = num_rows as u32;
-        let k = hidden as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (n.div_ceil(threads_x), 1, 1),
-            block_dim: (threads_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch_args = self.stream.launch_builder(&self.q4k_matvec);
-        launch_args
-            .arg(&*w_dev)
-            .arg(&x_dev)
-            .arg(&mut out_dev)
-            .arg(&n)
-            .arg(&k);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA q4k_matvec kernel", err))?;
-        self.stream
-            .synchronize()
-            .map_err(|err| RuntimeError::context("synchronizing CUDA q4k_matvec stream", err))?;
-        self.stream
-            .clone_dtoh(&out_dev)
-            .map_err(|err| RuntimeError::context("reading CUDA q4k_matvec output", err))
+        let x_dev = self.upload_f32(x)?;
+        let out_dev = self.launch_q4k_matvec_dev(q4k_data, &x_dev, num_rows, hidden)?;
+        self.sync_dtoh_f32(&out_dev)
     }
 
     pub(crate) fn launch_q6k_matvec(
@@ -398,67 +355,14 @@ impl CudaRuntime {
         num_rows: usize,
         hidden: usize,
     ) -> Result<Vec<f32>, RuntimeError> {
+        // Delegate to the device-resident variant — see `launch_q4k_matvec`
+        // for the single-source rationale + the zero-shape short-circuit.
         if num_rows == 0 {
             return Ok(Vec::new());
         }
-        if x.len() != hidden {
-            return Err(RuntimeError::usage(format!(
-                "q6k_matvec expected x.len() == hidden ({hidden}), got {}",
-                x.len()
-            )));
-        }
-        if !hidden.is_multiple_of(256) {
-            return Err(RuntimeError::usage(format!(
-                "q6k_matvec hidden size must be a multiple of 256, got {hidden}"
-            )));
-        }
-
-        // Q6_K super-block = 210 bytes / 256 elements.
-        let expected_bytes = num_rows
-            .checked_mul(hidden / 256)
-            .and_then(|blocks| blocks.checked_mul(210))
-            .ok_or_else(|| RuntimeError::usage("q6k_matvec byte-size overflow".to_string()))?;
-        if q6k_data.len() != expected_bytes {
-            return Err(RuntimeError::usage(format!(
-                "q6k_matvec expected {expected_bytes} Q6_K bytes for shape ({num_rows}, {hidden}), got {}",
-                q6k_data.len()
-            )));
-        }
-
-        let w_dev = self
-            .weight_cache
-            .get_or_upload_bytes(&self.stream, q6k_data)
-            .map_err(|err| RuntimeError::context("uploading Q6_K weights to CUDA", err))?;
-        let x_dev = self
-            .stream
-            .clone_htod(x)
-            .map_err(|err| RuntimeError::context("uploading activation vector to CUDA", err))?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
-            RuntimeError::context("allocating CUDA q6k_matvec output buffer", err)
-        })?;
-        let threads_x = Q6K_MATVEC_KERNEL.geometry.threads_per_group[0];
-        let n = num_rows as u32;
-        let k = hidden as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (n.div_ceil(threads_x), 1, 1),
-            block_dim: (threads_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch_args = self.stream.launch_builder(&self.q6k_matvec);
-        launch_args
-            .arg(&*w_dev)
-            .arg(&x_dev)
-            .arg(&mut out_dev)
-            .arg(&n)
-            .arg(&k);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA q6k_matvec kernel", err))?;
-        self.stream
-            .synchronize()
-            .map_err(|err| RuntimeError::context("synchronizing CUDA q6k_matvec stream", err))?;
-        self.stream
-            .clone_dtoh(&out_dev)
-            .map_err(|err| RuntimeError::context("reading CUDA q6k_matvec output", err))
+        let x_dev = self.upload_f32(x)?;
+        let out_dev = self.launch_q6k_matvec_dev(q6k_data, &x_dev, num_rows, hidden)?;
+        self.sync_dtoh_f32(&out_dev)
     }
 
     pub(crate) fn launch_q4k_matmul(
@@ -1878,6 +1782,135 @@ impl CudaRuntime {
             .arg(&seq);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context("launching CUDA q6k_matmul_dev kernel", err))?;
+        Ok(out_dev)
+    }
+
+    /// Q4_K × f32 matvec, device-resident: `x_dev` is the already-uploaded
+    /// `[hidden]` input; returns the `[num_rows]` output as a device buffer
+    /// (no sync, no readback). Mirrors `launch_q4k_matvec`'s shape validation
+    /// (the weight byte layout must be checked both for safety and because the
+    /// weight-cache key is `(ptr, len)`), but skips the input upload + output
+    /// readback. The decode FFN device chain chains gate/up/down matvecs
+    /// through this so an N-matvec chain pays one upload + one readback.
+    pub(crate) fn launch_q4k_matvec_dev(
+        &self,
+        q4k_data: &[u8],
+        x_dev: &CudaSlice<f32>,
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        if num_rows == 0 {
+            return self.stream.alloc_zeros::<f32>(0).map_err(|err| {
+                RuntimeError::context("allocating CUDA q4k_matvec_dev output", err)
+            });
+        }
+        if x_dev.len() != hidden {
+            return Err(RuntimeError::usage(format!(
+                "q4k_matvec_dev expected x_dev.len() == hidden ({hidden}), got {}",
+                x_dev.len()
+            )));
+        }
+        if !hidden.is_multiple_of(256) {
+            return Err(RuntimeError::usage(format!(
+                "q4k_matvec_dev hidden size must be a multiple of 256, got {hidden}"
+            )));
+        }
+        let expected_bytes = num_rows
+            .checked_mul(hidden / 256)
+            .and_then(|blocks| blocks.checked_mul(144))
+            .ok_or_else(|| RuntimeError::usage("q4k_matvec_dev byte-size overflow".to_string()))?;
+        if q4k_data.len() != expected_bytes {
+            return Err(RuntimeError::usage(format!(
+                "q4k_matvec_dev expected {expected_bytes} Q4_K bytes for shape ({num_rows}, {hidden}), got {}",
+                q4k_data.len()
+            )));
+        }
+        let w_dev = self
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q4k_data)
+            .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
+            RuntimeError::context("allocating CUDA q4k_matvec_dev output buffer", err)
+        })?;
+        let threads_x = Q4K_MATVEC_KERNEL.geometry.threads_per_group[0];
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.q4k_matvec);
+        launch_args
+            .arg(&*w_dev)
+            .arg(x_dev)
+            .arg(&mut out_dev)
+            .arg(&n)
+            .arg(&k);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA q4k_matvec_dev kernel", err))?;
+        Ok(out_dev)
+    }
+
+    /// Q6_K × f32 matvec, device-resident twin of [`launch_q4k_matvec_dev`].
+    pub(crate) fn launch_q6k_matvec_dev(
+        &self,
+        q6k_data: &[u8],
+        x_dev: &CudaSlice<f32>,
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        if num_rows == 0 {
+            return self.stream.alloc_zeros::<f32>(0).map_err(|err| {
+                RuntimeError::context("allocating CUDA q6k_matvec_dev output", err)
+            });
+        }
+        if x_dev.len() != hidden {
+            return Err(RuntimeError::usage(format!(
+                "q6k_matvec_dev expected x_dev.len() == hidden ({hidden}), got {}",
+                x_dev.len()
+            )));
+        }
+        if !hidden.is_multiple_of(256) {
+            return Err(RuntimeError::usage(format!(
+                "q6k_matvec_dev hidden size must be a multiple of 256, got {hidden}"
+            )));
+        }
+        // Q6_K super-block = 210 bytes / 256 elements.
+        let expected_bytes = num_rows
+            .checked_mul(hidden / 256)
+            .and_then(|blocks| blocks.checked_mul(210))
+            .ok_or_else(|| RuntimeError::usage("q6k_matvec_dev byte-size overflow".to_string()))?;
+        if q6k_data.len() != expected_bytes {
+            return Err(RuntimeError::usage(format!(
+                "q6k_matvec_dev expected {expected_bytes} Q6_K bytes for shape ({num_rows}, {hidden}), got {}",
+                q6k_data.len()
+            )));
+        }
+        let w_dev = self
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q6k_data)
+            .map_err(|err| RuntimeError::context("uploading Q6_K weights to CUDA", err))?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
+            RuntimeError::context("allocating CUDA q6k_matvec_dev output buffer", err)
+        })?;
+        let threads_x = Q6K_MATVEC_KERNEL.geometry.threads_per_group[0];
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.q6k_matvec);
+        launch_args
+            .arg(&*w_dev)
+            .arg(x_dev)
+            .arg(&mut out_dev)
+            .arg(&n)
+            .arg(&k);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA q6k_matvec_dev kernel", err))?;
         Ok(out_dev)
     }
 
