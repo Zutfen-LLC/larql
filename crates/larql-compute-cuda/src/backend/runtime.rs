@@ -469,74 +469,22 @@ impl CudaRuntime {
         hidden: usize,
         seq_len: usize,
     ) -> Result<Vec<f32>, RuntimeError> {
+        // Delegate to the device-resident variant so the shape validation,
+        // weight-cache upload, and kernel-arg layout live in exactly one
+        // place. The fused device-resident chain and this host-readback path
+        // therefore share a single launch implementation and can't drift on
+        // arg order (a drift would be silent UB in the unsafe launch).
+        //
+        // Short-circuit the degenerate shape before touching the device:
+        // cudarc rejects empty `clone_htod`/`alloc_zeros` (see the rms_norm
+        // placeholder workaround), and the original host launcher returned
+        // `Ok(vec![])` here with no device work — preserve that contract.
         if num_rows == 0 || seq_len == 0 {
-            return Ok(vec![0.0f32; seq_len * num_rows]);
+            return Ok(Vec::new());
         }
-        if x.len() != seq_len * hidden {
-            return Err(RuntimeError::usage(format!(
-                "q4k_matmul expected x.len() == seq*hidden ({}, {}), got {}",
-                seq_len * hidden,
-                hidden,
-                x.len()
-            )));
-        }
-        if !hidden.is_multiple_of(256) {
-            return Err(RuntimeError::usage(format!(
-                "q4k_matmul hidden size must be a multiple of 256, got {hidden}"
-            )));
-        }
-
-        let expected_bytes = num_rows
-            .checked_mul(hidden / 256)
-            .and_then(|blocks| blocks.checked_mul(144))
-            .ok_or_else(|| RuntimeError::usage("q4k_matmul byte-size overflow".to_string()))?;
-        if q4k_data.len() != expected_bytes {
-            return Err(RuntimeError::usage(format!(
-                "q4k_matmul expected {expected_bytes} Q4_K bytes for shape ({num_rows}, {hidden}), got {}",
-                q4k_data.len()
-            )));
-        }
-
-        let w_dev = self
-            .weight_cache
-            .get_or_upload_bytes(&self.stream, q4k_data)
-            .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))?;
-        let x_dev = self
-            .stream
-            .clone_htod(x)
-            .map_err(|err| RuntimeError::context("uploading activations to CUDA", err))?;
-        // Output is [seq, rows] row-major.
-        let out_len = seq_len * num_rows;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(out_len).map_err(|err| {
-            RuntimeError::context("allocating CUDA q4k_matmul output buffer", err)
-        })?;
-        let threads_x = Q4K_MATMUL_KERNEL.geometry.threads_per_group[0];
-        // One thread per (row, seq) pair.
-        let tiles = (num_rows * seq_len) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (tiles.div_ceil(threads_x), 1, 1),
-            block_dim: (threads_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let n = num_rows as u32;
-        let k = hidden as u32;
-        let seq = seq_len as u32;
-        let mut launch_args = self.stream.launch_builder(&self.q4k_matmul);
-        launch_args
-            .arg(&*w_dev)
-            .arg(&x_dev)
-            .arg(&mut out_dev)
-            .arg(&n)
-            .arg(&k)
-            .arg(&seq);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA q4k_matmul kernel", err))?;
-        self.stream
-            .synchronize()
-            .map_err(|err| RuntimeError::context("synchronizing CUDA q4k_matmul stream", err))?;
-        self.stream
-            .clone_dtoh(&out_dev)
-            .map_err(|err| RuntimeError::context("reading CUDA q4k_matmul output", err))
+        let x_dev = self.upload_f32(x)?;
+        let out_dev = self.launch_q4k_matmul_dev(q4k_data, &x_dev, num_rows, hidden, seq_len)?;
+        self.sync_dtoh_f32(&out_dev)
     }
 
     /// Amortised Q6_K × f32 matmul launch. Routed live through
@@ -550,74 +498,14 @@ impl CudaRuntime {
         hidden: usize,
         seq_len: usize,
     ) -> Result<Vec<f32>, RuntimeError> {
+        // Delegate to the device-resident variant — see `launch_q4k_matmul`
+        // for the single-source rationale + the zero-shape short-circuit.
         if num_rows == 0 || seq_len == 0 {
-            return Ok(vec![0.0f32; seq_len * num_rows]);
+            return Ok(Vec::new());
         }
-        if x.len() != seq_len * hidden {
-            return Err(RuntimeError::usage(format!(
-                "q6k_matmul expected x.len() == seq*hidden ({}, {}), got {}",
-                seq_len * hidden,
-                hidden,
-                x.len()
-            )));
-        }
-        if !hidden.is_multiple_of(256) {
-            return Err(RuntimeError::usage(format!(
-                "q6k_matmul hidden size must be a multiple of 256, got {hidden}"
-            )));
-        }
-
-        let expected_bytes = num_rows
-            .checked_mul(hidden / 256)
-            .and_then(|blocks| blocks.checked_mul(210))
-            .ok_or_else(|| RuntimeError::usage("q6k_matmul byte-size overflow".to_string()))?;
-        if q6k_data.len() != expected_bytes {
-            return Err(RuntimeError::usage(format!(
-                "q6k_matmul expected {expected_bytes} Q6_K bytes for shape ({num_rows}, {hidden}), got {}",
-                q6k_data.len()
-            )));
-        }
-
-        let w_dev = self
-            .weight_cache
-            .get_or_upload_bytes(&self.stream, q6k_data)
-            .map_err(|err| RuntimeError::context("uploading Q6_K weights to CUDA", err))?;
-        let x_dev = self
-            .stream
-            .clone_htod(x)
-            .map_err(|err| RuntimeError::context("uploading activations to CUDA", err))?;
-        // Output is [seq, rows] row-major.
-        let out_len = seq_len * num_rows;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(out_len).map_err(|err| {
-            RuntimeError::context("allocating CUDA q6k_matmul output buffer", err)
-        })?;
-        let threads_x = Q6K_MATMUL_KERNEL.geometry.threads_per_group[0];
-        // One thread per (row, seq) pair.
-        let tiles = (num_rows * seq_len) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (tiles.div_ceil(threads_x), 1, 1),
-            block_dim: (threads_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let n = num_rows as u32;
-        let k = hidden as u32;
-        let seq = seq_len as u32;
-        let mut launch_args = self.stream.launch_builder(&self.q6k_matmul);
-        launch_args
-            .arg(&*w_dev)
-            .arg(&x_dev)
-            .arg(&mut out_dev)
-            .arg(&n)
-            .arg(&k)
-            .arg(&seq);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA q6k_matmul kernel", err))?;
-        self.stream
-            .synchronize()
-            .map_err(|err| RuntimeError::context("synchronizing CUDA q6k_matmul stream", err))?;
-        self.stream
-            .clone_dtoh(&out_dev)
-            .map_err(|err| RuntimeError::context("reading CUDA q6k_matmul output", err))
+        let x_dev = self.upload_f32(x)?;
+        let out_dev = self.launch_q6k_matmul_dev(q6k_data, &x_dev, num_rows, hidden, seq_len)?;
+        self.sync_dtoh_f32(&out_dev)
     }
 
     pub(crate) fn launch_q4k_dual_matvec(
@@ -1743,14 +1631,11 @@ impl CudaRuntime {
                 out.len()
             )));
         }
-        // The element count is the only index; guard it against the 32-bit
-        // grid-dim limit (a single `unsigned int` `n` arg).
-        if n > u32::MAX as usize {
-            return Err(RuntimeError::usage(format!(
-                "{ctx} length {n} exceeds the 32-bit kernel index limit"
-            )));
-        }
-
+        // Validate the host slices before paying for the upload. The kernel-arg
+        // layout + LaunchConfig live in exactly one place
+        // (`launch_elementwise_binary_dev`) so this host-readback path and the
+        // device-resident chain share one launch implementation and can't
+        // drift on arg order (a drift would be silent UB in the unsafe launch).
         let a_dev = self
             .stream
             .clone_htod(in_a)
@@ -1759,29 +1644,8 @@ impl CudaRuntime {
             .stream
             .clone_htod(in_b)
             .map_err(|err| RuntimeError::context_concat("uploading ", ctx, " in_b to CUDA", err))?;
-        let mut out_dev = self
-            .stream
-            .alloc_zeros::<f32>(n)
-            .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
-        let threads_x = GEGGLU_SILU_KERNEL.geometry.threads_per_group[0];
-        let n_u = n as u32;
-        // Hold the optional scalar for the lifetime of `launch_args` — the
-        // builder borrows it across the (unsafe) launch, so it must outlive
-        // the launch rather than the `if let` block.
-        let extra = extra_scalar;
-        let cfg = LaunchConfig {
-            grid_dim: (n_u.div_ceil(threads_x), 1, 1),
-            block_dim: (threads_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch_args = self.stream.launch_builder(func);
-        launch_args.arg(&a_dev).arg(&b_dev).arg(&mut out_dev);
-        if let Some(ref scalar) = extra {
-            launch_args.arg(scalar);
-        }
-        launch_args.arg(&n_u);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
+        let out_dev =
+            self.launch_elementwise_binary_dev(func, &a_dev, &b_dev, extra_scalar, n, ctx)?;
         self.stream.synchronize().map_err(|err| {
             RuntimeError::context_concat("synchronizing CUDA ", ctx, " stream", err)
         })?;
@@ -1813,15 +1677,350 @@ impl CudaRuntime {
                 out.len()
             )));
         }
-        if n > u32::MAX as usize {
-            return Err(RuntimeError::usage(format!(
-                "{ctx} length {n} exceeds the 32-bit kernel index limit"
-            )));
-        }
-
+        // Delegate the launch to `launch_elementwise_unary_dev` so the
+        // kernel-arg layout is single-source — see
+        // `launch_elementwise_binary` for the rationale.
         let input_dev = self.stream.clone_htod(input).map_err(|err| {
             RuntimeError::context_concat("uploading ", ctx, " input to CUDA", err)
         })?;
+        let out_dev = self.launch_elementwise_unary_dev(func, &input_dev, n, ctx)?;
+        self.stream.synchronize().map_err(|err| {
+            RuntimeError::context_concat("synchronizing CUDA ", ctx, " stream", err)
+        })?;
+        let host_out = self
+            .stream
+            .clone_dtoh(&out_dev)
+            .map_err(|err| RuntimeError::context_concat("reading CUDA ", ctx, " output", err))?;
+        out.copy_from_slice(&host_out);
+        Ok(())
+    }
+
+    // ── device-resident launch variants ──────────────────────────────────
+    //
+    // These are the per-projection round-trip-collapse primitives. Unlike the
+    // launchers above, they take an input that is **already on the device**
+    // (`&CudaSlice<f32>`) and return a **device-resident** output
+    // (`CudaSlice<f32>`) — they do NOT upload the input, do NOT synchronize,
+    // and do NOT read the output back to the host. A caller chains several of
+    // these on the same stream (CUDA stream-ordered, so a kernel reading a
+    // buffer written by an earlier kernel on the same stream sees the data
+    // without a sync) and performs a single `sync_dtoh_f32` at the end of the
+    // chain. This collapses the per-projection htod(input) + dtoh(output)
+    // round-trips that the host-orchestrated pipeline pays between every
+    // sequential kernel. Weights still go through the persistent
+    // `weight_cache`; only transient activations stay resident across the
+    // chain (they are dropped once the chain's final `sync_dtoh_f32` returns).
+
+    /// Upload an f32 activation to the device once, returning a
+    /// device-resident handle. The chain caller holds this for the lifetime of
+    /// the chain (until the final `sync_dtoh_f32`).
+    pub(crate) fn upload_f32(&self, x: &[f32]) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.stream
+            .clone_htod(x)
+            .map_err(|err| RuntimeError::context("uploading activation to CUDA", err))
+    }
+
+    /// Synchronize the stream and read a device-resident f32 buffer back to the
+    /// host. The single sync + readback at the end of a device-resident chain
+    // — collapses one sync+dtoh per chained kernel into one for the whole
+    // chain.
+    pub(crate) fn sync_dtoh_f32(&self, dev: &CudaSlice<f32>) -> Result<Vec<f32>, RuntimeError> {
+        self.stream
+            .synchronize()
+            .map_err(|err| RuntimeError::context("synchronizing CUDA device chain stream", err))?;
+        self.stream
+            .clone_dtoh(dev)
+            .map_err(|err| RuntimeError::context("reading CUDA device chain output", err))
+    }
+
+    /// Amortised Q4_K × f32 matmul, device-resident: `x_dev` is the already-
+    /// uploaded `[seq, hidden]` input; returns the `[seq, num_rows]` output as
+    /// a device buffer (no sync, no readback). Mirrors `launch_q4k_matmul`'s
+    /// shape validation (the weight byte layout must be checked both for safety
+    /// and because the weight-cache key is `(ptr, len)`), but skips the input
+    /// upload + output readback.
+    pub(crate) fn launch_q4k_matmul_dev(
+        &self,
+        q4k_data: &[u8],
+        x_dev: &CudaSlice<f32>,
+        num_rows: usize,
+        hidden: usize,
+        seq_len: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        if num_rows == 0 || seq_len == 0 {
+            return self
+                .stream
+                .alloc_zeros::<f32>(seq_len * num_rows)
+                .map_err(|err| {
+                    RuntimeError::context("allocating CUDA q4k_matmul_dev output", err)
+                });
+        }
+        if x_dev.len() != seq_len * hidden {
+            return Err(RuntimeError::usage(format!(
+                "q4k_matmul_dev expected x_dev.len() == seq*hidden ({}, {}), got {}",
+                seq_len * hidden,
+                hidden,
+                x_dev.len()
+            )));
+        }
+        if !hidden.is_multiple_of(256) {
+            return Err(RuntimeError::usage(format!(
+                "q4k_matmul_dev hidden size must be a multiple of 256, got {hidden}"
+            )));
+        }
+        let expected_bytes = num_rows
+            .checked_mul(hidden / 256)
+            .and_then(|blocks| blocks.checked_mul(144))
+            .ok_or_else(|| RuntimeError::usage("q4k_matmul_dev byte-size overflow".to_string()))?;
+        if q4k_data.len() != expected_bytes {
+            return Err(RuntimeError::usage(format!(
+                "q4k_matmul_dev expected {expected_bytes} Q4_K bytes for shape ({num_rows}, {hidden}), got {}",
+                q4k_data.len()
+            )));
+        }
+        let w_dev = self
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q4k_data)
+            .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))?;
+        let out_len = seq_len * num_rows;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(out_len).map_err(|err| {
+            RuntimeError::context("allocating CUDA q4k_matmul_dev output buffer", err)
+        })?;
+        let threads_x = Q4K_MATMUL_KERNEL.geometry.threads_per_group[0];
+        let tiles = (num_rows * seq_len) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (tiles.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let seq = seq_len as u32;
+        let mut launch_args = self.stream.launch_builder(&self.q4k_matmul);
+        launch_args
+            .arg(&*w_dev)
+            .arg(x_dev)
+            .arg(&mut out_dev)
+            .arg(&n)
+            .arg(&k)
+            .arg(&seq);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA q4k_matmul_dev kernel", err))?;
+        Ok(out_dev)
+    }
+
+    /// Amortised Q6_K × f32 matmul, device-resident twin of
+    /// [`launch_q4k_matmul_dev`].
+    pub(crate) fn launch_q6k_matmul_dev(
+        &self,
+        q6k_data: &[u8],
+        x_dev: &CudaSlice<f32>,
+        num_rows: usize,
+        hidden: usize,
+        seq_len: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        if num_rows == 0 || seq_len == 0 {
+            return self
+                .stream
+                .alloc_zeros::<f32>(seq_len * num_rows)
+                .map_err(|err| {
+                    RuntimeError::context("allocating CUDA q6k_matmul_dev output", err)
+                });
+        }
+        if x_dev.len() != seq_len * hidden {
+            return Err(RuntimeError::usage(format!(
+                "q6k_matmul_dev expected x_dev.len() == seq*hidden ({}, {}), got {}",
+                seq_len * hidden,
+                hidden,
+                x_dev.len()
+            )));
+        }
+        if !hidden.is_multiple_of(256) {
+            return Err(RuntimeError::usage(format!(
+                "q6k_matmul_dev hidden size must be a multiple of 256, got {hidden}"
+            )));
+        }
+        let expected_bytes = num_rows
+            .checked_mul(hidden / 256)
+            .and_then(|blocks| blocks.checked_mul(210))
+            .ok_or_else(|| RuntimeError::usage("q6k_matmul_dev byte-size overflow".to_string()))?;
+        if q6k_data.len() != expected_bytes {
+            return Err(RuntimeError::usage(format!(
+                "q6k_matmul_dev expected {expected_bytes} Q6_K bytes for shape ({num_rows}, {hidden}), got {}",
+                q6k_data.len()
+            )));
+        }
+        let w_dev = self
+            .weight_cache
+            .get_or_upload_bytes(&self.stream, q6k_data)
+            .map_err(|err| RuntimeError::context("uploading Q6_K weights to CUDA", err))?;
+        let out_len = seq_len * num_rows;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(out_len).map_err(|err| {
+            RuntimeError::context("allocating CUDA q6k_matmul_dev output buffer", err)
+        })?;
+        let threads_x = Q6K_MATMUL_KERNEL.geometry.threads_per_group[0];
+        let tiles = (num_rows * seq_len) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (tiles.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n = num_rows as u32;
+        let k = hidden as u32;
+        let seq = seq_len as u32;
+        let mut launch_args = self.stream.launch_builder(&self.q6k_matmul);
+        launch_args
+            .arg(&*w_dev)
+            .arg(x_dev)
+            .arg(&mut out_dev)
+            .arg(&n)
+            .arg(&k)
+            .arg(&seq);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA q6k_matmul_dev kernel", err))?;
+        Ok(out_dev)
+    }
+
+    /// Device-resident GEGLU-SiLu: `out[i] = silu(gate[i]) * up[i]`. `gate_dev`
+    /// / `up_dev` are already-resident `n`-element buffers; returns the
+    /// `n`-element output as a device buffer (no sync, no readback).
+    pub(crate) fn launch_geglu_silu_dev(
+        &self,
+        gate_dev: &CudaSlice<f32>,
+        up_dev: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.launch_elementwise_binary_dev(
+            &self.geglu_silu,
+            gate_dev,
+            up_dev,
+            None,
+            n,
+            "geglu_silu",
+        )
+    }
+
+    /// Device-resident GEGLU-GELU-tanh twin of [`launch_geglu_silu_dev`].
+    pub(crate) fn launch_geglu_gelu_tanh_dev(
+        &self,
+        gate_dev: &CudaSlice<f32>,
+        up_dev: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.launch_elementwise_binary_dev(
+            &self.geglu_gelu_tanh,
+            gate_dev,
+            up_dev,
+            None,
+            n,
+            "geglu_gelu_tanh",
+        )
+    }
+
+    /// Device-resident standard SiLu: `out[i] = silu(x[i])`.
+    pub(crate) fn launch_activation_silu_dev(
+        &self,
+        input_dev: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.launch_elementwise_unary_dev(&self.activation_silu, input_dev, n, "activation_silu")
+    }
+
+    /// Device-resident standard GELU-tanh twin of
+    /// [`launch_activation_silu_dev`].
+    pub(crate) fn launch_activation_gelu_tanh_dev(
+        &self,
+        input_dev: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.launch_elementwise_unary_dev(
+            &self.activation_gelu_tanh,
+            input_dev,
+            n,
+            "activation_gelu_tanh",
+        )
+    }
+
+    /// Shared device-resident binary elementwise dispatch. `in_a` / `in_b` are
+    /// already on the device; the output is allocated and returned as a device
+    /// buffer. No upload, no sync, no readback — the caller drives the chain
+    /// and reads back once via [`sync_dtoh_f32`]. Mirrors the arg layout of
+    /// [`launch_elementwise_binary`] so the device kernel sees identical args.
+    fn launch_elementwise_binary_dev(
+        &self,
+        func: &CudaFunction,
+        in_a: &CudaSlice<f32>,
+        in_b: &CudaSlice<f32>,
+        extra_scalar: Option<f32>,
+        n: usize,
+        ctx: &'static str,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        if n == 0 {
+            return self.stream.alloc_zeros::<f32>(0).map_err(|err| {
+                RuntimeError::context_concat("allocating CUDA ", ctx, " output", err)
+            });
+        }
+        if in_a.len() != n || in_b.len() != n {
+            return Err(RuntimeError::usage(format!(
+                "{ctx}_dev expected in_a/in_b of length {n}, got {} / {}",
+                in_a.len(),
+                in_b.len()
+            )));
+        }
+        if n > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "{ctx}_dev length {n} exceeds the 32-bit kernel index limit"
+            )));
+        }
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(n)
+            .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
+        let threads_x = GEGGLU_SILU_KERNEL.geometry.threads_per_group[0];
+        let n_u = n as u32;
+        let extra = extra_scalar;
+        let cfg = LaunchConfig {
+            grid_dim: (n_u.div_ceil(threads_x), 1, 1),
+            block_dim: (threads_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(func);
+        launch_args.arg(in_a).arg(in_b).arg(&mut out_dev);
+        if let Some(ref scalar) = extra {
+            launch_args.arg(scalar);
+        }
+        launch_args.arg(&n_u);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
+        Ok(out_dev)
+    }
+
+    /// Shared device-resident unary elementwise dispatch. Mirrors the arg layout
+    /// of [`launch_elementwise_unary`] (single input → output), but the input is
+    /// already resident and the output stays resident (no upload/sync/readback).
+    fn launch_elementwise_unary_dev(
+        &self,
+        func: &CudaFunction,
+        input: &CudaSlice<f32>,
+        n: usize,
+        ctx: &'static str,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        if n == 0 {
+            return self.stream.alloc_zeros::<f32>(0).map_err(|err| {
+                RuntimeError::context_concat("allocating CUDA ", ctx, " output", err)
+            });
+        }
+        if input.len() != n {
+            return Err(RuntimeError::usage(format!(
+                "{ctx}_dev expected input of length {n}, got {}",
+                input.len()
+            )));
+        }
+        if n > u32::MAX as usize {
+            return Err(RuntimeError::usage(format!(
+                "{ctx}_dev length {n} exceeds the 32-bit kernel index limit"
+            )));
+        }
         let mut out_dev = self
             .stream
             .alloc_zeros::<f32>(n)
@@ -1834,18 +2033,10 @@ impl CudaRuntime {
             shared_mem_bytes: 0,
         };
         let mut launch_args = self.stream.launch_builder(func);
-        launch_args.arg(&input_dev).arg(&mut out_dev).arg(&n_u);
+        launch_args.arg(input).arg(&mut out_dev).arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
-        self.stream.synchronize().map_err(|err| {
-            RuntimeError::context_concat("synchronizing CUDA ", ctx, " stream", err)
-        })?;
-        let host_out = self
-            .stream
-            .clone_dtoh(&out_dev)
-            .map_err(|err| RuntimeError::context_concat("reading CUDA ", ctx, " output", err))?;
-        out.copy_from_slice(&host_out);
-        Ok(())
+        Ok(out_dev)
     }
 }
 
@@ -1892,7 +2083,7 @@ impl RuntimeError {
         }
     }
 
-    fn usage(message: String) -> Self {
+    pub(crate) fn usage(message: String) -> Self {
         Self { message }
     }
 }

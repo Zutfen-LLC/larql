@@ -209,6 +209,13 @@ impl CudaBackend {
         self.runtime.is_some()
     }
 
+    /// Borrow the device runtime (`None` on the scaffold path). Used by the
+    /// device-resident activation chain in `pipeline.rs` to drive several
+    /// kernels on the same stream and read back once.
+    pub(crate) fn runtime(&self) -> Option<&Arc<CudaRuntime>> {
+        self.runtime.as_ref()
+    }
+
     /// Snapshot the persistent weight-cache hit/miss counters. `None` on the
     /// scaffold path (no runtime / no device); the counts are always zero
     /// there since no weights are ever uploaded.

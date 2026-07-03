@@ -385,8 +385,31 @@ impl CudaBackend {
     }
 
     /// Prefill FFN block for one layer: pre-ffn norm → gate/up matmul (all
-    /// seq) → activation → down matmul → post-ffn residual.
+    /// seq) → activation → down matmul → post-ffn residual. Tries the
+    /// device-resident chain first ([`host_prefill_ffn_block_device`], which
+    /// keeps the gate/up/activation/down activations on the device across the
+    /// whole chain and reads back exactly once); falls back to the
+    /// host-orchestrated path ([`host_prefill_ffn_block_hostonly`]) when the
+    /// device path is unavailable or the layer features aren't supported.
     pub(crate) fn host_prefill_ffn_block(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn: &Array2<f32>,
+        hidden: usize,
+        inter: usize,
+    ) -> Option<Array2<f32>> {
+        if let Some(out) = self.host_prefill_ffn_block_device(layer, h_post_attn, hidden, inter) {
+            return Some(out);
+        }
+        self.host_prefill_ffn_block_hostonly(layer, h_post_attn, hidden, inter)
+    }
+
+    /// Prefill FFN block, host-orchestrated reference path: pre-ffn norm →
+    /// gate/up matmul (all seq) → activation → down matmul → post-ffn
+    /// residual. Each projection is a separate htod/launch/dtoh round-trip
+    /// (the elementwise ops run on host). This is the parity oracle for the
+    /// device-resident chain and the fallback when the device path bails.
+    pub(crate) fn host_prefill_ffn_block_hostonly(
         &self,
         layer: &FullPipelineLayer<'_>,
         h_post_attn: &Array2<f32>,
@@ -479,18 +502,170 @@ impl CudaBackend {
         )?;
         let out = Array2::from_shape_vec((seq_len, hidden), down_vec).ok()?;
 
+        Some(self.apply_post_ffn_residual_prefill(layer, h_post_attn, &out))
+    }
+
+    /// Device-resident prefill FFN chain: pre-ffn norm (host) → gate/up matmul
+    /// → activation → down matmul (all on the device, chained via
+    /// device-resident buffers) → single `sync_dtoh` readback → post-ffn norm
+    /// + residual (host).
+    ///
+    /// This collapses the per-projection round-trips the host-orchestrated
+    /// path pays between the gate/up matmuls, the activation, and the down
+    /// matmul: instead of 3 separate htod(input)+dtoh(output) cycles the chain
+    /// uploads the normed input once, chains four kernels on the same
+    /// CUDA stream (stream-ordered, so no inter-kernel sync), and reads the
+    /// `[seq, hidden]` down output back exactly once. The norm + post-ffn
+    /// residual stay on the host (the residual needs `h_post_attn`, which is
+    /// host-resident from the previous layer; threading it onto the device too
+    /// is the next collapse slice).
+    ///
+    /// Returns `None` (caller falls back to [`host_prefill_ffn_block_hostonly`])
+    /// when: no runtime; the work is below the activation gate; the gate/up/down
+    /// formats aren't Q4_K/Q6_K; the down matrix's stored width is padded
+    /// beyond `inter` (the device chain assumes a contiguous `[seq, inter]`
+    /// activation feeds the down matmul directly); or the activation/ffn-type
+    /// combination isn't one of the native kernels. `Err` from any chained
+    /// launch also maps to `None` (the host path is the documented fallback).
+    pub(crate) fn host_prefill_ffn_block_device(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn: &Array2<f32>,
+        hidden: usize,
+        inter: usize,
+    ) -> Option<Array2<f32>> {
+        let runtime = self.runtime()?;
+        let seq_len = h_post_attn.shape()[0];
+
+        // Below the activation gate the host path is faster (no fusion
+        // benefit, only transfer+sync overhead) — mirrors the other
+        // `*_NATIVE_MIN_ELEMS` gates.
+        if !Self::native_activation_worthwhile(seq_len.saturating_mul(inter)) {
+            return None;
+        }
+        // All three FFN projections must be a k-quant the device matmul handles.
+        let gate_fmt = layer.gate.format;
+        let up_fmt = layer.up.format;
+        let down_fmt = layer.down.format;
+        if !matches!(
+            (gate_fmt, up_fmt, down_fmt),
+            (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K)
+                | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
+        ) {
+            return None;
+        }
+        // The down matmul must contract exactly `inter` columns — a padded
+        // stored width would need a device-side zero-pad step the chain
+        // doesn't perform, so bail to the host path (which pads on host).
+        let stored_cols = down_stored_cols(layer, hidden, inter)?;
+        if stored_cols != inter {
+            return None;
+        }
+
+        // Pre-FFN norm on the host (the norm weight is f32; threading it onto
+        // the device + chaining norm→gate/up is the next collapse slice).
+        let pre_norm_w = if layer.has_post_norms {
+            layer.pre_ffn_norm
+        } else {
+            Some(layer.post_attn_norm)
+        };
+        let h_in = match pre_norm_w {
+            Some(w) => self.norm_2d(
+                layer.norm_type,
+                h_post_attn,
+                w,
+                layer.norm_offset,
+                layer.eps,
+            ),
+            None => self.norm_2d_no_weight(h_post_attn, layer.norm_offset, layer.eps),
+        };
+        let h_in_slice = h_in.as_slice()?;
+
+        // Drive the device chain. Any launch error maps to `None` so the
+        // caller falls back to the host-orchestrated path (the documented
+        // contract for every native dispatch in this backend).
+        let down_vec: Vec<f32> = {
+            let x_dev = runtime.upload_f32(h_in_slice).ok()?;
+            let gate_dev = matmul_dev_by_fmt(
+                runtime,
+                gate_fmt,
+                layer.gate.data,
+                &x_dev,
+                inter,
+                hidden,
+                seq_len,
+            )
+            .ok()?;
+            let up_dev = matmul_dev_by_fmt(
+                runtime,
+                up_fmt,
+                layer.up.data,
+                &x_dev,
+                inter,
+                hidden,
+                seq_len,
+            )
+            .ok()?;
+            let act_n = seq_len.checked_mul(inter)?;
+            let act_dev = match layer.ffn_type {
+                larql_compute::FfnType::Gated => match layer.activation {
+                    Activation::Silu => runtime
+                        .launch_geglu_silu_dev(&gate_dev, &up_dev, act_n)
+                        .ok()?,
+                    Activation::GeluTanh => runtime
+                        .launch_geglu_gelu_tanh_dev(&gate_dev, &up_dev, act_n)
+                        .ok()?,
+                    _ => return None,
+                },
+                larql_compute::FfnType::Standard => match layer.activation {
+                    Activation::Silu => runtime.launch_activation_silu_dev(&up_dev, act_n).ok()?,
+                    Activation::GeluTanh => runtime
+                        .launch_activation_gelu_tanh_dev(&up_dev, act_n)
+                        .ok()?,
+                    _ => return None,
+                },
+            };
+            let down_dev = matmul_dev_by_fmt(
+                runtime,
+                down_fmt,
+                layer.down.data,
+                &act_dev,
+                hidden,
+                stored_cols,
+                seq_len,
+            )
+            .ok()?;
+            runtime.sync_dtoh_f32(&down_dev).ok()?
+        };
+        if down_vec.len() != seq_len * hidden {
+            return None;
+        }
+        let out = Array2::from_shape_vec((seq_len, hidden), down_vec).ok()?;
+        Some(self.apply_post_ffn_residual_prefill(layer, h_post_attn, &out))
+    }
+
+    /// Post-FFN norm + residual for the prefill block, shared by the
+    /// host-orchestrated and device-resident paths so the two can't drift.
+    /// When `has_post_norms`, normalise `out` with `post_ffn_norm` (or the
+    /// no-weight path when absent) before the scaled residual add; otherwise
+    /// add `out` straight onto `h_post_attn`.
+    fn apply_post_ffn_residual_prefill(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn: &Array2<f32>,
+        out: &Array2<f32>,
+    ) -> Array2<f32> {
         let res_mult = layer.residual_multiplier;
-        let h_post_ffn = if layer.has_post_norms {
+        if layer.has_post_norms {
             let norm_w = layer.post_ffn_norm;
             let normed = match norm_w {
-                Some(w) => self.norm_2d(layer.norm_type, &out, w, layer.norm_offset, layer.eps),
-                None => self.norm_2d_no_weight(&out, layer.norm_offset, layer.eps),
+                Some(w) => self.norm_2d(layer.norm_type, out, w, layer.norm_offset, layer.eps),
+                None => self.norm_2d_no_weight(out, layer.norm_offset, layer.eps),
             };
             self.add_residual_native(h_post_attn, &normed, res_mult)
         } else {
-            self.add_residual_native(h_post_attn, &out, res_mult)
-        };
-        Some(h_post_ffn)
+            self.add_residual_native(h_post_attn, out, res_mult)
+        }
     }
 
     /// One attention block for a single decode step:
@@ -1532,6 +1707,56 @@ fn super_block_bytes(fmt: QuantFormat) -> Option<usize> {
         QuantFormat::Q4_K => Some(144),
         QuantFormat::Q6_K => Some(210),
         _ => None,
+    }
+}
+
+/// The down projection's stored column count (the contraction width) derived
+/// from its byte length, without allocating the padded activation. The
+/// device-resident FFN chain uses this to decide whether the `[seq, inter]`
+/// activation feeds the down matmul directly (`stored_cols == inter`) or needs
+/// a host-side zero-pad step (`stored_cols > inter`, where the chain bails to
+/// the host path). Mirrors the `stored_cols` derivation in
+/// [`down_padded_activation`].
+fn down_stored_cols(layer: &FullPipelineLayer<'_>, hidden: usize, inter: usize) -> Option<usize> {
+    let down = &layer.down;
+    let bytes_per_sb = super_block_bytes(down.format)?;
+    if hidden == 0 || down.data.is_empty() {
+        return None;
+    }
+    let down_bytes_per_row = down.data.len() / hidden;
+    if down_bytes_per_row == 0 || !down_bytes_per_row.is_multiple_of(bytes_per_sb) {
+        return None;
+    }
+    let stored_cols = down_bytes_per_row / bytes_per_sb * 256;
+    (stored_cols >= inter).then_some(stored_cols)
+}
+
+/// Device-resident amortised matmul dispatch by quant format: Q4_K →
+/// `launch_q4k_matmul_dev`, Q6_K → `launch_q6k_matmul_dev`. Used by the
+/// device-resident FFN chain so the gate/up/down projections share one upload
+/// of the input and keep their outputs on the device. `None` for other
+/// formats (the chain's gate condition rejects them before reaching here, but
+/// the exhaustive match keeps a future format loud rather than silently
+/// skipping a projection).
+fn matmul_dev_by_fmt(
+    runtime: &crate::backend::CudaRuntime,
+    format: QuantFormat,
+    weights: &[u8],
+    x_dev: &cudarc::driver::CudaSlice<f32>,
+    num_rows: usize,
+    hidden: usize,
+    seq_len: usize,
+) -> Result<cudarc::driver::CudaSlice<f32>, crate::backend::RuntimeError> {
+    match format {
+        QuantFormat::Q4_K => {
+            runtime.launch_q4k_matmul_dev(weights, x_dev, num_rows, hidden, seq_len)
+        }
+        QuantFormat::Q6_K => {
+            runtime.launch_q6k_matmul_dev(weights, x_dev, num_rows, hidden, seq_len)
+        }
+        _ => Err(crate::backend::RuntimeError::usage(format!(
+            "matmul_dev_by_fmt: unsupported device-chain format {format:?}"
+        ))),
     }
 }
 

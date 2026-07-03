@@ -89,6 +89,37 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// `q4k_matmul`/`q6k_matmul` short-circuit the degenerate zero-shape case
+    /// (`num_rows == 0` or `seq_len == 0`) and return an empty `Vec` without
+    /// touching the device — cudarc rejects empty `clone_htod`/`alloc_zeros`
+    /// (see the rms_norm placeholder workaround), so the launcher must bail
+    /// before the upload. Runtime-gated (only the native path reaches the
+    /// launcher; the scaffold returns `None` upstream).
+    #[test]
+    fn q4k_matmul_zero_shape_returns_empty_without_device() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let [(gate, _), _, _] = index.interleaved_kquant_layer_data(0).unwrap();
+        let rows = index.num_features(0);
+
+        // seq_len == 0 (empty input slice).
+        let got = b
+            .q4k_matmul(gate, &[], rows, weights.hidden_size, 0)
+            .expect("seq_len==0 must short-circuit to Ok(vec![])");
+        assert!(got.is_empty(), "seq_len==0 must return an empty Vec");
+
+        // num_rows == 0 (zero-row weight contraction).
+        let x = vec![0.0f32; weights.hidden_size];
+        let got = b
+            .q4k_matmul(gate, &x, 0, weights.hidden_size, 1)
+            .expect("num_rows==0 must short-circuit to Ok(vec![])");
+        assert!(got.is_empty(), "num_rows==0 must return an empty Vec");
+    }
+
     #[test]
     fn q6k_matvec_matches_cpu_delegate() {
         let rows = 4usize;
@@ -975,6 +1006,111 @@ mod tests {
             max_abs < 1e-3,
             "prefill final-position hidden diverged: max_abs={max_abs:.6e}"
         );
+    }
+
+    /// Scaffold path (no CUDA runtime): the device-resident FFN chain
+    /// ([`CudaBackend::host_prefill_ffn_block_device`]) returns `None` so the
+    /// dispatcher falls through to the host-orchestrated path, and that path
+    /// matches the explicit host-only reference. Runs on every host.
+    #[test]
+    fn device_ffn_chain_bails_on_scaffold() {
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        let inter = index.num_features(0);
+        // seq large enough to clear the activation gate (seq*inter >= 8192);
+        // the bail here is the missing runtime, not the gate.
+        let token_ids: Vec<u32> = (0..32u32).collect();
+        let (x, seq_len, _) = prefill_input(&weights, &token_ids);
+        let h_post_attn = Array2::from_shape_vec((seq_len, hidden), x).unwrap();
+        let layer = &layers[0];
+
+        let device_out = b.host_prefill_ffn_block_device(layer, &h_post_attn, hidden, inter);
+        if b.native_runtime_available() {
+            // On a real device this is covered by the runtime-gated parity
+            // test below; skip the scaffold assertion there.
+            return;
+        }
+        assert!(
+            device_out.is_none(),
+            "device chain must bail without a runtime"
+        );
+
+        // The dispatcher falls through to the host-only path; it must match
+        // the explicit host-only reference exactly (same code path).
+        let via_dispatch = b.host_prefill_ffn_block(layer, &h_post_attn, hidden, inter);
+        let via_hostonly = b.host_prefill_ffn_block_hostonly(layer, &h_post_attn, hidden, inter);
+        match (via_dispatch, via_hostonly) {
+            (Some(d), Some(h)) => assert_eq!(d.as_slice().unwrap(), h.as_slice().unwrap()),
+            (a, b2) => panic!("dispatch/hostonly disagreed: {a:?} vs {b2:?}"),
+        }
+    }
+
+    /// The device-resident FFN chain must match the host-orchestrated reference
+    /// when a runtime is present. The matmul kernels are bit-exact with their
+    /// CPU twins, so the only divergence is the activation transcendental
+    /// (device `tanhf`/`expf` vs host Rust `tanh`/`exp`, ≤ 1e-5 on the raw
+    /// activation — see `native_geglu_*_matches_host_*`), amplified by the
+    /// down matmul's linear contraction. Runtime-gated.
+    #[test]
+    fn device_ffn_chain_matches_host_orchestrated_when_runtime_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        let inter = index.num_features(0);
+        let token_ids: Vec<u32> = (0..32u32).collect();
+        let (x, seq_len, _) = prefill_input(&weights, &token_ids);
+        let h_post_attn = Array2::from_shape_vec((seq_len, hidden), x).unwrap();
+        let layer = &layers[0];
+
+        let device_out = b
+            .host_prefill_ffn_block_device(layer, &h_post_attn, hidden, inter)
+            .expect("device chain should run with a runtime on a gate-clearing fixture");
+        let host_out = b
+            .host_prefill_ffn_block_hostonly(layer, &h_post_attn, hidden, inter)
+            .expect("host-only path should always run");
+
+        assert_eq!(device_out.shape(), host_out.shape());
+        let max_abs = device_out
+            .iter()
+            .zip(host_out.iter())
+            .map(|(d, h)| (d - h).abs())
+            .fold(0.0f32, f32::max);
+        // Tolerance accommodates the activation-libm divergence amplified by
+        // the down matmul; a wiring bug would diverge by O(1).
+        assert!(
+            max_abs < 1e-3,
+            "device-resident FFN chain diverged from host reference: max_abs={max_abs:.6e}"
+        );
+    }
+
+    /// The device-resident chain bails to `None` when the work is below the
+    /// activation gate (`seq*inter < ACTIVATION_NATIVE_MIN_ELEMS`), regardless
+    /// of runtime availability — the host path is faster for small inputs.
+    /// Runs on every host (on the scaffold path the bail is the missing
+    /// runtime; on a runtime host it's the gate — either way `None`).
+    #[test]
+    fn device_ffn_chain_bails_below_activation_gate() {
+        let b = backend();
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        let inter = index.num_features(0);
+        // seq=1 → seq*inter = 256, well below the 8192 gate.
+        let (x, seq_len, _) = prefill_input(&weights, &[0u32]);
+        let h_post_attn = Array2::from_shape_vec((seq_len, hidden), x).unwrap();
+        let layer = &layers[0];
+        assert!(b
+            .host_prefill_ffn_block_device(layer, &h_post_attn, hidden, inter)
+            .is_none());
     }
 
     /// Scaled-RoPE prefill parity: CUDA's `prefill_kquant` vs the CPU direct
