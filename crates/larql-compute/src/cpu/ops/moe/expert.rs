@@ -15,6 +15,21 @@ use crate::options;
 // `q4k_q8k_gate_up_into` exists for future kernel exploration but is not
 // wired into the hot path — see comment in `run_single_expert_q4k_q8k_into`.
 
+/// One projection's (gate OR up) Q4_K byte span within a `[2*inter, hidden]`
+/// packed gate_up weight: `inter` rows × `(hidden / 256)` super-blocks × 144
+/// bytes per super-block. The single source of truth for the Q4_K gate/up
+/// row stride — used by the substrate expert paths
+/// (`run_single_expert_into`, `run_single_expert_q4k_q8k_into`) and the CUDA
+/// device-fused MoE expert path (`larql_compute_cuda::pipeline`), so a Q4_K
+/// layout change is a one-site edit instead of three silent-mis-decode risks.
+///
+/// Returns `None` on `inter * row_block_bytes` overflow.
+pub fn q4k_gate_up_half(inter: usize, hidden: usize) -> Option<usize> {
+    let row_block_bytes = (hidden / larql_models::quant::ggml::Q4_K_BLOCK_ELEMS)
+        * larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
+    inter.checked_mul(row_block_bytes)
+}
+
 /// Per-call scratch for `run_single_expert_with_scratch` — preallocate once
 /// per gRPC frame and reuse across all K active experts.  Keeps allocation
 /// off the hot path: at Gemma 4 26B-A4B sizes the un-pooled version was
@@ -271,9 +286,8 @@ pub fn run_single_expert_into<'s>(
     }
 
     if q4k_path {
-        let row_block_bytes = (hidden / larql_models::quant::ggml::Q4_K_BLOCK_ELEMS)
-            * larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
-        let half = inter * row_block_bytes;
+        let half = q4k_gate_up_half(inter, hidden)
+            .expect("Q4_K expert gate/up byte span does not overflow");
         let gate_bytes = &gate_up_bytes[..half];
         let up_bytes = &gate_up_bytes[half..2 * half];
         q4k_matvec_into(&mut scratch.gate_out, h_norm, gate_bytes, inter, hidden);
@@ -450,8 +464,8 @@ pub fn run_single_expert_q4k_q8k_into<'s>(
     // Q4_K weight stride (in bytes) per row: ceil(hidden / Q4_K_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES.
     let block = larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
     let inter_padded = inter.div_ceil(block) * block;
-    let row_block_bytes = (hidden / block) * larql_models::quant::ggml::Q4_K_BLOCK_BYTES;
-    let half = inter * row_block_bytes;
+    let half =
+        q4k_gate_up_half(inter, hidden).expect("Q4_K expert gate/up byte span does not overflow");
     if gate_up_bytes.len() < 2 * half {
         for v in scratch.out.iter_mut() {
             *v = 0.0;

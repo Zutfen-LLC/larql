@@ -2143,6 +2143,274 @@ mod tests {
         );
     }
 
+    // ── device-fused MoE expert matvecs (Session 24) ─────────────────────
+
+    /// Build a synthetic **Q4_K** MoE fixture: `hidden=256, inter=256`,
+    /// `num_experts=2, top_k=1`, deterministic LCG weights. Returns the
+    /// hidden input, the `MoeLayerWeights` (with `'static`-leaked expert
+    /// byte + router refs), and the `(hidden, inter)` dims. The expert
+    /// format is Q4_K so the device path's Q4_K × f32 math applies (the
+    /// existing `make_test_gemma4_moe_weights` fixture packs BF16 experts,
+    /// which the device path bails on).
+    fn build_q4k_moe_fixture() -> (
+        Vec<f32>,
+        larql_compute::MoeLayerWeights<'static>,
+        usize,
+        usize,
+    ) {
+        let hidden: usize = 256;
+        let inter: usize = 256;
+        let num_experts: usize = 2;
+        let top_k: usize = 1;
+        let lcg = |seed: u32, n: usize| -> Vec<f32> {
+            let mut s = seed.wrapping_mul(2654435761);
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((s >> 8) & 0xffff) as f32 / 65535.0 - 0.5
+                })
+                .collect()
+        };
+
+        let mut gate_up_refs: Vec<&'static [u8]> = Vec::with_capacity(num_experts);
+        let mut down_refs: Vec<&'static [u8]> = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let gate_up_f = lcg(10 + e as u32, 2 * inter * hidden);
+            let down_f = lcg(20 + e as u32, hidden * inter);
+            let gu = quantize_q4_k(&gate_up_f);
+            let dn = quantize_q4_k(&down_f);
+            // Leak each expert's bytes so the borrow is 'static (mirrors
+            // build_moe_layer_from_fixture's discipline for the dense slab).
+            gate_up_refs.push(Box::leak(gu.into_boxed_slice()));
+            down_refs.push(Box::leak(dn.into_boxed_slice()));
+        }
+        // Router: route to expert 1 (so per-expert indexing is exercised, not
+        // just expert 0).
+        let router_proj: Vec<f32> = {
+            let mut r = vec![0.0f32; num_experts * hidden];
+            for v in &mut r[hidden..2 * hidden] {
+                *v = 1.0;
+            }
+            r
+        };
+        let router_static: &'static [f32] = Box::leak(router_proj.into_boxed_slice());
+
+        let h: Vec<f32> = lcg(99, hidden);
+
+        let moe = larql_compute::MoeLayerWeights {
+            experts_gate_up: gate_up_refs,
+            experts_down: down_refs,
+            routing_policy: larql_compute::MoeRoutingPolicy::default(),
+            weight_layout: larql_compute::MoeWeightLayout::default(),
+            expert_data_format: QuantFormat::Q4_K,
+            router_proj: router_static,
+            router_scale: &[],
+            router_per_expert_scale: &[],
+            router_norm: &[],
+            router_norm_parameter_free: false,
+            router_input_scalar: 1.0,
+            pre_experts_norm: &[],
+            post_ffn1_norm: &[],
+            post_experts_norm: &[],
+            num_experts,
+            top_k,
+            intermediate_size: inter,
+            activation: larql_compute::Activation::Silu,
+        };
+        (h, moe, hidden, inter)
+    }
+
+    /// Scaffold path (no CUDA runtime): the device-routed expert
+    /// contribution ([`CudaBackend::moe_expert_contribution_device`])
+    /// returns `None`, so the MoE block falls back to the substrate
+    /// `cpu_moe_forward`. Runs on every host.
+    #[test]
+    fn moe_expert_contribution_device_bails_on_scaffold() {
+        let b = backend();
+        let (h, moe, _hidden, _inter) = build_q4k_moe_fixture();
+        // On the scaffold (no runtime) the device path bails before even
+        // looking at the format or scratch, so empty scratch is safe.
+        let (mut eo, mut act) = (vec![], vec![]);
+        assert!(
+            b.moe_expert_contribution_device(&h, &moe, 0.0, 1e-6, &mut eo, &mut act)
+                .is_none(),
+            "device expert contribution must bail without a runtime"
+        );
+    }
+
+    /// The Q4_K expert-contribution structure (routing → gate/up/down split →
+    /// activation → weighted sum → post-expert norm) must match a fresh,
+    /// independently-composed reference that uses the CPU `q4k_matvec_into`
+    /// reference directly. Both paths use the same Q4_K × f32 matvec, so the
+    /// match is bit-identical — a wiring bug (wrong gate/up split point,
+    /// swapped gate/up, wrong activation, missing weight, skipped
+    /// post-norm) would diverge. Runs on every host (host-only path).
+    #[test]
+    fn moe_expert_contribution_q4k_structure_matches_reference() {
+        use larql_compute::cpu::ops::moe::{
+            moe_expert_input, moe_post_expert_output, moe_route_from_router_input, moe_router_input,
+        };
+        use larql_compute::cpu::ops::q4_common::q4k_matvec_into;
+        use larql_models::quant::ggml::{Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS};
+
+        let b = backend();
+        let (h, moe, hidden, inter) = build_q4k_moe_fixture();
+        let inter_padded = moe.inter_padded();
+
+        let mut expert_out = vec![0.0f32; hidden];
+        let mut act = vec![0.0f32; inter_padded];
+        let got = crate::pipeline::moe_expert_contribution_hostonly(
+            &h,
+            &moe,
+            0.0,
+            1e-6,
+            &mut expert_out,
+            &mut act,
+        )
+        .expect("host-only Q4_K expert contribution must succeed");
+
+        // Independent reference, composed from the substrate primitives
+        // (NOT via the shared helper) so the gate/up split + activation +
+        // weighted-sum + post-norm wiring is cross-checked. The gate/up split
+        // is computed inline here (deliberately not via `q4k_gate_up_half`) so
+        // the helper's split formula is independently pinned.
+        let row_block_bytes = (hidden / Q4_K_BLOCK_ELEMS) * Q4_K_BLOCK_BYTES;
+        let half = inter * row_block_bytes;
+        let expert_input = moe_expert_input(&h, &moe, 0.0, 1e-6);
+        let router_in = moe_router_input(&h, &expert_input, &moe, 0.0, 1e-6);
+        let (indices, weights) = moe_route_from_router_input(&router_in, &moe);
+
+        let mut expert_out = vec![0.0f32; hidden];
+        let mut act = vec![0.0f32; inter_padded];
+        for (&ei, &w) in indices.iter().zip(weights.iter()) {
+            if w == 0.0 {
+                continue;
+            }
+            let gate_up = moe.experts_gate_up[ei];
+            let down = moe.experts_down[ei];
+            let gate_bytes = &gate_up[..half];
+            let up_bytes = &gate_up[half..2 * half];
+            let mut gate_out = vec![0.0f32; inter];
+            let mut up_out = vec![0.0f32; inter];
+            q4k_matvec_into(&mut gate_out, &expert_input, gate_bytes, inter, hidden);
+            q4k_matvec_into(&mut up_out, &expert_input, up_bytes, inter, hidden);
+            for j in 0..inter {
+                let g = gate_out[j];
+                let u = up_out[j];
+                // Silu (matches the fixture's activation).
+                act[j] = (g / (1.0 + (-g).exp())) * u;
+            }
+            let mut down_out = vec![0.0f32; hidden];
+            q4k_matvec_into(&mut down_out, &act, down, hidden, inter_padded);
+            for (acc, &v) in expert_out.iter_mut().zip(down_out.iter()) {
+                *acc += w * v;
+            }
+        }
+        let expected = moe_post_expert_output(&expert_out, &moe, 0.0, 1e-6);
+
+        assert_eq!(got.len(), expected.len());
+        let max_abs = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-5,
+            "Q4_K expert-contribution structure diverged from reference: max_abs={max_abs:.6e}"
+        );
+        // Sanity: the fixture routes to a non-degenerate expert.
+        assert!(
+            got.iter().any(|v| v.abs() > 1e-6),
+            "expert contribution should be non-zero"
+        );
+
+        // Silence the unused-backend warning on the no-op host path.
+        let _ = b;
+    }
+
+    /// The device path bails to `None` for non-Q4_K experts (BF16 monolith)
+    /// and for a hidden dim that isn't a 256-multiple (the gate/up byte split
+    /// needs whole Q4_K super-blocks). The MoE block then falls back to
+    /// `cpu_moe_forward`. Runs on every host (the structure helper is the
+    /// host-only oracle — no runtime involved).
+    #[test]
+    fn moe_expert_contribution_q4k_bails_on_non_q4k_and_non_aligned() {
+        // Non-Q4_K format → None (bails before the scratch-size check, so
+        // empty scratch is safe).
+        let (_h, mut moe, hidden, _inter) = build_q4k_moe_fixture();
+        moe.expert_data_format = QuantFormat::BF16;
+        let (mut eo, mut act) = (vec![], vec![]);
+        assert!(
+            crate::pipeline::moe_expert_contribution_hostonly(
+                &vec![0.1; hidden],
+                &moe,
+                0.0,
+                1e-6,
+                &mut eo,
+                &mut act,
+            )
+            .is_none(),
+            "non-Q4_K experts must bail"
+        );
+
+        // Restore Q4_K but pass a hidden dim that isn't a 256-multiple. The
+        // fixture's gate_up bytes were built for hidden=256, so this is
+        // deliberately mis-shaped — the helper must reject on the alignment
+        // gate (before indexing the mismatched weights), so empty scratch is
+        // safe here too.
+        moe.expert_data_format = QuantFormat::Q4_K;
+        let bad_h = vec![0.1f32; 200];
+        assert!(
+            crate::pipeline::moe_expert_contribution_hostonly(
+                &bad_h, &moe, 0.0, 1e-6, &mut eo, &mut act
+            )
+            .is_none(),
+            "non-256-multiple hidden must bail"
+        );
+    }
+
+    /// Device-routed expert contribution must match the host-only Q4_K × f32
+    /// reference when a CUDA runtime is present. The native `q4k_matvec`
+    /// kernel is parity-tested against the CPU twin; the only divergence is
+    /// the device dequant/FMA rounding, amplified by the down matvec — a
+    /// wiring bug would diverge by O(1). Runtime-gated (no-op on this
+    /// no-CUDA host).
+    #[test]
+    fn moe_expert_contribution_native_matches_host_when_runtime_available() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let (h, moe, hidden, _inter) = build_q4k_moe_fixture();
+        let inter_padded = moe.inter_padded();
+
+        let (mut eo_dev, mut act_dev) = (vec![0.0f32; hidden], vec![0.0f32; inter_padded]);
+        let device = b
+            .moe_expert_contribution_device(&h, &moe, 0.0, 1e-6, &mut eo_dev, &mut act_dev)
+            .expect("device path must run with a runtime on a Q4_K fixture");
+        let (mut eo_host, mut act_host) = (vec![0.0f32; hidden], vec![0.0f32; inter_padded]);
+        let host = crate::pipeline::moe_expert_contribution_hostonly(
+            &h,
+            &moe,
+            0.0,
+            1e-6,
+            &mut eo_host,
+            &mut act_host,
+        )
+        .expect("host-only path must always run");
+
+        assert_eq!(device.len(), host.len());
+        let max_abs = device
+            .iter()
+            .zip(host.iter())
+            .map(|(d, ho)| (d - ho).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "native MoE expert contribution diverged from host reference: max_abs={max_abs:.6e}"
+        );
+    }
+
     /// PLE and remote-FFN layers still bail to `None` (they need data / a
     /// callback the trait surface doesn't carry). Drives the bail via the
     /// host path directly so it runs on every host (no runtime gate).

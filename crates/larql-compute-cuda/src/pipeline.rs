@@ -35,7 +35,10 @@
 use larql_compute::attention::build_rope_inv_freq;
 use larql_compute::attention::decode::gqa_attention_decode_step;
 use larql_compute::attention::rope::apply_rope_partial_at_full;
-use larql_compute::cpu::ops::moe::cpu_moe_forward;
+use larql_compute::cpu::ops::moe::{
+    cpu_moe_forward, moe_expert_input, moe_post_expert_output, moe_route_from_router_input,
+    moe_router_input,
+};
 use larql_compute::cpu::ops::outer_combine::outer_post_norm_residual;
 use larql_compute::residual::{
     layer_norm_eps, rms_norm_eps, rms_norm_heads, rms_norm_heads_no_weight,
@@ -44,6 +47,7 @@ use larql_compute::{
     Activation, DecodeStateDump, FullPipelineLayer, NormType, QuantFormat, QuantMatVec,
     StateDumpMask,
 };
+use larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
 use ndarray::Array2;
 
 use crate::CudaBackend;
@@ -1643,14 +1647,16 @@ impl CudaBackend {
     /// Hybrid-MoE FFN block for a single decode token (Gemma 4 26B-A4B
     /// shape). Runs the dense slab via the existing [`host_ffn_block`]
     /// (native quant matvec projections + host elementwise + post-FFN
-    /// norm + residual), the expert block via the substrate reference
-    /// [`cpu_moe_forward`], then combines the two with the Gemma-4 outer
-    /// post-norm + residual — the structure of
-    /// `larql-inference::moe_ffn_block_cpu_with_index`:
+    /// norm + residual), the expert block via the device-routed
+    /// [`Self::moe_combine_row_device`] (native per-expert gate/up/down
+    /// Q4_K matvecs; falls back to the substrate [`cpu_moe_forward`] when
+    /// there is no runtime or the experts aren't Q4_K × f32), then
+    /// combines the two with the Gemma-4 outer post-norm + residual — the
+    /// structure of `larql-inference::moe_ffn_block_cpu_with_index`:
     ///
     ///   h1 = dense_slab - h_post_attn   (the dense delta; the slab
     ///                                    already carries the residual)
-    ///   h2 = cpu_moe_forward(h_post_attn)  (the expert contribution)
+    ///   h2 = expert_contribution(h_post_attn)  (the expert block)
     ///   out = h_post_attn + outer_norm(h1 + h2)
     ///
     /// `None` if the dense slab or expert block can't be computed — the
@@ -1671,7 +1677,21 @@ impl CudaBackend {
         let dense = h_post_ffn_dense.as_slice()?;
         let outer_w = moe_outer_norm(layer);
         let mut combined = vec![0.0f32; hidden];
-        let out = moe_combine_row(ha, dense, moe, layer, outer_w, &mut combined);
+        // Single-token decode: allocate the expert scratch once (no loop to hoist out of).
+        let mut expert_out = vec![0.0f32; hidden];
+        let mut act = vec![0.0f32; moe.inter_padded()];
+        let out = self
+            .moe_combine_row_device(
+                ha,
+                dense,
+                moe,
+                layer,
+                outer_w,
+                &mut combined,
+                &mut expert_out,
+                &mut act,
+            )
+            .unwrap_or_else(|| moe_combine_row(ha, dense, moe, layer, outer_w, &mut combined));
         Some(vec_to_2d_row(out))
     }
 
@@ -1679,9 +1699,12 @@ impl CudaBackend {
     /// [`host_ffn_block_moe_decode`] but the dense slab uses the amortised
     /// native quant matmul across all `seq_len` positions
     /// ([`host_prefill_ffn_block`]), and the expert block + outer combine
-    /// run per position via [`moe_combine_row`] (the substrate
-    /// `cpu_moe_forward` is single-token). The `combined` scratch is
-    /// hoisted out of the per-position loop to avoid per-token allocation.
+    /// run per position (the expert contribution is single-token). Each
+    /// position tries the device-routed [`Self::moe_combine_row_device`]
+    /// first (native Q4_K expert matvecs) and falls back to the substrate
+    /// [`cpu_moe_forward`] when the device path bails. The `combined`
+    /// scratch is hoisted out of the per-position loop to avoid per-token
+    /// allocation.
     pub(crate) fn host_prefill_ffn_block_moe(
         &self,
         layer: &FullPipelineLayer<'_>,
@@ -1696,20 +1719,99 @@ impl CudaBackend {
         let dense = h_post_ffn_dense.as_slice()?;
         let outer_w = moe_outer_norm(layer);
         let mut combined = vec![0.0f32; hidden];
+        // Hoist the expert scratch out of the per-position loop (mirrors
+        // `combined`): `expert_out` is `[hidden]` (re-zeroed per token inside
+        // `moe_expert_contribution_q4k` before accumulation) and `act` is
+        // `[inter_padded]` with padding columns that stay zero across
+        // positions — so both reuse cleanly across the prefill loop.
+        let mut expert_out = vec![0.0f32; hidden];
+        let mut act = vec![0.0f32; moe.inter_padded()];
         let mut out = vec![0.0f32; seq_len * hidden];
         for pos in 0..seq_len {
             let off = pos * hidden;
-            let row = moe_combine_row(
-                &ha[off..off + hidden],
-                &dense[off..off + hidden],
-                moe,
-                layer,
-                outer_w,
-                &mut combined,
-            );
+            let row = self
+                .moe_combine_row_device(
+                    &ha[off..off + hidden],
+                    &dense[off..off + hidden],
+                    moe,
+                    layer,
+                    outer_w,
+                    &mut combined,
+                    &mut expert_out,
+                    &mut act,
+                )
+                .unwrap_or_else(|| {
+                    moe_combine_row(
+                        &ha[off..off + hidden],
+                        &dense[off..off + hidden],
+                        moe,
+                        layer,
+                        outer_w,
+                        &mut combined,
+                    )
+                });
             out[off..off + hidden].copy_from_slice(&row);
         }
         Array2::from_shape_vec((seq_len, hidden), out).ok()
+    }
+
+    /// Device-routed expert contribution for a single token: the routing +
+    /// post-expert norm stay on the host, but every per-expert gate/up/down
+    /// projection runs through the native CUDA `q4k_matvec` kernel
+    /// (native-then-CPU fallback via [`QuantMatVec::q4k_matvec`]). Returns
+    /// `None` (caller falls back to the substrate [`cpu_moe_forward`]) when
+    /// there is no runtime or the experts aren't Q4_K × f32 (the device
+    /// kernel's math — see [`moe_expert_contribution_q4k`]). On a no-CUDA
+    /// host this is always `None`, so the MoE block keeps its existing
+    /// `cpu_moe_forward` (Q8_K-direct SDOT on Apple Silicon) behaviour
+    /// unchanged.
+    pub(crate) fn moe_expert_contribution_device(
+        &self,
+        h: &[f32],
+        moe: &larql_compute::MoeLayerWeights<'_>,
+        norm_offset: f32,
+        eps: f32,
+        expert_out: &mut [f32],
+        act: &mut [f32],
+    ) -> Option<Vec<f32>> {
+        self.runtime()?;
+        moe_expert_contribution_q4k(h, moe, norm_offset, eps, expert_out, act, |w, x, r, k| {
+            self.q4k_matvec(w, x, r, k)
+        })
+    }
+
+    /// Device-routed single-token MoE combine: the device expert
+    /// contribution ([`Self::moe_expert_contribution_device`]) substitutes
+    /// for the substrate `cpu_moe_forward` call inside [`moe_combine_row`];
+    /// the dense-delta subtraction + outer post-norm + residual run through
+    /// the shared [`apply_outer_combine`] so the device and host paths
+    /// can't drift on the combine wiring. Returns `None` when the device
+    /// expert path bails — the caller falls back to [`moe_combine_row`]
+    /// (the `cpu_moe_forward` reference). `expert_out`/`act` are
+    /// caller-owned scratch (see [`moe_expert_contribution_q4k`]).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_combine_row_device(
+        &self,
+        ha_row: &[f32],
+        dense_row: &[f32],
+        moe: &larql_compute::MoeLayerWeights<'_>,
+        layer: &FullPipelineLayer<'_>,
+        outer_w: Option<&[f32]>,
+        combined: &mut [f32],
+        expert_out: &mut [f32],
+        act: &mut [f32],
+    ) -> Option<Vec<f32>> {
+        let h2 = self.moe_expert_contribution_device(
+            ha_row,
+            moe,
+            layer.norm_offset,
+            layer.eps,
+            expert_out,
+            act,
+        )?;
+        Some(apply_outer_combine(
+            ha_row, dense_row, &h2, outer_w, layer, combined,
+        ))
     }
 }
 
@@ -2295,10 +2397,152 @@ pub(crate) fn moe_combine_row(
     combined: &mut [f32],
 ) -> Vec<f32> {
     let h2 = cpu_moe_forward(ha_row, moe, layer.norm_offset, layer.eps);
+    apply_outer_combine(ha_row, dense_row, &h2, outer_w, layer, combined)
+}
+
+/// Gemma-4 outer combine shared by the host ([`moe_combine_row`]) and device
+/// ([`CudaBackend::moe_combine_row_device`]) MoE paths so the dense-delta
+/// subtraction + outer post-norm + residual live in exactly one place — the
+/// only difference between the two paths is how the expert contribution `h2`
+/// is produced. `combined` is caller-owned `[hidden]` scratch, fully
+/// overwritten here.
+pub(crate) fn apply_outer_combine(
+    ha_row: &[f32],
+    dense_row: &[f32],
+    h2: &[f32],
+    outer_w: Option<&[f32]>,
+    layer: &FullPipelineLayer<'_>,
+    combined: &mut [f32],
+) -> Vec<f32> {
     for (i, c) in combined.iter_mut().enumerate() {
         *c = (dense_row[i] - ha_row[i]) + h2[i];
     }
     outer_post_norm_residual(ha_row, combined, outer_w, layer.norm_offset, layer.eps)
+}
+
+/// Per-token expert-block contribution computed with **Q4_K × f32** matvecs
+/// (the device path's math). Mirrors the structure of the substrate
+/// [`cpu_moe_forward`] — routing → per-expert gated FFN → weighted sum →
+/// post-expert norm — but runs every gate/up/down projection through the
+/// supplied `matvec` closure, which performs `out[rows] = W[rows,k] @ x[k]`
+/// on Q4_K weights against an f32 input (dequantize-then-dot).
+///
+/// **Why not reuse `cpu_moe_forward` directly:** its default hot path is
+/// Q4_K-**direct** (Q8_K quantization of the input + integer SDOT), an
+/// Apple-Silicon-only optimization (NEON `SDOT`). CUDA has no SDOT, so the
+/// device path dequantizes Q4_K to f32 and dots with the f32 input — the
+/// same math `QuantMatVec::q4k_matvec` performs. The closure is
+/// `self.q4k_matvec` (native-then-CPU) on the device path and
+/// `CpuBackend::q4k_matvec` on the host-only parity path; both feed the
+/// same Q4_K × f32 kernel (the native one is parity-tested against the CPU
+/// twin), so the device and host-only outputs match within the kernel
+/// tolerance.
+///
+/// Returns `None` (caller falls back to `cpu_moe_forward`) when the experts
+/// aren't Q4_K, the hidden dim isn't a 256-multiple (the gate/up byte split
+/// assumes whole Q4_K super-blocks), or a matvec returns the wrong length.
+pub(crate) fn moe_expert_contribution_q4k<M>(
+    h: &[f32],
+    moe: &larql_compute::MoeLayerWeights<'_>,
+    norm_offset: f32,
+    eps: f32,
+    expert_out: &mut [f32],
+    act: &mut [f32],
+    mut matvec: M,
+) -> Option<Vec<f32>>
+where
+    M: FnMut(&[u8], &[f32], usize, usize) -> Option<Vec<f32>>,
+{
+    let hidden = h.len();
+    let inter = moe.intermediate_size;
+    if inter == 0 || hidden == 0 {
+        return None;
+    }
+    // Only Q4_K experts: the native + CPU `q4k_matvec` decode 144-byte Q4_K
+    // super-blocks. Other formats (BF16 monolith, etc.) keep the
+    // `cpu_moe_forward` path.
+    if !matches!(moe.expert_data_format, QuantFormat::Q4_K) {
+        return None;
+    }
+    // The gate/up byte split (and the Q4_K super-block decode) need a whole
+    // number of super-blocks per row.
+    if !hidden.is_multiple_of(Q4_K_BLOCK_ELEMS) {
+        return None;
+    }
+    let inter_padded = moe.inter_padded();
+    // Caller-owned scratch must match the layer's geometry. `expert_out` is
+    // `[hidden]` (zeroed at the start of each call before accumulation);
+    // `act` is `[inter_padded]` with the padding columns `[inter..]` zero on
+    // entry (they are never written, so the down matvec reads them as zero —
+    // matches the substrate `ExpertScratch::act` discipline). Hoisting these
+    // out of the per-position prefill loop avoids `2 * seq_len` allocations.
+    if expert_out.len() != hidden || act.len() != inter_padded {
+        return None;
+    }
+    // gate_up layout: [2*inter, hidden] (gate rows first, then up rows). `half`
+    // is one projection's byte span, sourced from the shared substrate
+    // `q4k_gate_up_half` so the Q4_K row-stride lives in exactly one place.
+    let half = larql_compute::cpu::ops::moe::q4k_gate_up_half(inter, hidden)?;
+
+    let expert_input = moe_expert_input(h, moe, norm_offset, eps);
+    let router_in = moe_router_input(h, &expert_input, moe, norm_offset, eps);
+    let (indices, weights) = moe_route_from_router_input(&router_in, moe);
+
+    let activation = moe.activation;
+    expert_out.fill(0.0);
+    for (&ei, &w) in indices.iter().zip(weights.iter()) {
+        if w == 0.0 {
+            continue;
+        }
+        let Some(&gate_up_bytes) = moe.experts_gate_up.get(ei) else {
+            continue;
+        };
+        let Some(&down_bytes) = moe.experts_down.get(ei) else {
+            continue;
+        };
+        if gate_up_bytes.len() < 2 * half {
+            continue;
+        }
+        let gate_bytes = &gate_up_bytes[..half];
+        let up_bytes = &gate_up_bytes[half..2 * half];
+        let gate_out = matvec(gate_bytes, &expert_input, inter, hidden)?;
+        let up_out = matvec(up_bytes, &expert_input, inter, hidden)?;
+        if gate_out.len() != inter || up_out.len() != inter {
+            return None;
+        }
+        // act(gate) * up into act[..inter]; padding stays zero.
+        apply_activation_gated(activation, &gate_out, &up_out, &mut act[..inter]);
+        let down_out = matvec(down_bytes, act, hidden, inter_padded)?;
+        if down_out.len() != hidden {
+            return None;
+        }
+        for (acc, &v) in expert_out.iter_mut().zip(down_out.iter()) {
+            *acc += w * v;
+        }
+    }
+    Some(moe_post_expert_output(expert_out, moe, norm_offset, eps))
+}
+
+/// Host-only Q4_K × f32 expert contribution — the device path's parity
+/// oracle. Same structure as [`moe_expert_contribution_q4k`] but every
+/// matvec runs the CPU `CpuBackend::q4k_matvec` reference (Q4_K × f32). Used
+/// by the runtime-gated native parity test to lock the device-vs-host match
+/// against a fresh composition. Test-only (the device path's host fallback
+/// is the substrate `cpu_moe_forward`, not this oracle).
+#[cfg(test)]
+pub(crate) fn moe_expert_contribution_hostonly(
+    h: &[f32],
+    moe: &larql_compute::MoeLayerWeights<'_>,
+    norm_offset: f32,
+    eps: f32,
+    expert_out: &mut [f32],
+    act: &mut [f32],
+) -> Option<Vec<f32>> {
+    use larql_compute::CpuBackend;
+    const CPU: CpuBackend = CpuBackend;
+    moe_expert_contribution_q4k(h, moe, norm_offset, eps, expert_out, act, |w, x, r, k| {
+        CPU.q4k_matvec(w, x, r, k)
+    })
 }
 
 /// `h + b_scale * x` for `[1, hidden]` arrays.
