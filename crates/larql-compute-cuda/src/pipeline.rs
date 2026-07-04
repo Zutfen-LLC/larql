@@ -1765,6 +1765,13 @@ impl CudaBackend {
     /// host this is always `None`, so the MoE block keeps its existing
     /// `cpu_moe_forward` (Q8_K-direct SDOT on Apple Silicon) behaviour
     /// unchanged.
+    ///
+    /// On a CUDA host this first tries the device-resident per-expert chain
+    /// ([`Self::moe_expert_contribution_device_chain`] — single upload of the
+    /// expert input shared by every expert's gate/up, weights served from the
+    /// Session 19 weight cache, one readback per expert) and falls back to the
+    /// per-call matvec path when the chain bails (padding, non-gated
+    /// activation, etc.). Both paths perform the same Q4_K × f32 math.
     pub(crate) fn moe_expert_contribution_device(
         &self,
         h: &[f32],
@@ -1774,10 +1781,134 @@ impl CudaBackend {
         expert_out: &mut [f32],
         act: &mut [f32],
     ) -> Option<Vec<f32>> {
-        self.runtime()?;
+        let runtime = self.runtime()?;
+        // Try the device-resident per-expert chain first (single input upload
+        // + one readback/expert, mirroring the decode/prefill FFN device
+        // chains). Falls through to the per-call matvec path when the chain
+        // bails (down-padding, non-gated activation, etc.) — both paths share
+        // the same Q4_K × f32 math so the two can't numerically diverge.
+        if let Some(out) =
+            self.moe_expert_contribution_device_chain(runtime, h, moe, norm_offset, eps, expert_out)
+        {
+            return Some(out);
+        }
         moe_expert_contribution_q4k(h, moe, norm_offset, eps, expert_out, act, |w, x, r, k| {
             self.q4k_matvec(w, x, r, k)
         })
+    }
+
+    /// Device-resident per-expert FFN chain — the Session 24 device expert
+    /// path collapsed to a single input upload + one readback per expert,
+    /// mirroring the decode/prefill FFN device chains (Sessions 20-23). All
+    /// top-k experts share one upload of `expert_input`; each expert's
+    /// gate/up/activation/down runs as a device-resident chain (weights served
+    /// from the Session 19 weight cache; the intermediate gate/up/activation
+    /// outputs stay on the device between launches, dropping after the
+    /// per-expert readback). Routing + the post-expert norm stay on the host,
+    /// exactly as in [`moe_expert_contribution_q4k`].
+    ///
+    /// Returns `None` (caller falls back to the per-call matvec path) when:
+    /// the experts aren't Q4_K; `hidden` isn't a 256-multiple; the down
+    /// contraction needs zero-padding (`inter_padded != inter`, where the
+    /// chain would feed the activation output directly into the down matvec);
+    /// the activation isn't one of the native gated kernels; or any chained
+    /// launch returns `Err` (the host per-call path is the documented
+    /// fallback). `runtime` must already be present (the caller gates on it).
+    fn moe_expert_contribution_device_chain(
+        &self,
+        runtime: &crate::backend::CudaRuntime,
+        h: &[f32],
+        moe: &larql_compute::MoeLayerWeights<'_>,
+        norm_offset: f32,
+        eps: f32,
+        expert_out: &mut [f32],
+    ) -> Option<Vec<f32>> {
+        use larql_compute::cpu::ops::moe::{
+            moe_expert_input, moe_post_expert_output, moe_route_from_router_input, moe_router_input,
+        };
+        let hidden = h.len();
+        let (half, inter) = moe_expert_chain_eligible(moe, hidden)?;
+        if expert_out.len() != hidden {
+            return None;
+        }
+
+        let expert_input = moe_expert_input(h, moe, norm_offset, eps);
+        let router_in = moe_router_input(h, &expert_input, moe, norm_offset, eps);
+        let (indices, weights) = moe_route_from_router_input(&router_in, moe);
+
+        expert_out.fill(0.0);
+        // Upload the expert input once; every expert's gate/up share this
+        // resident buffer. (Session 24's per-call path re-uploaded the input
+        // on every gate/up/down matvec — 3 × top_k uploads per token.)
+        let x_dev = runtime.upload_f32(&expert_input).ok()?;
+
+        for (&ei, &w) in indices.iter().zip(weights.iter()) {
+            if w == 0.0 {
+                continue;
+            }
+            let Some(&gate_up_bytes) = moe.experts_gate_up.get(ei) else {
+                continue;
+            };
+            let Some(&down_bytes) = moe.experts_down.get(ei) else {
+                continue;
+            };
+            if gate_up_bytes.len() < 2 * half {
+                continue;
+            }
+            let gate_bytes = &gate_up_bytes[..half];
+            let up_bytes = &gate_up_bytes[half..2 * half];
+
+            // Per-expert device chain: gate/up share `x_dev`, activation reads
+            // the gate/up outputs in place, down contracts the activation. The
+            // intermediates stay resident; only `down` is read back. Any
+            // launch error maps to `None` (the host per-call path is the
+            // documented fallback for every native dispatch in this backend).
+            let down_vec: Vec<f32> = {
+                let gate_dev =
+                    match runtime.launch_q4k_matvec_dev(gate_bytes, &x_dev, inter, hidden) {
+                        Ok(d) => d,
+                        Err(_) => return None,
+                    };
+                let up_dev = match runtime.launch_q4k_matvec_dev(up_bytes, &x_dev, inter, hidden) {
+                    Ok(d) => d,
+                    Err(_) => return None,
+                };
+                let act_dev = match moe.activation {
+                    Activation::Silu => {
+                        match runtime.launch_geglu_silu_dev(&gate_dev, &up_dev, inter) {
+                            Ok(d) => d,
+                            Err(_) => return None,
+                        }
+                    }
+                    Activation::GeluTanh => {
+                        match runtime.launch_geglu_gelu_tanh_dev(&gate_dev, &up_dev, inter) {
+                            Ok(d) => d,
+                            Err(_) => return None,
+                        }
+                    }
+                    // `moe_expert_chain_eligible` already rejected the rest.
+                    _ => return None,
+                };
+                // down: num_rows = hidden, contraction = inter (== inter_padded
+                // here — the eligibility gate rejects padding).
+                let down_dev =
+                    match runtime.launch_q4k_matvec_dev(down_bytes, &act_dev, hidden, inter) {
+                        Ok(d) => d,
+                        Err(_) => return None,
+                    };
+                match runtime.sync_dtoh_f32(&down_dev) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                }
+            };
+            if down_vec.len() != hidden {
+                return None;
+            }
+            for (acc, &v) in expert_out.iter_mut().zip(down_vec.iter()) {
+                *acc += w * v;
+            }
+        }
+        Some(moe_post_expert_output(expert_out, moe, norm_offset, eps))
     }
 
     /// Device-routed single-token MoE combine: the device expert
@@ -2418,6 +2549,43 @@ pub(crate) fn apply_outer_combine(
         *c = (dense_row[i] - ha_row[i]) + h2[i];
     }
     outer_post_norm_residual(ha_row, combined, outer_w, layer.norm_offset, layer.eps)
+}
+
+/// Eligibility gate for the device-resident per-expert FFN chain
+/// ([`CudaBackend::moe_expert_contribution_device_chain`]). Returns
+/// `(half_byte_span, inter)` when the chain can run on this MoE layer, else
+/// `None`. Pure (no device touch) so the eligibility logic — the same Q4_K +
+/// 256-alignment gates as [`moe_expert_contribution_q4k`], plus the two
+/// chain-specific gates (no down zero-padding, since the chain feeds the
+/// activation output directly into the down matvec; and a gated activation,
+/// since only `Silu`/`GeluTanh` have device-resident launchers) — is testable
+/// on every host.
+pub(crate) fn moe_expert_chain_eligible(
+    moe: &larql_compute::MoeLayerWeights<'_>,
+    hidden: usize,
+) -> Option<(usize, usize)> {
+    let inter = moe.intermediate_size;
+    if inter == 0 || hidden == 0 {
+        return None;
+    }
+    if !matches!(moe.expert_data_format, QuantFormat::Q4_K) {
+        return None;
+    }
+    if !hidden.is_multiple_of(Q4_K_BLOCK_ELEMS) {
+        return None;
+    }
+    // The chain feeds the `[inter]` activation output straight into the down
+    // matvec; a padded contraction (`inter_padded > inter`) would need a
+    // zero-pad step the chain doesn't perform, so bail to the per-call path
+    // (which pads the host `act` scratch).
+    if moe.inter_padded() != inter {
+        return None;
+    }
+    if !matches!(moe.activation, Activation::Silu | Activation::GeluTanh) {
+        return None;
+    }
+    let half = larql_compute::cpu::ops::moe::q4k_gate_up_half(inter, hidden)?;
+    Some((half, inter))
 }
 
 /// Per-token expert-block contribution computed with **Q4_K × f32** matvecs

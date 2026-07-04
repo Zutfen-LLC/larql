@@ -2373,8 +2373,11 @@ mod tests {
     /// reference when a CUDA runtime is present. The native `q4k_matvec`
     /// kernel is parity-tested against the CPU twin; the only divergence is
     /// the device dequant/FMA rounding, amplified by the down matvec — a
-    /// wiring bug would diverge by O(1). Runtime-gated (no-op on this
-    /// no-CUDA host).
+    /// wiring bug would diverge by O(1). On a CUDA host the fixture is Q4_K /
+    /// 256-aligned / Silu, so [`moe_expert_contribution_device`] takes the
+    /// device-resident per-expert **chain** path (single input upload + one
+    /// readback/expert) — this test therefore pins the chain's numerics end
+    /// to end. Runtime-gated (no-op on this no-CUDA host).
     #[test]
     fn moe_expert_contribution_native_matches_host_when_runtime_available() {
         let b = backend();
@@ -2408,6 +2411,107 @@ mod tests {
         assert!(
             max_abs < 1e-3,
             "native MoE expert contribution diverged from host reference: max_abs={max_abs:.6e}"
+        );
+    }
+
+    /// The device-resident per-expert chain's eligibility gate is the single
+    /// source of truth for whether the chain runs. The Q4_K / 256-aligned /
+    /// gated fixture is eligible; a non-256-multiple hidden, a non-Q4_K
+    /// format, a padded contraction, and a non-gated activation are all
+    /// rejected. Runs on every host (pure gate, no device).
+    #[test]
+    fn moe_expert_chain_eligibility_gate() {
+        let (_h, moe, hidden, _inter) = build_q4k_moe_fixture();
+        // The fixture is Q4_K / hidden=256 / Silu / unpadded → eligible.
+        let (half, inter) = crate::pipeline::moe_expert_chain_eligible(&moe, hidden)
+            .expect("Q4_K aligned gated fixture must be chain-eligible");
+        assert_eq!(inter, moe.intermediate_size);
+        // `half` must equal the shared substrate Q4_K gate/up row stride.
+        assert_eq!(
+            half,
+            larql_compute::cpu::ops::moe::q4k_gate_up_half(inter, hidden).unwrap()
+        );
+
+        // Non-256-multiple hidden → ineligible (no rebuild needed — the gate
+        // is pure and only inspects the dims/format/activation).
+        assert!(
+            crate::pipeline::moe_expert_chain_eligible(&moe, 200).is_none(),
+            "non-256-multiple hidden must be chain-ineligible"
+        );
+
+        // Non-Q4_K format → ineligible (re-fetch a fresh fixture and mutate;
+        // `MoeLayerWeights` isn't `Clone`, but the gate never reads weights).
+        let (_h, mut bf16, hidden, _inter) = build_q4k_moe_fixture();
+        bf16.expert_data_format = QuantFormat::BF16;
+        assert!(
+            crate::pipeline::moe_expert_chain_eligible(&bf16, hidden).is_none(),
+            "non-Q4_K experts must be chain-ineligible"
+        );
+
+        // Padded down contraction → ineligible. `inter=200` rounds up to the
+        // next 256-block (256) under the default quant-block-padded layout, so
+        // `inter_padded != inter`.
+        let (_h, mut padded, hidden, _inter) = build_q4k_moe_fixture();
+        padded.intermediate_size = 200;
+        assert!(
+            crate::pipeline::moe_expert_chain_eligible(&padded, hidden).is_none(),
+            "padded down contraction must be chain-ineligible"
+        );
+
+        // Non-gated activation → ineligible. `Relu` isn't one of the native
+        // gated kernels the chain dispatches.
+        let (_h, mut relu, hidden, _inter) = build_q4k_moe_fixture();
+        relu.activation = larql_compute::Activation::ReLU;
+        assert!(
+            crate::pipeline::moe_expert_chain_eligible(&relu, hidden).is_none(),
+            "non-gated activation must be chain-ineligible"
+        );
+    }
+
+    /// When the device chain bails (here: a padded down contraction, which the
+    /// chain can't feed into the down matvec without a zero-pad step),
+    /// [`moe_expert_contribution_device`] must transparently fall back to the
+    /// per-call matvec path and still match the host-only Q4_K × f32
+    /// reference. Runtime-gated (no-op on this no-CUDA host).
+    #[test]
+    fn moe_expert_device_falls_back_when_chain_ineligible() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // Reuse the Q4_K fixture but force a padded contraction. The expert
+        // weights are unchanged; the per-call matvec path pads the host `act`
+        // scratch (zero columns) before the down matvec, so the math stays
+        // exact.
+        let (h, mut moe, hidden, _inter) = build_q4k_moe_fixture();
+        moe.intermediate_size = 200; // rounds up to inter_padded = 256
+        assert!(moe.inter_padded() != moe.intermediate_size);
+        let inter_padded = moe.inter_padded();
+
+        let (mut eo_dev, mut act_dev) = (vec![0.0f32; hidden], vec![0.0f32; inter_padded]);
+        let device = b
+            .moe_expert_contribution_device(&h, &moe, 0.0, 1e-6, &mut eo_dev, &mut act_dev)
+            .expect("device path must fall back when the chain is ineligible");
+        let (mut eo_host, mut act_host) = (vec![0.0f32; hidden], vec![0.0f32; inter_padded]);
+        let host = crate::pipeline::moe_expert_contribution_hostonly(
+            &h,
+            &moe,
+            0.0,
+            1e-6,
+            &mut eo_host,
+            &mut act_host,
+        )
+        .expect("host-only path must always run");
+
+        assert_eq!(device.len(), host.len());
+        let max_abs = device
+            .iter()
+            .zip(host.iter())
+            .map(|(d, ho)| (d - ho).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "fallback device path diverged from host reference: max_abs={max_abs:.6e}"
         );
     }
 
