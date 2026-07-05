@@ -1,0 +1,98 @@
+# larql-compute-cuda CI (CPU-only compile check).
+#
+# CUDA GPU backend for larql-compute.  This workflow is CPU-only:
+# `larql-compute-cuda` links via cudarc's `fallback-dynamic-loading`,
+# so it compiles on a host with no CUDA driver/runtime installed (see
+# `crates/larql-compute-cuda/Cargo.toml`).  The goal is to catch compile
+# regressions -- cudarc version bumps, or unsafe `launch_builder` arg-order
+# drift (silent UB at runtime, e.g. `runtime.rs` kv_append launch) -- in CI
+# instead of only on a developer machine with a GPU.
+#
+# No GPU is required, and no runtime tests are executed.
+
+name: larql-compute-cuda
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/larql-compute-cuda/**
+      - crates/larql-compute/**
+      - crates/larql-models/**
+      - crates/larql-vindex/**
+      - crates/larql-inference/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/larql-compute-cuda.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - crates/larql-compute-cuda/**
+      - crates/larql-compute/**
+      - crates/larql-models/**
+      - crates/larql-vindex/**
+      - crates/larql-inference/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/larql-compute-cuda.yml
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    name: check · ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install OpenBLAS
+        # `larql-compute` and `larql-inference` link BLAS on Linux via
+        # `openblas-src` (system feature); cudarc itself needs no system
+        # libs thanks to `fallback-dynamic-loading`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Cache cargo registry + build artefacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: Linux-cargo-compute-cuda-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            Linux-cargo-compute-cuda-
+
+      - name: Format check
+        run: cargo fmt -p larql-compute-cuda -- --check
+
+      - name: Check (all targets)
+        # Compile-only; no GPU needed. `fallback-dynamic-loading` means
+        # cudarc resolves the driver at runtime via dlopen, never at link
+        # time, so this is green on a stock ubuntu-latest runner.
+        run: cargo check -p larql-compute-cuda --all-targets
+
+      - name: Clippy (no-deps)
+        # `--no-deps` so warnings in sibling crates in-flight work do
+        # not promote to errors here; matches the local `make` lint
+        # targets and the other compute CI workflows.
+        run: cargo clippy -p larql-compute-cuda --all-targets --no-deps -- -D warnings
+
+      - name: Check larql-inference --features cuda
+        # Ensures the cuda activation path through the inference facade
+        # (optional dep + `larql-vindex/cuda`) still compiles end-to-end.
+        run: cargo check -p larql-inference --features cuda
+
+      - name: Check larql-inference --features gpu-all
+        # `gpu-all` = metal + cuda + vulkan.  On Linux the metal crate
+        # compiles to an empty lib (its source is `#[cfg(target_os =
+        # "macos")]`-gated), so this exercises the cuda + vulkan
+        # activation together without requiring any GPU.
+        run: cargo check -p larql-inference --features gpu-all
