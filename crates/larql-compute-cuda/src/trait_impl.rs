@@ -253,14 +253,15 @@ impl DecodeBackend for CudaBackend {
     }
 
     fn kv_cache_len(&self) -> usize {
-        // The host KV mirror is the source of truth for the host-orchestrated
-        // attention path (the device cache has no attention kernels yet, so
-        // it's only kept for the lifecycle contract). Return the host
-        // mirror's committed length so callers tracking decode position stay
-        // consistent with what attention actually sees. Falls back to the
-        // device cursor when the host mirror is empty (e.g. a caller queries
-        // length before any prefill on a backend that populated the device
-        // cache through another path).
+        // The host KV mirror is the source of truth for position/residual: it
+        // is read by the host-orchestrated attention path and kept in lockstep
+        // with the device-resident activation/attention chain (which drives
+        // its own decode_attention / prefill_attention kernels against the
+        // device K/V buffers). Return the host mirror's committed length so
+        // callers tracking decode position stay consistent with what attention
+        // actually sees. Falls back to the device cursor when the host mirror
+        // is empty (e.g. a caller queries length before any prefill on a
+        // backend that populated the device cache through another path).
         let host_len = self.host_kv_len();
         if host_len > 0 {
             host_len
