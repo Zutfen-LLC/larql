@@ -445,8 +445,11 @@ impl DecodeBackend for CudaBackend {
     /// (`pipeline::host_prefill_kquant`): projections use the amortised
     /// native CUDA q4k/q6k matmul kernels across all `seq_len` positions;
     /// causal attention + elementwise ops on host. Populates the host KV
-    /// mirror (and the device cache via `populate_kv_layer` in lockstep).
-    /// `None` on the scaffold path or for unsupported layer features.
+    /// mirror and advances the device KV cursors in lockstep. The device
+    /// buffers themselves are NOT re-populated (GPU-2002: the device-resident
+    /// attention chain reads fresh per-layer uploads, so the full mirror
+    /// upload was pure waste). `None` on the scaffold path or for unsupported
+    /// layer features.
     fn prefill_kquant(
         &self,
         layers: &[larql_compute::FullPipelineLayer<'_>],
@@ -461,10 +464,19 @@ impl DecodeBackend for CudaBackend {
             return None;
         }
         let h = self.host_prefill_kquant(layers, x, hidden, inter, seq_len, softcap)?;
-        // Populate the device KV cache in lockstep with the host mirror so
-        // `has_kv_cache` / `kv_cache_len` reflect the post-prefill state and
-        // subsequent `decode_token` calls see the right `pos`.
-        {
+        // GPU-2002: the device-resident attention chain
+        // (`device_resident_attention_layer` /
+        // `host_prefill_attention_block_device`) reads K/V from fresh per-layer
+        // uploads, NOT from `CudaKVCache`. The full
+        // `seq * kv_dim * num_layers` host->device mirror upload the
+        // `populate_kv_layer` loop performed was therefore pure waste.
+        //
+        // Today that loop is skipped (see `device_attn_is_kv_source_of_truth`):
+        // only the device cursors advance in lockstep with the host mirror so
+        // `kv_cache_len_native` / the `DecodeBackend` lifecycle contract stay
+        // consistent. The upload is retained behind the gate for the future
+        // device-attention source-of-truth path.
+        if self.device_attn_is_kv_source_of_truth() {
             let kv = self.lock_host_kv();
             for (li, slot) in kv.iter().enumerate() {
                 let (k_cache, v_cache) = slot;
@@ -481,6 +493,12 @@ impl DecodeBackend for CudaBackend {
                     );
                 }
             }
+        } else {
+            // Cheap cursor-only update: no data upload, just advance every
+            // device layer's `current_len` to the post-prefill length so the
+            // lifecycle contract (`kv_cache_len_native`) reflects the host
+            // mirror without the `seq*kv_dim*num_layers` transfer.
+            self.advance_kv_cache_cursors(seq_len);
         }
         Some(h)
     }

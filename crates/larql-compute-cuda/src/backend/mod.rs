@@ -724,6 +724,35 @@ impl CudaBackend {
         }
     }
 
+    /// Whether the device KV cache (`CudaKVCache`) is the source of truth for
+    /// attention K/V reads. Today attention runs through the device-resident
+    /// chain (`device_resident_attention_layer` /
+    /// `host_prefill_attention_block_device`), which uploads fresh K/V per
+    /// layer, so this is `false`. When a future device-side attention kernel
+    /// reads directly from `CudaKVCache`, flip this to `true` to re-enable the
+    /// lockstep mirror upload in `prefill_kquant` (GPU-2002).
+    pub(crate) fn device_attn_is_kv_source_of_truth(&self) -> bool {
+        false
+    }
+
+    /// Advance every layer's device KV cursor to `len` without uploading any
+    /// data -- a cheap lifecycle-bookkeeping update. Keeps `kv_cache_len_native`
+    /// / the `DecodeBackend` lifecycle contract consistent with the post-prefill
+    /// host mirror length while skipping the wasteful full mirror upload
+    /// (GPU-2002). The device buffers are not zeroed; cursors just report `len`
+    /// so `kv_cache_len` / future device-attention paths see the right committed
+    /// length. No-op when no device cache is allocated (mirrors the `None`-cache
+    /// no-op semantics of `native_kv_append`).
+    pub(crate) fn advance_kv_cache_cursors(&self, len: usize) {
+        if let Ok(mut guard) = self.kv_cache.lock() {
+            if let Some(cache) = guard.as_mut() {
+                for layer in &mut cache.layers {
+                    layer.current_len = len;
+                }
+            }
+        }
+    }
+
     pub(crate) fn runtime_summary(&self) -> &str {
         match (&self.runtime, &self.runtime_status) {
             (Some(runtime), _) => runtime.summary(),
