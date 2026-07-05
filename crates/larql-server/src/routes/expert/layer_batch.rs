@@ -31,6 +31,8 @@ use crate::error::ServerError;
 use crate::state::AppState;
 
 use super::cpu::run_experts_cpu_batch;
+#[cfg(feature = "cuda-experts")]
+use super::cuda::run_experts_cuda_batch;
 
 // Limits concurrent `run_experts_cpu_batch` calls to the number of logical
 // CPUs on the machine.  Without this, 30 simultaneous predispatch requests
@@ -102,6 +104,17 @@ pub async fn handle_experts_layer_batch(
         .map_err(|_| ServerError::Internal("compute semaphore closed".into()))?;
     let (weighted_sum, t_spawn_internal) = tokio::task::spawn_blocking(move || {
         let t_in = std::time::Instant::now();
+        // GPU-3003: try the CUDA expert route first when available (opt-in via
+        // LARQL_USE_CUDA_EXPERTS=1 on a cuda-experts build with a runtime).
+        // Returns Ok(None) when unavailable → fall back to the CPU path so a
+        // CUDA-host build and a CPU-only build produce identical output.
+        #[cfg(feature = "cuda-experts")]
+        let r = match run_experts_cuda_batch(&state, layer, &residual, &expert_ids, &expert_weights) {
+            Ok(Some(out)) => Ok(out),
+            Ok(None) => run_experts_cpu_batch(&state, layer, &residual, &expert_ids, &expert_weights),
+            Err(e) => Err(e),
+        };
+        #[cfg(not(feature = "cuda-experts"))]
         let r = run_experts_cpu_batch(&state, layer, &residual, &expert_ids, &expert_weights);
         let t_internal = t_in.elapsed();
         (r, t_internal)
@@ -178,6 +191,14 @@ pub async fn handle_experts_layer_batch_f16(
         .map_err(|_| ServerError::Internal("compute semaphore closed".into()))?;
     let (weighted_sum, t_spawn_internal) = tokio::task::spawn_blocking(move || {
         let t_in = std::time::Instant::now();
+        // GPU-3003: try the CUDA expert route first; fall back to CPU.
+        #[cfg(feature = "cuda-experts")]
+        let r = match run_experts_cuda_batch(&state, layer, &residual, &expert_ids, &expert_weights) {
+            Ok(Some(out)) => Ok(out),
+            Ok(None) => run_experts_cpu_batch(&state, layer, &residual, &expert_ids, &expert_weights),
+            Err(e) => Err(e),
+        };
+        #[cfg(not(feature = "cuda-experts"))]
         let r = run_experts_cpu_batch(&state, layer, &residual, &expert_ids, &expert_weights);
         let t_internal = t_in.elapsed();
         (r, t_internal)

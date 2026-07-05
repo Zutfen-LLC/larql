@@ -129,6 +129,15 @@ pub struct LoadedModel {
     /// Only populated when the server has interleaved Q4K data loaded.
     #[cfg(all(feature = "metal-experts", target_os = "macos"))]
     pub metal_ffn_layer_bufs: std::sync::OnceLock<Vec<[larql_compute_metal::MetalBuffer; 3]>>,
+
+    /// Lazy-initialised CUDA backend for GPU expert dispatch (GPU-3003).
+    /// `Some(Some(backend))` = initialised, runtime available;
+    /// `Some(None)` = initialised, no CUDA runtime / construction failed;
+    /// `None` = not yet initialised. Only present under `--features cuda-experts`.
+    /// The backend holds the persistent device-resident weight cache so expert
+    /// weights stay resident on the GPU across requests.
+    #[cfg(feature = "cuda-experts")]
+    pub cuda_backend: std::sync::OnceLock<Option<larql_compute_cuda::CudaBackend>>,
 }
 
 impl LoadedModel {
@@ -471,6 +480,8 @@ mod loaded_model_tests {
             moe_scratches: std::sync::Mutex::new(HashMap::new()),
             #[cfg(all(feature = "metal-experts", target_os = "macos"))]
             metal_ffn_layer_bufs: std::sync::OnceLock::new(),
+            #[cfg(feature = "cuda-experts")]
+            cuda_backend: std::sync::OnceLock::new(),
         }
     }
 
