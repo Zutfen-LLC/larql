@@ -17,6 +17,37 @@ type ShardCallItem = (usize, usize, Vec<f32>);
 /// Output of `forward_layer_moe`: (output rows, optional per-expert (logit, weight)).
 type LayerMoeResult = (Vec<f32>, Vec<(f32, f32)>);
 
+// ── GPU-3002 — retry / failover configuration ─────────────────────────────
+//
+// `LARQL_MOE_MAX_RETRIES` bounds the number of retry attempts after the
+// first dispatch fails with a retryable error. Default 2 (so up to 3
+// total attempts including the original). Set to 0 to disable retry.
+//
+// Backoff is fixed (no jitter) and small — 2ms, 8ms — because the
+// dominant case is failover to a *different replica*, not waiting for the
+// same shard to recover. The backoff only applies to same-shard retries.
+
+/// Read the max-retry count from the environment once at first use.
+fn moe_max_retries() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("LARQL_MOE_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Backoff duration for attempt N (0-indexed). Returns 0 for attempt 0
+/// (no backoff on the first failure) and a small bounded delay otherwise.
+fn moe_retry_backoff(attempt: usize) -> std::time::Duration {
+    match attempt {
+        0 => std::time::Duration::ZERO,
+        1 => std::time::Duration::from_millis(2),
+        _ => std::time::Duration::from_millis(8),
+    }
+}
+
 // ── RemoteMoeBackend ───────────────────────────────────────────────────────
 
 /// Remote MoE expert backend. Thread-safe — all methods take `&self`.
@@ -104,7 +135,12 @@ impl RemoteMoeBackend {
     ///   3. One `POST /v1/expert/batch` per shard (parallel).
     ///   4. Weighted outputs are summed; post-experts norm applied.
     ///
-    /// Returns the expert-block contribution (same shape as `h`).
+    /// **GPU-3002** — on a transient shard error (timeout, 503, connection),
+    /// the affected experts are re-dispatched to an alternate replica that
+    /// owns the same `(layer, expert_id)`, with bounded retries + backoff.
+    /// Fatal errors (`NoShard`, 400, shape mismatch) fail immediately.
+    /// When no shard owns a required expert at all, returns `NoShard`
+    /// unchanged (no retry possible).
     pub fn forward_moe(
         &self,
         layer: usize,
@@ -158,7 +194,7 @@ impl RemoteMoeBackend {
             }
         }
 
-        let results_per_shard: Vec<Result<Vec<f32>, RemoteMoeError>> = non_empty
+        let results_per_shard: Vec<(usize, Result<Vec<f32>, RemoteMoeError>)> = non_empty
             .par_iter()
             .map(|(si, ids, ws)| {
                 let shard_url = &shards[*si].config.url;
@@ -179,26 +215,152 @@ impl RemoteMoeBackend {
                         ids.len(),
                     );
                 }
-                result
+                (*si, result)
             })
             .collect();
 
-        // 4. Sum shard partials into the layer's combined expert output.
+        // 4. GPU-3002 — retry failed shards against alternate replicas.
+        //    Separate successful partials from retryable/fatal errors.
         let mut out = vec![0.0f32; hidden];
-        for result in results_per_shard {
-            let shard_out = result?;
-            if shard_out.len() != hidden {
-                return Err(RemoteMoeError::BadResponse(format!(
-                    "shard returned {} floats, expected {hidden}",
-                    shard_out.len()
-                )));
-            }
-            for (acc, &v) in out.iter_mut().zip(shard_out.iter()) {
-                *acc += v;
+        // (expert_ids, weights) that need re-dispatch after a retryable error.
+        let mut pending: (Vec<u32>, Vec<f32>) = (Vec::new(), Vec::new());
+
+        for (si, result) in results_per_shard {
+            match result {
+                Ok(shard_out) => {
+                    if shard_out.len() != hidden {
+                        return Err(RemoteMoeError::BadResponse(format!(
+                            "shard returned {} floats, expected {hidden}",
+                            shard_out.len()
+                        )));
+                    }
+                    for (acc, &v) in out.iter_mut().zip(shard_out.iter()) {
+                        *acc += v;
+                    }
+                }
+                Err(e) if e.is_retryable() => {
+                    // Collect this shard's experts for failover retry.
+                    let ids = &shard_calls[si].1;
+                    let wts = &shard_calls[si].2;
+                    pending.0.extend_from_slice(ids);
+                    pending.1.extend_from_slice(wts);
+                }
+                Err(e) => return Err(e), // fatal — propagate immediately
             }
         }
 
-        // 5. Post-experts norm.
+        // 5. GPU-3002 — retry loop: re-dispatch pending experts to alternate
+        //    replicas. When no alternate replica exists (single-owner
+        //    deployment), this becomes a same-shard retry after backoff —
+        //    useful for transient 503/saturation on a healthy shard.
+        let original_failed_shard_indices: Vec<usize> = shard_calls
+            .iter()
+            .filter(|(_, ids, _)| !ids.is_empty())
+            .map(|(si, _, _)| *si)
+            .collect();
+        let mut attempt = 0usize;
+        while !pending.0.is_empty() {
+            if attempt > moe_max_retries() {
+                // Exhausted retries — return a retryable error.
+                return Err(RemoteMoeError::ServerError {
+                    status: 503,
+                    body: format!(
+                        "MoE expert retry exhausted after {} attempts (layer {layer})",
+                        moe_max_retries() + 1
+                    ),
+                });
+            }
+            let backoff = moe_retry_backoff(attempt);
+            if !backoff.is_zero() {
+                std::thread::sleep(backoff);
+            }
+            if attempt > 0 {
+                metrics::record_moe_retry();
+            }
+
+            // Re-route pending experts to alternate replicas (shards
+            // other than the original owner), or back to the same shard
+            // if no alternate exists.
+            let mut retry_calls: Vec<(usize, Vec<u32>, Vec<f32>)> = (0..shards.len())
+                .map(|i| (i, Vec::new(), Vec::new()))
+                .collect();
+            let mut did_failover = false;
+
+            for (&expert_id, &weight) in pending.0.iter().zip(pending.1.iter()) {
+                let eid = expert_id as usize;
+                // Prefer an alternate shard not in the original failed set.
+                let alt = shards
+                    .iter()
+                    .enumerate()
+                    .find(|(si, s)| {
+                        s.owns_unit(layer, eid)
+                            && (!original_failed_shard_indices.contains(si) || attempt > 0)
+                    })
+                    .map(|(si, _)| si)
+                    .or_else(|| {
+                        // Fall back to any owner (same-shard retry).
+                        shards
+                            .iter()
+                            .position(|s| s.owns_unit(layer, eid))
+                    });
+                match alt {
+                    Some(si) => {
+                        if !original_failed_shard_indices.contains(&si) {
+                            did_failover = true;
+                        }
+                        retry_calls[si].1.push(expert_id);
+                        retry_calls[si].2.push(weight);
+                    }
+                    None => {
+                        return Err(RemoteMoeError::NoShard { expert_id: eid });
+                    }
+                }
+            }
+
+            if did_failover {
+                metrics::record_moe_failover();
+            }
+
+            let retry_non_empty: Vec<(usize, &Vec<u32>, &Vec<f32>)> = retry_calls
+                .iter()
+                .filter(|(_, ids, _)| !ids.is_empty())
+                .map(|(si, ids, ws)| (*si, ids, ws))
+                .collect();
+
+            let retry_results: Vec<(usize, Result<Vec<f32>, RemoteMoeError>)> = retry_non_empty
+                .par_iter()
+                .map(|(si, ids, ws)| (*si, shards[*si].call_layer_batch(layer, h, ids, ws)))
+                .collect();
+
+            let mut next_pending: (Vec<u32>, Vec<f32>) = (Vec::new(), Vec::new());
+            for (si, result) in retry_results {
+                match result {
+                    Ok(shard_out) => {
+                        if shard_out.len() != hidden {
+                            return Err(RemoteMoeError::BadResponse(format!(
+                                "retry shard returned {} floats, expected {hidden}",
+                                shard_out.len()
+                            )));
+                        }
+                        for (acc, &v) in out.iter_mut().zip(shard_out.iter()) {
+                            *acc += v;
+                        }
+                    }
+                    Err(e) if e.is_retryable() && attempt < moe_max_retries() => {
+                        let ids = &retry_calls[si].1;
+                        let wts = &retry_calls[si].2;
+                        next_pending.0.extend_from_slice(ids);
+                        next_pending.1.extend_from_slice(wts);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            pending = next_pending;
+            attempt += 1;
+        }
+
+        // 6. Post-experts norm.
         Ok(rms_norm(&out, router.post_experts_norm, eps, norm_offset))
     }
 
@@ -362,7 +524,22 @@ impl RemoteMoeBackend {
         eps: f32,
     ) -> Result<Vec<f32>, RemoteMoeError> {
         let inflight = self.forward_moe_stream_fire(layer, h, router, streams, norm_offset, eps)?;
-        self.forward_moe_stream_collect(streams, inflight)
+        match self.forward_moe_stream_collect(streams, inflight) {
+            Ok(h2) => Ok(h2),
+            Err(e) if e.is_retryable() && moe_max_retries() > 0 => {
+                // GPU-3002 — the gRPC stream to the failed shard is now
+                // broken (the shard is dead or saturated). Fall back to
+                // `forward_moe`, which re-dispatches the layer against
+                // alternate replicas via HTTP/UDS with built-in
+                // retry/failover. This degrades the failed layer to the
+                // unary path for one token, then the decode loop continues
+                // on the (now-recovered or alternate) streams.
+                metrics::record_moe_retry();
+                metrics::record_moe_failover();
+                self.forward_moe(layer, h, router, norm_offset, eps)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Fire half of `forward_moe_stream`: route locally, push one input per
