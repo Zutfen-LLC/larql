@@ -1,14 +1,28 @@
-# larql-compute-cuda CI (CPU-only compile check).
+# larql-compute-cuda CI.
 #
-# CUDA GPU backend for larql-compute.  This workflow is CPU-only:
-# `larql-compute-cuda` links via cudarc's `fallback-dynamic-loading`,
-# so it compiles on a host with no CUDA driver/runtime installed (see
-# `crates/larql-compute-cuda/Cargo.toml`).  The goal is to catch compile
-# regressions -- cudarc version bumps, or unsafe `launch_builder` arg-order
-# drift (silent UB at runtime, e.g. `runtime.rs` kv_append launch) -- in CI
-# instead of only on a developer machine with a GPU.
+# Two jobs:
 #
-# No GPU is required, and no runtime tests are executed.
+#  1. `check` (CPU-only compile) -- runs on the self-hosted Linux x64 runner
+#     pool, no GPU.  `larql-compute-cuda` links via cudarc's
+#     `fallback-dynamic-loading`, so it compiles on a host with no CUDA
+#     driver/runtime installed (see `crates/larql-compute-cuda/Cargo.toml`).
+#     Catches compile regressions -- cudarc version bumps, or unsafe
+#     `launch_builder` arg-order drift (silent UB at runtime, e.g.
+#     `runtime.rs` kv_append launch) -- in CI instead of only on a developer
+#     machine with a GPU.  (Added in GPU-0002; moved to self-hosted runners
+#     in the self-hosted-runner migration.)
+#
+#  2. `self-hosted-runtime` (native GPU) -- runs on a self-hosted NVIDIA
+#     runner (`[self-hosted, linux, nvidia]`), triggered by PRs labeled
+#     `gpu-cuda` and a nightly schedule.  Sets `LARQL_REQUIRE_CUDA=1` so the
+#     runtime-gated tests fail loudly instead of silently skipping when a
+#     misconfigured runner exposes no CUDA device, and runs the full
+#     `cargo test -p larql-compute-cuda` against the real device.  Device /
+#     NVRTC diagnostics are printed to job output.  (Added in GPU-1001A.)
+#
+# The physical NVIDIA runner is provisioned by a separate ops task; until it
+# is registered the `self-hosted-runtime` job will stay queued (it does NOT
+# affect the CPU-only `check` job, which stays green).
 
 name: larql-compute-cuda
 
@@ -35,6 +49,11 @@ on:
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/larql-compute-cuda.yml
+  schedule:
+    # Nightly at 05:30 UTC -- gives a daily native-CUDA signal even when no
+    # `gpu-cuda`-labeled PR is open.  Only drives `self-hosted-runtime` (the
+    # CPU compile job is already covered by every push/PR).
+    - cron: "30 5 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -96,3 +115,81 @@ jobs:
         # "macos")]`-gated), so this exercises the cuda + vulkan
         # activation together without requiring any GPU.
         run: cargo check -p larql-inference --features gpu-all
+
+  # Native CUDA runtime tests on a self-hosted NVIDIA runner.
+  #
+  # `LARQL_REQUIRE_CUDA=1` turns the runtime-gated tests (the
+  # `if !b.test_runtime_gate() { return; }` guards in
+  # `crates/larql-compute-cuda/src/lib.rs`) from silent skips into loud
+  # failures, so a runner that is registered but has no working CUDA
+  # driver/device fails the job instead of passing vacuously.  When the env
+  # var is unset the guards keep their current skip behaviour.
+  #
+  # Until the physical NVIDIA runner is registered (separate ops task) this
+  # job will wait in the queue -- it never blocks `check`, which runs on the
+  # self-hosted Linux x64 pool and stays green.
+  self-hosted-runtime:
+    name: self-hosted-runtime · nvidia
+    needs: check
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'gpu-cuda')
+    runs-on: [self-hosted, linux, nvidia]
+    timeout-minutes: 45
+    env:
+      LARQL_REQUIRE_CUDA: "1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install OpenBLAS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Cache cargo registry + build artefacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: Linux-cargo-compute-cuda-selfhosted-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            Linux-cargo-compute-cuda-selfhosted-
+
+      - name: Diagnose CUDA runtime / device
+        # Surfaces the driver/device/NVRTC-load state up front so a
+        # misconfigured runner is obvious in the job log. `runtime_summary()`
+        # (== `device_info()`) prints device name, ordinal, compute capability
+        # and the NVRTC module-load status (see `CudaRuntime::initialize` in
+        # `backend/runtime.rs`). There is no standalone `device_info` binary,
+        # so the runtime state is surfaced by the first runtime-gated test
+        # that runs (or, if the runtime is missing, by the LARQL_REQUIRE_CUDA=1
+        # panic). `nvidia-smi` is the authoritative driver/device check.
+        run: |
+          echo "::group::nvidia-smi"
+          nvidia-smi || echo "(nvidia-smi not found -- driver missing?)"
+          echo "::endgroup::"
+          echo "::group::nvcc / NVRTC"
+          nvcc --version 2>/dev/null || echo "(nvcc not found; cudarc bundles its own NVRTC at runtime via fallback-dynamic-loading)"
+          echo "::endgroup::"
+          echo "::group::Driver/library"
+          ldconfig -p 2>/dev/null | grep -iE "libcuda|libnvidia" | head -20 || true
+          echo "::endgroup::"
+          echo "device_info() / runtime_summary() will be printed by the test binary below (or by the LARQL_REQUIRE_CUDA=1 panic if the runtime is missing)."
+
+      - name: Format check
+        run: cargo fmt -p larql-compute-cuda -- --check
+
+      - name: Clippy (no-deps)
+        run: cargo clippy -p larql-compute-cuda --all-targets --no-deps -- -D warnings
+
+      - name: Native CUDA tests (LARQL_REQUIRE_CUDA=1)
+        # Runs the full native test suite.  Runtime-gated tests execute on the
+        # device; if the runner exposes no working CUDA runtime the
+        # LARQL_REQUIRE_CUDA=1 guard panics loudly instead of skipping.
+        run: cargo test -p larql-compute-cuda

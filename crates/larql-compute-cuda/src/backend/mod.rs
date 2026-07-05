@@ -209,6 +209,37 @@ impl CudaBackend {
         self.runtime.is_some()
     }
 
+    /// Test-only runtime gate that honours `LARQL_REQUIRE_CUDA`.
+    ///
+    /// Returns `true` when the native runtime is available (continue the
+    /// test).  When no runtime is present:
+    ///   - `LARQL_REQUIRE_CUDA` unset or falsy -> returns `false` so the
+    ///     caller's `if !gate { return; }` skips the test (legacy
+    ///     behaviour on GPU-less hosts).
+    ///   - `LARQL_REQUIRE_CUDA` set to a truthy value (`1`/`true`/`TRUE`)
+    ///     -> panics loudly with `runtime_summary()` so a misconfigured
+    ///     self-hosted NVIDIA runner (registered but no working CUDA
+    ///     device) fails CI instead of passing vacuously with every test
+    ///     skipped.
+    #[cfg(test)]
+    pub(crate) fn test_runtime_gate(&self) -> bool {
+        if self.native_runtime_available() {
+            return true;
+        }
+        let require = matches!(
+            std::env::var("LARQL_REQUIRE_CUDA").as_deref(),
+            Ok("1" | "true" | "TRUE")
+        );
+        if require {
+            panic!(
+                "LARQL_REQUIRE_CUDA=1 is set but no native CUDA runtime is \
+                 available; runtime_summary: {}",
+                self.runtime_summary()
+            );
+        }
+        false
+    }
+
     /// Borrow the device runtime (`None` on the scaffold path). Used by the
     /// device-resident activation chain in `pipeline.rs` to drive several
     /// kernels on the same stream and read back once.

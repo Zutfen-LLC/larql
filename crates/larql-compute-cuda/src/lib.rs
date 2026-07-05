@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn q4k_matmul_zero_shape_returns_empty_without_device() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights();
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn native_q4k_matvec_matches_cpu_when_runtime_is_available() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn native_q6k_matvec_matches_cpu_when_runtime_is_available() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn native_q6k_matmul_matches_cpu_when_runtime_is_available() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -299,7 +299,7 @@ mod tests {
     fn q6k_matmul_trait_native_matches_cpu_when_runtime_is_available() {
         use larql_compute::backend::QuantMatVec;
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn native_q4k_dual_matvec_matches_cpu_when_runtime_is_available() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn native_q4k_matmul_matches_cpu_when_runtime_is_available() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn native_f32_gemv_matches_cpu_when_runtime_is_available() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn native_f32_gemv_rejects_dim_exceeding_u32_index_limit() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
         let n = u32::MAX as usize + 1;
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn native_f16_gemv_matches_cpu_when_runtime_is_available() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn native_f16_gemv_rejects_dim_exceeding_u32_index_limit() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
         // A dim just above u32::MAX — the guard fires before the length
@@ -582,7 +582,7 @@ mod tests {
     fn native_q4_matvec_matches_cpu_when_runtime_is_available() {
         use larql_compute::backend::QuantMatVec;
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -611,7 +611,7 @@ mod tests {
     fn native_q4_vecmat_matches_cpu_when_runtime_is_available() {
         use larql_compute::backend::QuantMatVec;
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
 
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn native_q4_matvec_rejects_dim_exceeding_u32_index_limit() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
         let n = u32::MAX as usize + 1;
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn native_q4_vecmat_rejects_dim_exceeding_u32_index_limit() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
         let inter = u32::MAX as usize + 1;
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn preallocate_kv_cache_allocates_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         b.preallocate_kv_cache_per_layer(&[(2, 64), (4, 128)], 16);
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn native_populate_kv_layer_appends_and_advances_cursor() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let (num_kv, head_dim, seq) = (2usize, 64usize, 3usize);
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn native_kv_append_rejects_pos_exceeding_u32_index_limit() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         b.preallocate_kv_cache_per_layer(&[(2, 64)], 16);
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn native_kv_append_rejects_row_elems_product_exceeding_u32_index_limit() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         // Preallocate with a tiny real cache so the lookup succeeds; the
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn native_kv_append_rejects_block_overflow() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         b.preallocate_kv_cache_per_layer(&[(2, 64)], 16);
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn native_kv_append_rejects_slot_beyond_cache_capacity() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let (num_kv, head_dim) = (2usize, 64usize);
@@ -855,7 +855,7 @@ mod tests {
     #[test]
     fn preallocate_kv_cache_reallocates_on_larger_max_seq() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         b.preallocate_kv_cache_per_layer(&[(2, 64)], 4);
@@ -938,7 +938,7 @@ mod tests {
     #[test]
     fn native_path_advertises_fused_capabilities() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         assert!(b.supports(larql_compute::Capability::QuantMatVec));
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn prefill_kquant_matches_cpu_reference_when_runtime_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights();
@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn device_ffn_chain_matches_host_orchestrated_when_runtime_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights();
@@ -1170,7 +1170,7 @@ mod tests {
     #[test]
     fn decode_device_ffn_chain_matches_host_when_runtime_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let hidden: usize = 256;
@@ -1273,7 +1273,7 @@ mod tests {
     #[test]
     fn prefill_device_attention_chain_matches_host_when_runtime_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let hidden: usize = 256;
@@ -1387,7 +1387,7 @@ mod tests {
     #[test]
     fn decode_device_attention_chain_matches_host_when_runtime_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let hidden: usize = 256;
@@ -1656,7 +1656,7 @@ mod tests {
     #[test]
     fn prefill_kquant_matches_cpu_on_rope_scaled_fixture() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights_rope_scaled();
@@ -1707,7 +1707,7 @@ mod tests {
     #[test]
     fn decode_token_matches_cpu_reference_when_runtime_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights();
@@ -1777,7 +1777,7 @@ mod tests {
     #[test]
     fn multi_token_decode_matches_cpu_reference() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights();
@@ -1855,7 +1855,7 @@ mod tests {
     #[test]
     fn decode_token_with_state_dump_respects_mask() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights();
@@ -2383,7 +2383,7 @@ mod tests {
     #[test]
     fn moe_expert_contribution_native_matches_host_when_runtime_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let (h, moe, hidden, _inter) = build_q4k_moe_fixture();
@@ -2478,7 +2478,7 @@ mod tests {
     #[test]
     fn moe_expert_device_falls_back_when_chain_ineligible() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         // Reuse the Q4_K fixture but force a padded contraction. The expert
@@ -2593,7 +2593,7 @@ mod tests {
     #[test]
     fn moe_prefill_and_decode_run_through_trait_surface() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let weights = Box::leak(Box::new(make_test_gemma4_moe_weights()));
@@ -2736,7 +2736,7 @@ mod tests {
     fn native_rms_norm_matches_cpu_when_runtime_is_available() {
         use larql_compute::residual::rms_norm_eps;
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let rows = 3usize;
@@ -2764,7 +2764,7 @@ mod tests {
     fn native_rms_norm_no_weight_matches_cpu_when_runtime_is_available() {
         use larql_compute::residual::rms_norm_eps;
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let rows = 2usize;
@@ -2790,7 +2790,7 @@ mod tests {
     fn native_rms_norm_heads_weighted_matches_cpu_when_runtime_is_available() {
         use larql_compute::residual::rms_norm_heads;
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let seq = 2usize;
@@ -2832,7 +2832,7 @@ mod tests {
     fn native_rms_norm_heads_no_weight_matches_cpu_when_runtime_is_available() {
         use larql_compute::residual::rms_norm_heads_no_weight;
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let seq = 2usize;
@@ -2991,7 +2991,7 @@ mod tests {
     #[test]
     fn native_geglu_silu_matches_host_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let n = 4096usize;
@@ -3030,7 +3030,7 @@ mod tests {
     #[test]
     fn native_geglu_gelu_tanh_matches_host_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let n = 4096usize;
@@ -3068,7 +3068,7 @@ mod tests {
     #[test]
     fn native_activation_silu_matches_host_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let n = 4096usize;
@@ -3097,7 +3097,7 @@ mod tests {
     #[test]
     fn native_activation_gelu_tanh_matches_host_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let n = 4096usize;
@@ -3128,7 +3128,7 @@ mod tests {
     #[test]
     fn native_geglu_silu_rejects_dim_exceeding_u32_index_limit() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         // u32::MAX + 1 elements. The host can't actually allocate 4B f32
@@ -3186,7 +3186,7 @@ mod tests {
     #[test]
     fn native_residual_add_matches_host_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let n = 8192usize;
@@ -3223,7 +3223,7 @@ mod tests {
     #[test]
     fn native_residual_add_rejects_dim_exceeding_u32_index_limit() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let h = vec![0.0f32; 4];
@@ -3290,7 +3290,7 @@ mod tests {
     #[test]
     fn native_rope_matches_host_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let seq = 8usize;
@@ -3364,7 +3364,7 @@ mod tests {
     #[test]
     fn native_rope_rejects_invalid_shapes() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let seq = 2usize;
@@ -3479,7 +3479,7 @@ mod tests {
     #[test]
     fn native_decode_attention_matches_host_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let head_dim = 64usize;
@@ -3537,7 +3537,7 @@ mod tests {
     #[test]
     fn native_decode_attention_rejects_invalid_shapes() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         // q length (4) disagrees with num_q*head_dim (8).
@@ -3645,7 +3645,7 @@ mod tests {
     #[test]
     fn native_prefill_attention_matches_host_when_runtime_is_available() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         let head_dim = 32usize;
@@ -3709,7 +3709,7 @@ mod tests {
     #[test]
     fn native_prefill_attention_rejects_invalid_shapes() {
         let b = backend();
-        if !b.native_runtime_available() {
+        if !b.test_runtime_gate() {
             return;
         }
         // q length disagrees with seq_len*num_q*head_dim.
@@ -3744,7 +3744,7 @@ mod tests {
     #[test]
     fn weight_cache_reuses_bytes_across_launches() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights();
@@ -3804,7 +3804,7 @@ mod tests {
     #[test]
     fn reset_kv_cache_flushes_weight_cache() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
         let weights = make_test_q4k_weights();
@@ -3858,7 +3858,7 @@ mod tests {
     #[test]
     fn weight_cache_reuses_floats_across_launches() {
         let backend = backend();
-        if !backend.native_runtime_available() {
+        if !backend.test_runtime_gate() {
             return;
         }
         let rows = 4usize;
