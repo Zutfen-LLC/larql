@@ -2262,6 +2262,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "criterion",
  "half",
  "larql-compute",
  "larql-models",

@@ -2,6 +2,7 @@ use crate::backend::runtime::{try_init, VulkanRuntime};
 use crate::options::BackendOptions;
 
 pub mod runtime;
+mod device_chain;
 
 #[derive(Debug)]
 pub struct VulkanBackend {

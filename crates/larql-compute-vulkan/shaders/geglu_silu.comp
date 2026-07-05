@@ -1,0 +1,30 @@
+// GEGLU (SiLU-gated) activation compute shader (GLSL / Vulkan).
+//
+// out[i] = silu(gate[i]) * up[i], where silu(x) = x / (1 + exp(-x)).
+//
+// Element-wise: one invocation per element. This is the Vulkan twin of
+// the CPU reference `larql_compute::cpu::ops::geglu::geglu_silu`.
+//
+// Bindings: gate (ro), up (ro), out (wo). Length = seq * inter.
+// No push constants needed.
+
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly restrict buffer GateBlock { float gate[]; };
+layout(set = 0, binding = 1) readonly restrict buffer UpBlock { float up[]; };
+layout(set = 0, binding = 2) writeonly buffer OutBlock { float out_vals[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    // Guard with the bound from the smaller binding; callers size the
+    // dispatch to the element count, so a plain length check isn't
+    // available here. We rely on the dispatch geometry to not overshoot.
+    if (i >= gate.length()) {
+        return;
+    }
+    float g = gate[i];
+    float silu_g = g / (1.0 + exp(-g));
+    out_vals[i] = silu_g * up[i];
+}

@@ -185,9 +185,9 @@ impl DecodeBackend for VulkanBackend {}
 impl ComputeBackend for VulkanBackend {
     fn name(&self) -> &str {
         if self.native_runtime_available() {
-            "vulkan (native q4_k matvec; remaining ops CPU fallback)"
+            "vulkan (native FFN chain: q4k_matmul/rms_norm/geglu/residual; attention/moe CPU fallback)"
         } else {
-            "vulkan (cpu-delegate scaffold)"
+            "vulkan (cpu-delegate scaffold; no FFN chain without a device)"
         }
     }
 

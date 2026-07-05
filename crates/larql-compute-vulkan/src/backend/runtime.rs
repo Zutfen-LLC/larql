@@ -30,22 +30,40 @@ use crate::options::BackendOptions;
 /// `shaders/q4k_matmul.comp` and embedded as a checked-in byte array.
 const Q4K_MATVEC_SPV: &[u8] = include_bytes!("../../spv/q4k_matmul.spv");
 
+/// The Q4_K matmul (seq-general) SPIR-V - the 2D-dispatch twin of the matvec
+/// shader, used by the device-resident FFN chain for seq > 1.
+const Q4K_MATMUL_SPV: &[u8] = include_bytes!("../../spv/q4k_matmul2d.spv");
+/// RMSNorm SPIR-V - post-embedding + per-FFN-input normalisation.
+const RMS_NORM_SPV: &[u8] = include_bytes!("../../spv/rms_norm.spv");
+/// GEGLU (SiLU-gated) activation SPIR-V - `silu(gate) * up`.
+const GEGLU_SILU_SPV: &[u8] = include_bytes!("../../spv/geglu_silu.spv");
+/// Residual-add SPIR-V - `a + b`, completes the FFN chain.
+const RESIDUAL_ADD_SPV: &[u8] = include_bytes!("../../spv/residual_add.spv");
+
 /// A live Vulkan device + queue + descriptor pool, holding the compiled
 /// q4k_matvec pipeline. Built by [`VulkanRuntime::initialize`]; stored as
 /// `Option<Arc<VulkanRuntime>>` on [`super::VulkanBackend`].
 pub(crate) struct VulkanRuntime {
     _entry: Arc<Entry>,
-    instance: Arc<Instance>,
-    device: ash::Device,
-    physical_device: vk::PhysicalDevice,
-    queue_family_index: u32,
-    command_pool: vk::CommandPool,
-    descriptor_pool: vk::DescriptorPool,
+    pub(super) instance: Arc<Instance>,
+    pub(super) device: ash::Device,
+    pub(super) physical_device: vk::PhysicalDevice,
+    pub(super) queue_family_index: u32,
+    pub(super) command_pool: vk::CommandPool,
+    pub(super) descriptor_pool: vk::DescriptorPool,
     /// One descriptor set layout: 3 storage buffers (w, x, out) +
     /// push-constants (n, k).
-    descriptor_set_layout: vk::DescriptorSetLayout,
-    pipeline_layout: vk::PipelineLayout,
+    pub(super) descriptor_set_layout: vk::DescriptorSetLayout,
+    pub(super) pipeline_layout: vk::PipelineLayout,
     q4k_matvec_pipeline: vk::Pipeline,
+    /// Seq-general Q4_K matmul pipeline (FFN gate/up/down projections).
+    pub(super) q4k_matmul_pipeline: vk::Pipeline,
+    /// RMSNorm pipeline.
+    pub(super) rms_norm_pipeline: vk::Pipeline,
+    /// GEGLU (SiLU-gated) activation pipeline.
+    pub(super) geglu_pipeline: vk::Pipeline,
+    /// Residual-add pipeline.
+    pub(super) residual_add_pipeline: vk::Pipeline,
     #[allow(dead_code)]
     properties: vk::PhysicalDeviceProperties,
     /// Pre-formatted one-line summary built at init (uses the device name +
@@ -82,6 +100,14 @@ impl VulkanRuntime {
         let pipeline_layout = create_pipeline_layout(&device, descriptor_set_layout)?;
         let q4k_matvec_pipeline =
             create_compute_pipeline(&device, pipeline_layout, Q4K_MATVEC_SPV, "main")?;
+        let q4k_matmul_pipeline =
+            create_compute_pipeline(&device, pipeline_layout, Q4K_MATMUL_SPV, "main")?;
+        let rms_norm_pipeline =
+            create_compute_pipeline(&device, pipeline_layout, RMS_NORM_SPV, "main")?;
+        let geglu_pipeline =
+            create_compute_pipeline(&device, pipeline_layout, GEGLU_SILU_SPV, "main")?;
+        let residual_add_pipeline =
+            create_compute_pipeline(&device, pipeline_layout, RESIDUAL_ADD_SPV, "main")?;
 
         let properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let device_name = {
@@ -113,6 +139,10 @@ impl VulkanRuntime {
             descriptor_set_layout,
             pipeline_layout,
             q4k_matvec_pipeline,
+            q4k_matmul_pipeline,
+            rms_norm_pipeline,
+            geglu_pipeline,
+            residual_add_pipeline,
             properties,
             summary,
         })
@@ -302,6 +332,10 @@ impl Drop for VulkanRuntime {
             let device = &self.device;
             device.device_wait_idle().ok();
             device.destroy_pipeline(self.q4k_matvec_pipeline, None);
+            device.destroy_pipeline(self.q4k_matmul_pipeline, None);
+            device.destroy_pipeline(self.rms_norm_pipeline, None);
+            device.destroy_pipeline(self.geglu_pipeline, None);
+            device.destroy_pipeline(self.residual_add_pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
@@ -314,9 +348,9 @@ impl Drop for VulkanRuntime {
 
 // ── Host-visible buffer helper ────────────────────────────────────────────
 
-struct DeviceBuffer {
-    handle: vk::Buffer,
-    memory: vk::DeviceMemory,
+pub(super) struct DeviceBuffer {
+    pub(super) handle: vk::Buffer,
+    pub(super) memory: vk::DeviceMemory,
 }
 
 fn find_memory_type(
@@ -337,7 +371,7 @@ fn find_memory_type(
     )))
 }
 
-fn create_buffer(
+pub(super) fn create_buffer(
     device: &ash::Device,
     instance: &Instance,
     physical: vk::PhysicalDevice,
@@ -372,7 +406,7 @@ fn create_buffer(
     Ok(DeviceBuffer { handle, memory })
 }
 
-fn upload_bytes(
+pub(super) fn upload_bytes(
     device: &ash::Device,
     memory: vk::DeviceMemory,
     data: &[u8],
@@ -395,7 +429,7 @@ fn upload_bytes(
     Ok(())
 }
 
-fn read_back<T: bytemuck::Pod>(
+pub(super) fn read_back<T: bytemuck::Pod>(
     device: &ash::Device,
     memory: vk::DeviceMemory,
     count: usize,
@@ -496,11 +530,11 @@ fn create_command_pool(device: &ash::Device, qfi: u32) -> Result<vk::CommandPool
 fn create_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, RuntimeError> {
     let pool_size = vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: 16,
+        descriptor_count: 64,
     };
     let info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(std::slice::from_ref(&pool_size))
-        .max_sets(16)
+        .max_sets(64)
         .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
     unsafe {
         device
@@ -535,7 +569,7 @@ fn create_pipeline_layout(
     let push_range = vk::PushConstantRange {
         stage_flags: vk::ShaderStageFlags::COMPUTE,
         offset: 0,
-        size: 8, // two u32: n, k
+        size: 16, // up to 4 x u32 (rms_norm: n, seq, offset, eps)
     };
     let info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(std::slice::from_ref(&set_layout))
@@ -582,7 +616,7 @@ fn create_compute_pipeline(
     Ok(pipeline)
 }
 
-fn allocate_descriptor_set(
+pub(super) fn allocate_descriptor_set(
     device: &ash::Device,
     pool: vk::DescriptorPool,
     layout: vk::DescriptorSetLayout,
@@ -598,7 +632,7 @@ fn allocate_descriptor_set(
     .map(|sets| sets[0])
 }
 
-fn allocate_command_buffer(
+pub(super) fn allocate_command_buffer(
     device: &ash::Device,
     pool: vk::CommandPool,
 ) -> Result<vk::CommandBuffer, RuntimeError> {
@@ -614,7 +648,7 @@ fn allocate_command_buffer(
     .map(|cbs| cbs[0])
 }
 
-fn submit_and_wait(
+pub(super) fn submit_and_wait(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     qfi: u32,
@@ -656,19 +690,19 @@ pub(crate) enum RuntimeError {
 }
 
 impl RuntimeError {
-    fn loader(ctx: &str, err: ash::LoadingError) -> Self {
+    pub(super) fn loader(ctx: &str, err: ash::LoadingError) -> Self {
         Self::Loader(format!("{ctx}: {err}"))
     }
-    fn instance(ctx: &str, err: vk::Result) -> Self {
+    pub(super) fn instance(ctx: &str, err: vk::Result) -> Self {
         Self::Instance(format!("{ctx}: {err:?}"))
     }
-    fn device(ctx: &str, err: vk::Result) -> Self {
+    pub(super) fn device(ctx: &str, err: vk::Result) -> Self {
         Self::Device(format!("{ctx}: {err:?}"))
     }
-    fn compile(ctx: &str, err: vk::Result) -> Self {
+    pub(super) fn compile(ctx: &str, err: vk::Result) -> Self {
         Self::Compile(format!("{ctx}: {err:?}"))
     }
-    fn usage(msg: String) -> Self {
+    pub(super) fn usage(msg: String) -> Self {
         Self::Usage(msg)
     }
 }

@@ -9,14 +9,33 @@
 //
 // This file intentionally does nothing when the feature is off.
 
+/// All compute shaders that ship with this crate. Add new entries here when
+/// a shader is added; the rebuild loop + rerun-if-changed directives are
+/// derived from this list.
+const SHADERS: &[(&str, &str)] = &[
+    ("shaders/q4k_matmul.comp", "spv/q4k_matmul.spv"),
+    ("shaders/q4k_matmul2d.comp", "spv/q4k_matmul2d.spv"),
+    ("shaders/rms_norm.comp", "spv/rms_norm.spv"),
+    ("shaders/geglu_silu.comp", "spv/geglu_silu.spv"),
+    ("shaders/residual_add.comp", "spv/residual_add.spv"),
+];
+
 #[cfg(feature = "shader-rebuild")]
 fn main() {
-    println!("cargo:rerun-if-changed=shaders/q4k_matmul.comp");
-    compile_shader("shaders/q4k_matmul.comp", "spv/q4k_matmul.spv");
+    for (src, dst) in SHADERS {
+        println!("cargo:rerun-if-changed={src}");
+        compile_shader(src, dst);
+    }
 }
 
 #[cfg(not(feature = "shader-rebuild"))]
-fn main() {}
+fn main() {
+    // Still emit rerun-if-changed so a rebuild after toggling the feature
+    // picks up shader edits without a clean build.
+    for (src, _dst) in SHADERS {
+        println!("cargo:rerun-if-changed={src}");
+    }
+}
 
 #[cfg(feature = "shader-rebuild")]
 fn compile_shader(src: &str, dst: &str) {
