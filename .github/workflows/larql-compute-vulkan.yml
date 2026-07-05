@@ -49,13 +49,27 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Install OpenBLAS
+      - name: Ensure OpenBLAS
         # `larql-compute` and `larql-inference` link BLAS on Linux via
         # `openblas-src` (system feature); the vulkan crate itself has
         # no external system dependency.
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libopenblas-dev pkg-config
+          if pkg-config --exists openblas; then
+            echo "OpenBLAS already available"
+            exit 0
+          fi
+
+          if sudo -n true 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y libopenblas-dev pkg-config
+            pkg-config --modversion openblas
+            exit 0
+          fi
+
+          echo "OpenBLAS is missing and this runner does not permit passwordless sudo."
+          echo "Bake libopenblas-dev and pkg-config into the runner image, or grant NOPASSWD sudo."
+          exit 1
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5

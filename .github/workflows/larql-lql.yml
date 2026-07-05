@@ -48,10 +48,24 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Install OpenBLAS (Linux)
+      - name: Ensure OpenBLAS (Linux)
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libopenblas-dev pkg-config
+          if pkg-config --exists openblas; then
+            echo "OpenBLAS already available"
+            exit 0
+          fi
+
+          if sudo -n true 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y libopenblas-dev pkg-config
+            pkg-config --modversion openblas
+            exit 0
+          fi
+
+          echo "OpenBLAS is missing and this runner does not permit passwordless sudo."
+          echo "Bake libopenblas-dev and pkg-config into the runner image, or grant NOPASSWD sudo."
+          exit 1
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5
@@ -93,10 +107,24 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install OpenBLAS
+      - name: Ensure OpenBLAS
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libopenblas-dev pkg-config
+          if pkg-config --exists openblas; then
+            echo "OpenBLAS already available"
+            exit 0
+          fi
+
+          if sudo -n true 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y libopenblas-dev pkg-config
+            pkg-config --modversion openblas
+            exit 0
+          fi
+
+          echo "OpenBLAS is missing and this runner does not permit passwordless sudo."
+          echo "Bake libopenblas-dev and pkg-config into the runner image, or grant NOPASSWD sudo."
+          exit 1
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
