@@ -12,6 +12,7 @@
 
 pub mod async_compute_backend_impl;
 pub mod backend;
+pub mod calibration;
 pub mod buffers;
 pub mod decode;
 pub mod kernels;

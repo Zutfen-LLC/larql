@@ -3,7 +3,7 @@ mod runtime;
 use crate::kv_cache::{CudaKVCache, KvCacheError};
 use crate::options::BackendOptions;
 use crate::pipeline::HostKvType;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) use runtime::{CudaRuntime, RuntimeError};
 
@@ -23,6 +23,12 @@ pub struct CudaBackend {
     /// `kv_cache` stays populated for the `DecodeBackend` lifecycle contract
     /// but device-side attention kernels aren't implemented yet).
     pub(crate) host_kv: Mutex<HostKvType>,
+    /// One-shot calibrated FFN activation gate (GPU-1004). Populated on the
+    /// first device-resident FFN call via [`Self::activation_gate_cached`].
+    /// `OnceLock` gives the one-shot semantics: the first writer wins and all
+    /// later reads reuse the cached threshold. Mirrors Metal's cached
+    /// `flop_threshold` field, populated by `MetalBackend::calibrate()`.
+    activation_gate: OnceLock<usize>,
 }
 
 impl CudaBackend {
@@ -38,6 +44,7 @@ impl CudaBackend {
                 runtime_status: None,
                 kv_cache: Mutex::new(None),
                 host_kv: Mutex::new(Vec::new()),
+                activation_gate: OnceLock::new(),
             }),
             Err(err) if options.allow_cpu_delegate => Ok(Self {
                 options,
@@ -45,6 +52,7 @@ impl CudaBackend {
                 runtime_status: Some(err.to_string()),
                 kv_cache: Mutex::new(None),
                 host_kv: Mutex::new(Vec::new()),
+                activation_gate: OnceLock::new(),
             }),
             Err(err) => Err(BackendInitError::Unavailable(err.to_string())),
         }
@@ -238,6 +246,26 @@ impl CudaBackend {
             );
         }
         false
+    }
+
+    /// Cached calibrated FFN activation gate (GPU-1004). On the first call,
+    /// if a runtime is present, run one-shot calibration (timing the device
+    /// chain vs the host-only reference at a representative decode shape) and
+    /// cache the threshold. Without a runtime, or if calibration errors, the
+    /// conservative default is used. Always returns a value in
+    /// `[MIN_ACTIVATION_FLOOR, DEFAULT_ACTIVATION_MIN_ELEMS]`.
+    pub(crate) fn activation_gate_cached(&self) -> usize {
+        if let Some(&g) = self.activation_gate.get() {
+            return g;
+        }
+        let g = match self.runtime.as_ref() {
+            Some(rt) => crate::calibration::calibrate_activation_threshold(rt),
+            None => crate::calibration::DEFAULT_ACTIVATION_MIN_ELEMS,
+        };
+        // OnceLock::set ignores a racing first writer; both writers compute the
+        // same envelope-bounded value, so the "first wins" semantics are fine.
+        let _ = self.activation_gate.set(g);
+        g
     }
 
     /// Borrow the device runtime (`None` on the scaffold path). Used by the

@@ -829,10 +829,11 @@ impl CudaBackend {
         let runtime = self.runtime()?;
         let seq_len = h_post_attn.shape()[0];
 
-        // Below the activation gate the host path is faster (no fusion
-        // benefit, only transfer+sync overhead) — mirrors the other
-        // `*_NATIVE_MIN_ELEMS` gates.
-        if !Self::native_activation_worthwhile(seq_len.saturating_mul(inter)) {
+        // Adaptive FFN gate (GPU-1004): calibrate once per backend, then
+        // route the device chain when it actually beats the host-only
+        // reference. Mirrors the other `*_NATIVE_MIN_ELEMS` gates but is
+        // adaptive instead of a fixed constant.
+        if !self.ffn_activation_gate_worthwhile(seq_len.saturating_mul(inter)) {
             return None;
         }
         // All three FFN projections must be a k-quant the device matmul handles.
@@ -1546,11 +1547,13 @@ impl CudaBackend {
         inter: usize,
     ) -> Option<Array2<f32>> {
         let runtime = self.runtime()?;
-        // Decode is a single token: the work is `inter` (the gate/up/down
-        // contraction width). Below the activation gate the host path is
-        // faster (no fusion benefit, only transfer+sync overhead) — mirrors
-        // the other `*_NATIVE_MIN_ELEMS` gates and the prefill device chain.
-        if !Self::native_activation_worthwhile(inter) {
+        // Adaptive FFN gate (GPU-1004): the first device-resident decode FFN
+        // call calibrates the gate once by timing the device chain vs the
+        // host-only reference at a representative shape, then caches the
+        // threshold on the runtime. Below the gate (or before calibration
+        // completes) the host path runs — mirrors the other `*_NATIVE_MIN_ELEMS`
+        // gates but is adaptive per-backend instead of a fixed constant.
+        if !self.ffn_activation_gate_worthwhile(inter) {
             return None;
         }
         // All three FFN projections must be a k-quant the device matvec handles.
@@ -2007,6 +2010,21 @@ impl CudaBackend {
     /// per-call device round-trip.
     fn native_activation_worthwhile(elems: usize) -> bool {
         elems >= Self::ACTIVATION_NATIVE_MIN_ELEMS
+    }
+
+    /// One-shot calibrated FFN activation gate (GPU-1004).
+    ///
+    /// On the first device-resident FFN call, calibrate the gate by timing
+    /// the device chain vs the host-only reference at a representative shape
+    /// and cache the result on the runtime. Subsequent calls read the cached
+    /// threshold. The gate always sits in
+    /// `[MIN_ACTIVATION_FLOOR, DEFAULT_ACTIVATION_MIN_ELEMS]`, so tiny shapes
+    /// never pay launch overhead (floor) and the conservative default bounds
+    /// the upside. The host-only path remains the fallback when the gate
+    /// rejects a shape.
+    fn ffn_activation_gate_worthwhile(&self, elems: usize) -> bool {
+        let gate = self.activation_gate_cached();
+        elems >= gate
     }
 
     /// Minimum element count for a native residual add to be worth the
@@ -2896,7 +2914,7 @@ pub(crate) type HostKvType = HostKv;
 /// outputs on the device. `None` (as `Err`) for other formats — the chain's
 /// gate condition rejects them before reaching here, but the exhaustive match
 /// keeps a future format loud rather than silently skipping a projection.
-fn matvec_dev_by_fmt(
+pub(crate) fn matvec_dev_by_fmt(
     runtime: &crate::backend::CudaRuntime,
     format: QuantFormat,
     weights: &[u8],
