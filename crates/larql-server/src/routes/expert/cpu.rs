@@ -126,6 +126,18 @@ pub fn run_experts_cpu_batch(
         }
     };
 
+    // GPU-3004: per-expert output cache. Opt-in via LARQL_EXPERT_OUTPUT_CACHE=1.
+    // The expert FFN is a pure function of (weights, h_norm) — no sampling
+    // noise in the residual — so caching is sound whenever the same
+    // (layer, expert, residual) triple recurs (repeated prompts / contexts).
+    // Key is hashed once from h_norm (shared across all K experts in the layer).
+    let expert_cache_enabled = crate::env_flags::expert_output_cache_enabled();
+    let expert_rkey = if expert_cache_enabled {
+        Some(crate::routes::expert::output_cache::ExpertOutputCache::residual_key(&h_norm))
+    } else {
+        None
+    };
+
     // Fold the K experts directly into a per-worker hidden-sized accumulator,
     // then reduce across workers.  Replaces the prior pattern of collecting
     // K (Vec<f32>, weight) partials and serially summing them — that path
@@ -140,6 +152,16 @@ pub fn run_experts_cpu_batch(
         .fold(
             || vec![0.0f32; hidden],
             |mut acc, (&eid, &w)| {
+                // GPU-3004: cache check (opt-in). On hit, fold the cached
+                // output and skip the matvec. On miss, compute then insert.
+                if let Some(rkey) = expert_rkey {
+                    if let Some(cached) = model.expert_output_cache.get(layer, eid, rkey) {
+                        for (a, &v) in acc.iter_mut().zip(cached.iter()) {
+                            *a += w * v;
+                        }
+                        return acc;
+                    }
+                }
                 let Some((gu_bytes, dn_bytes)) = resolve_bytes(eid) else {
                     return acc;
                 };
@@ -164,6 +186,10 @@ pub fn run_experts_cpu_batch(
                             scratch, &h_norm, gu_bytes, dn_bytes, inter, format, activation,
                         )
                     };
+                    // GPU-3004: insert the computed output (miss path).
+                    if let Some(rkey) = expert_rkey {
+                        model.expert_output_cache.insert(layer, eid, rkey, h2.to_vec());
+                    }
                     for (a, &v) in acc.iter_mut().zip(h2.iter()) {
                         *a += w * v;
                     }

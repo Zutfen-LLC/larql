@@ -33,6 +33,7 @@ pub mod cpu;
 pub mod cuda;
 pub mod layer_batch;
 pub mod metal;
+pub mod output_cache;
 pub mod multi_layer_batch;
 pub mod single;
 pub mod warmup;
@@ -49,6 +50,7 @@ pub use cuda::run_experts_cuda_batch;
 pub use layer_batch::{handle_experts_layer_batch, handle_experts_layer_batch_f16};
 #[cfg(all(feature = "metal-experts", target_os = "macos"))]
 pub use metal::run_experts_metal_batch;
+pub use output_cache::ExpertOutputCache;
 pub use multi_layer_batch::{
     handle_experts_multi_layer_batch, handle_experts_multi_layer_batch_q8k,
 };

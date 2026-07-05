@@ -75,6 +75,11 @@ async fn add_q4k_ffn(model: &LoadedModel, mut stats: serde_json::Value) -> serde
                 "feature_major_down": has_fm,
             }),
         );
+        // GPU-3004: per-expert output cache hit/miss metrics.
+        obj.insert(
+            "expert_output_cache".into(),
+            model.expert_output_cache.stats(),
+        );
     }
     stats
 }
