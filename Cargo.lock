@@ -2220,6 +2220,7 @@ dependencies = [
 name = "larql-compute-cuda"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "cudarc",
  "dirs 5.0.1",
  "half",

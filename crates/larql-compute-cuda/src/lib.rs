@@ -27,6 +27,8 @@ pub mod weight_cache;
 pub use backend::{BackendInitError, CudaBackend};
 pub use kernels::{DispatchGeometry, KernelHandle};
 pub use options::BackendOptions;
+pub use weight_cache::CacheStats;
+pub use backend::TransferStats;
 
 pub fn cuda_backend() -> Result<CudaBackend, BackendInitError> {
     CudaBackend::new()

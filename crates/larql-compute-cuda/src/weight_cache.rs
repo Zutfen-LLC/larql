@@ -102,13 +102,15 @@ impl WeightKey {
 /// weight slice registers a hit and skips the upload). Test-only snapshot —
 /// the live counters are the `AtomicU64`s on [`WeightCache`]; this struct only
 /// exists to return a coherent snapshot from `stats()`.
-#[cfg(test)]
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct CacheStats {
-    pub(crate) bytes_hits: u64,
-    pub(crate) bytes_misses: u64,
-    pub(crate) float_hits: u64,
-    pub(crate) float_misses: u64,
+pub struct CacheStats {
+    pub bytes_hits: u64,
+    pub bytes_misses: u64,
+    pub float_hits: u64,
+    pub float_misses: u64,
+    /// Cumulative bytes uploaded to the device across all misses (the raw
+    /// transfer volume, for the pipeline bench's `htod_bytes/token` metric).
+    pub bytes_uploaded: u64,
 }
 
 /// Persistent device-resident weight cache. Two typed maps (`u8` for quant/f16
@@ -130,6 +132,7 @@ pub(crate) struct WeightCache {
     bytes_misses: AtomicU64,
     float_hits: AtomicU64,
     float_misses: AtomicU64,
+    bytes_uploaded: AtomicU64,
 }
 
 impl WeightCache {
@@ -159,6 +162,8 @@ impl WeightCache {
             }
             let dev = Arc::new(stream.clone_htod(bytes)?);
             guard.insert(key, Arc::clone(&dev));
+            self.bytes_uploaded
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             dev
         };
         self.bytes_misses.fetch_add(1, Ordering::Relaxed);
@@ -181,21 +186,24 @@ impl WeightCache {
             }
             let dev = Arc::new(stream.clone_htod(floats)?);
             guard.insert(key, Arc::clone(&dev));
+            self.bytes_uploaded
+                .fetch_add((floats.len() * 4) as u64, Ordering::Relaxed);
             dev
         };
         self.float_misses.fetch_add(1, Ordering::Relaxed);
         Ok(dev)
     }
 
-    /// Snapshot the cumulative hit/miss counters (test/diagnostic). Relaxed
-    /// loads are fine — these are observability counters, not synchronisation.
-    #[cfg(test)]
+    /// Snapshot the cumulative hit/miss counters (test/diagnostic/bench).
+    /// Relaxed loads are fine — these are observability counters, not
+    /// synchronisation.
     pub(crate) fn stats(&self) -> CacheStats {
         CacheStats {
             bytes_hits: self.bytes_hits.load(Ordering::Relaxed),
             bytes_misses: self.bytes_misses.load(Ordering::Relaxed),
             float_hits: self.float_hits.load(Ordering::Relaxed),
             float_misses: self.float_misses.load(Ordering::Relaxed),
+            bytes_uploaded: self.bytes_uploaded.load(Ordering::Relaxed),
         }
     }
 
