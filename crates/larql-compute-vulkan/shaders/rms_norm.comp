@@ -1,0 +1,44 @@
+// RMSNorm compute shader (GLSL / Vulkan).
+//
+// y[row, j] = (x[row, j] / rms(row)) * (offset + w[j])
+// where rms(row) = sqrt(mean(x[row,:].^2) + eps).
+//
+// One invocation per output row (seq position). Loops over the hidden
+// dim to accumulate the sum-of-squares in f32, then writes the row.
+// This is the Vulkan twin of the CPU reference `residual::rms_norm_eps`
+// (which accumulates in f64 — the GPU uses f32, so cross-precision
+// parity holds to a tolerance, not bit-exactly; see chain tests).
+//
+// Push constants: n (hidden), seq (rows), offset, eps.
+
+#version 450 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly restrict buffer XBlock { float x[]; };
+layout(set = 0, binding = 1) readonly restrict buffer WBlock { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer YBlock { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint n;        // hidden dim (elements per row)
+    uint seq;      // number of rows
+    float offset;  // norm weight offset (0.0 Llama, 1.0 Gemma)
+    float eps;     // RMSNorm epsilon
+} push;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= push.seq) {
+        return;
+    }
+    uint base = row * push.n;
+    float sqsum = 0.0;
+    for (uint j = 0u; j < push.n; ++j) {
+        float v = x[base + j];
+        sqsum += v * v;
+    }
+    float rms = sqrt(sqsum / float(push.n) + push.eps);
+    for (uint j = 0u; j < push.n; ++j) {
+        y[base + j] = (x[base + j] / rms) * (push.offset + w[j]);
+    }
+}

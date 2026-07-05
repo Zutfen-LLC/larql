@@ -26,6 +26,11 @@ bytemuck = "1"
 [dev-dependencies]
 larql-compute = { path = "../larql-compute", features = ["test-utils"] }
 larql-models = { path = "../larql-models", features = ["test-utils"] }
+criterion = "0.5"
+
+[[bench]]
+name = "chain"
+harness = false
 
 [features]
 default = []

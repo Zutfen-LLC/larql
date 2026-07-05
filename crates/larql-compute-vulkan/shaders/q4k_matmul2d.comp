@@ -1,0 +1,106 @@
+// Q4_K matmul compute shader (GLSL / Vulkan) — general seq_len.
+//
+// Computes out[s * out_rows + row] = sum_k W[row, k] * x[s, k] for a
+// Q4_K-quantised weight matrix, across seq_len input vectors. This is
+// the seq-general twin of the q4k_matmul.comp matvec: a 2D dispatch
+// with one invocation per (row, seq_pos). The Q4_K super-block dequant
+// inner loop is identical to the validated matvec shader.
+//
+// Push constants: out_rows (inter/rows of W), k (hidden, multiple of 256),
+// seq (number of input vectors).
+//
+// Note: each (row, seq) invocation re-dequantises W[row, :]. For seq=1
+// this is identical to the matvec; for larger seq the weight is re-read
+// per seq position (accepted for MVP correctness; a shared-memory tile
+// variant is a follow-up).
+
+#version 450 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer WBlock { uint w4k[]; };
+layout(set = 0, binding = 1) readonly restrict buffer XBlock { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer OutBlock { float out_vals[]; };
+
+layout(push_constant) uniform Push {
+    uint out_rows;  // number of rows in W (intermediate dim)
+    uint k;         // hidden dim (multiple of 256)
+    uint seq;       // number of input vectors
+} push;
+
+uint fetch_byte(uint off) {
+    return (w4k[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+uint fetch_u16(uint off) {
+    return fetch_byte(off) | (fetch_byte(off + 1u) << 8u);
+}
+
+float decode_f16(uint bits) {
+    uint s = (bits >> 15u) & 1u;
+    uint e = (bits >> 10u) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    float val;
+    if (e == 0u) {
+        val = float(m) * exp2(-24.0);
+    } else {
+        val = (1.0 + float(m) * exp2(-10.0)) * exp2(int(e) - 15);
+    }
+    return s == 1u ? -val : val;
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint s = gl_GlobalInvocationID.y;
+    if (row >= push.out_rows || s >= push.seq) {
+        return;
+    }
+
+    uint superblocks = push.k / 256u;
+    uint bytes_per_row = superblocks * 144u;
+    uint row_base = row * bytes_per_row;
+    uint x_base_row = s * push.k;
+    float acc = 0.0;
+
+    for (uint sb = 0u; sb < superblocks; ++sb) {
+        uint block = row_base + sb * 144u;
+        float d = decode_f16(fetch_u16(block + 0u));
+        float dmin = decode_f16(fetch_u16(block + 2u));
+
+        for (uint j = 0u; j < 8u; ++j) {
+            uint sc;
+            uint mn;
+            if (j < 4u) {
+                sc = fetch_byte(block + 4u + j) & 0x3Fu;
+                mn = fetch_byte(block + 4u + j + 4u) & 0x3Fu;
+            } else {
+                sc = (fetch_byte(block + 4u + j + 4u) & 0x0Fu)
+                    | ((fetch_byte(block + 4u + (j - 4u)) >> 6u) << 4u);
+                mn = (fetch_byte(block + 4u + j + 4u) >> 4u)
+                    | ((fetch_byte(block + 4u + j) >> 6u) << 4u);
+            }
+
+            float scale = d * float(sc);
+            float min_scale = dmin * float(mn);
+            uint group = j >> 1u;
+            bool high_nibble = (j & 1u) != 0u;
+            uint x_base = x_base_row + sb * 256u + j * 32u;
+            uint qs_base = block + 16u + group * 32u;
+
+            float sum_x = 0.0;
+            float dot = 0.0;
+            for (uint l = 0u; l < 32u; ++l) {
+                float xv = x[x_base + l];
+                uint byte = fetch_byte(qs_base + l);
+                float nib = high_nibble
+                    ? float((byte >> 4u) & 0x0Fu)
+                    : float(byte & 0x0Fu);
+                sum_x += xv;
+                dot += nib * xv;
+            }
+            acc += scale * dot - min_scale * sum_x;
+        }
+    }
+
+    out_vals[s * push.out_rows + row] = acc;
+}
