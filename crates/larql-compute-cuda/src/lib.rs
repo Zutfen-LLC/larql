@@ -974,6 +974,32 @@ mod tests {
         assert!(!b.supports_quant(larql_compute::QuantFormat::Q4_K));
     }
 
+    /// GPU-2003: the device-resident decode fast path (one htod + one dtoh per
+    /// token instead of O(num_layers)) bails to `None` on the scaffold path
+    /// (no CUDA runtime) — its first line is `self.runtime()?`. The
+    /// host-orchestrated loop is the documented fallback, and on a scaffold
+    /// backend that loop also returns `None` (no native matvec), so
+    /// `decode_token` stays `None` end-to-end. Runs on every host.
+    #[test]
+    fn device_resident_decode_bails_on_scaffold() {
+        let b = backend();
+        if b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let hidden = weights.hidden_size;
+        let inter = index.num_features(0);
+        // The fast path is private; the observable contract is that
+        // `decode_token` still returns `None` on the scaffold (the fast path's
+        // `None` + the fallback's `None`). This guards against the fast path
+        // ever panicking or returning a wrong-shape `Some` without a runtime.
+        assert!(b
+            .decode_token(&layers, &vec![0.0f32; hidden], hidden, inter)
+            .is_none());
+    }
+
     /// Native runtime present: `supports`/`supports_quant` advertise the
     /// fused capabilities. Runtime-gated.
     #[test]
