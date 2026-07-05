@@ -6,6 +6,7 @@ use crate::pipeline::HostKvType;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) use runtime::{CudaRuntime, RuntimeError};
+pub use runtime::TransferStats;
 
 pub struct CudaBackend {
     options: BackendOptions,
@@ -213,7 +214,7 @@ impl CudaBackend {
         }
     }
 
-    pub(crate) fn native_runtime_available(&self) -> bool {
+    pub fn native_runtime_available(&self) -> bool {
         self.runtime.is_some()
     }
 
@@ -277,12 +278,22 @@ impl CudaBackend {
 
     /// Snapshot the persistent weight-cache hit/miss counters. `None` on the
     /// scaffold path (no runtime / no device); the counts are always zero
-    /// there since no weights are ever uploaded.
-    #[cfg(test)]
-    pub(crate) fn weight_cache_stats(&self) -> Option<crate::weight_cache::CacheStats> {
+    /// there since no weights are ever uploaded. Exposed `pub` so the
+    /// pipeline bench (external integration target) can read the cache
+    /// hit-rate metric.
+    pub fn weight_cache_stats(&self) -> Option<crate::weight_cache::CacheStats> {
         self.runtime
             .as_ref()
             .map(|runtime| runtime.weight_cache_stats())
+    }
+
+    /// Snapshot the cumulative host→device and device→host transfer byte
+    /// counters. `None` on the scaffold path. Exposed `pub` so the pipeline
+    /// bench can report `htod_bytes/token` and `dtoh_bytes/token`.
+    pub fn transfer_stats(&self) -> Option<runtime::TransferStats> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.transfer_stats())
     }
 
     /// Native RMSNorm (body norm) — the device twin of

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use cudarc::driver::{
@@ -21,7 +22,6 @@ use crate::ops::{
     RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC, RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
     ROPE_CUDA_SRC, ROPE_KERNEL,
 };
-#[cfg(test)]
 use crate::weight_cache::CacheStats;
 use crate::weight_cache::WeightCache;
 
@@ -53,6 +53,13 @@ pub(crate) struct CudaRuntime {
     rope: CudaFunction,
     decode_attention: CudaFunction,
     prefill_attention: CudaFunction,
+    /// Cumulative host→device transfer bytes (bench instrumentation).
+    /// Counted in `upload_f32` / `clone_htod` launchers so the pipeline
+    /// bench can report `htod_bytes/token`. Relaxed atomic — observability
+    /// only, not synchronisation.
+    htod_bytes: AtomicU64,
+    /// Cumulative device→host transfer bytes (bench instrumentation).
+    dtoh_bytes: AtomicU64,
     /// Persistent device-resident weight cache (see `weight_cache.rs`).
     /// Uploads each immutable weight matrix once and reuses the device buffer
     /// across calls — the first slice of the per-projection htod round-trip
@@ -207,6 +214,8 @@ impl CudaRuntime {
             rope,
             decode_attention,
             prefill_attention,
+            htod_bytes: AtomicU64::new(0),
+            dtoh_bytes: AtomicU64::new(0),
             weight_cache: WeightCache::default(),
             summary: format!(
                 "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention loaded, remaining ops use CPU fallback"
@@ -225,10 +234,18 @@ impl CudaRuntime {
         &self.stream
     }
 
-    /// Snapshot the weight-cache hit/miss counters (test diagnostic).
-    #[cfg(test)]
+    /// Snapshot the weight-cache hit/miss counters (bench/test diagnostic).
     pub(crate) fn weight_cache_stats(&self) -> CacheStats {
         self.weight_cache.stats()
+    }
+
+    /// Snapshot the cumulative host→device and device→host transfer byte
+    /// counters (bench instrumentation). Relaxed loads — observability only.
+    pub(crate) fn transfer_stats(&self) -> TransferStats {
+        TransferStats {
+            htod_bytes: self.htod_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            dtoh_bytes: self.dtoh_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Drop every cached device weight buffer. The backend calls this at each
@@ -1576,6 +1593,8 @@ impl CudaRuntime {
     /// device-resident handle. The chain caller holds this for the lifetime of
     /// the chain (until the final `sync_dtoh_f32`).
     pub(crate) fn upload_f32(&self, x: &[f32]) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.htod_bytes
+            .fetch_add((x.len() * 4) as u64, std::sync::atomic::Ordering::Relaxed);
         self.stream
             .clone_htod(x)
             .map_err(|err| RuntimeError::context("uploading activation to CUDA", err))
@@ -1610,6 +1629,8 @@ impl CudaRuntime {
     // — collapses one sync+dtoh per chained kernel into one for the whole
     // chain.
     pub(crate) fn sync_dtoh_f32(&self, dev: &CudaSlice<f32>) -> Result<Vec<f32>, RuntimeError> {
+        self.dtoh_bytes
+            .fetch_add((dev.len() * 4) as u64, std::sync::atomic::Ordering::Relaxed);
         self.stream
             .synchronize()
             .map_err(|err| RuntimeError::context("synchronizing CUDA device chain stream", err))?;
@@ -2474,6 +2495,15 @@ impl CudaRuntime {
     }
 }
 
+
+/// Cumulative transfer byte counters, surfaced for the pipeline bench.
+/// Snapshotted from the `AtomicU64`s on [`CudaRuntime`] via
+/// [`CudaRuntime::transfer_stats`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TransferStats {
+    pub htod_bytes: u64,
+    pub dtoh_bytes: u64,
+}
 
 /// GPU-1005: SHA-256 the structured blob
 /// `v1\nfmad={fmad}\ncc={cc_major}.{cc_minor}\nsrc={combined_src}` and
