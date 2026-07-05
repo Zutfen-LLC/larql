@@ -1,12 +1,14 @@
 //! `larql-compute-cuda`
 //!
-//! CUDA backend scaffold for `larql-compute`.
+//! CUDA backend for `larql-compute`.
 //!
-//! This crate deliberately lands the control-plane shape first: backend
-//! construction, shared trait conformance, dispatch metadata, and parity
-//! tests. The current implementation delegates compute and K/V intents to
-//! CPU/reference paths where necessary so the wider backend-selection work
-//! can compile and run before CUDA kernels are brought up.
+//! Native k-quant + GEMV kernels compiled via NVRTC (Q4_K/Q6_K matvec,
+//! matmul, dual matvec; f32/f16 GEMV; Q4 matvec/vecmat), plus a
+//! host-orchestrated decode/prefill pipeline that drives a device-resident
+//! activation/attention chain (RMSNorm, RoPE, GeGLU, residual add,
+//! decode/prefill attention — all running on the device between a single
+//! upload and a single readback). Falls back to CPU/reference paths when no
+//! CUDA runtime is present.
 
 pub mod async_compute_backend_impl;
 pub mod backend;

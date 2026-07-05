@@ -820,7 +820,7 @@ macOS gets Metal GPU acceleration. Linux and Windows run the same CPU path (BLAS
 
 ```bash
 cargo build --release                    # optimised build
-cargo build --release --features gpu     # with GPU backend (Metal on macOS today; Vulkan/CUDA later)
+cargo build --release --features gpu     # with GPU backend (Metal on macOS). The native CUDA path is behind --features cuda; --features gpu-all enables Metal + CUDA + Vulkan
 cargo test                               # all tests across all crates
 .venv/bin/python scripts/diagnose_models.py    # cross-engine correctness sweep — see below
 cargo test -p larql-inference            # inference engine tests (109 tests)
