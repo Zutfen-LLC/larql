@@ -19,10 +19,13 @@
 //!   their CPU twins (parity-tested).
 //! - A host-side KV mirror (`host_kv` on `CudaBackend`) holds the per-layer
 //!   `(K_cache, V_cache)` `[len, kv_dim]` arrays the host attention reads.
-//!   The device `CudaKVCache` from Session 10 is populated in parallel via
-//!   `populate_kv_layer` so the `DecodeBackend` lifecycle contract stays
-//!   consistent, but attention itself reads the host mirror — the simplest
-//!   correct path before device-side attention kernels land.
+//!   The device `CudaKVCache` from Session 10 has its per-layer cursors
+//!   advanced in lockstep (GPU-2002: the buffers themselves are no longer
+//!   re-populated — the device-resident attention chain reads fresh per-layer
+//!   uploads, so the full mirror upload was pure waste) so the `DecodeBackend`
+//!   lifecycle contract stays consistent, but attention itself reads the host
+//!   mirror — the simplest correct path before device-side attention kernels
+//!   land.
 //!
 //! What this is NOT: a single-command-buffer fused pipeline (Metal's shape).
 //! Each matvec is a separate htod/launch/dtoh round-trip. That is the
