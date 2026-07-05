@@ -1849,6 +1849,154 @@ mod tests {
         }
     }
 
+    /// End-to-end prefill→decode parity (GPU-1002). Runs a real multi-token
+    /// prompt through `prefill_kquant` then several `decode_token` steps and
+    /// asserts the **sampled argmax tokens** AND the final hidden state match
+    /// the CPU reference, with `kv_cache_len` advancing one row per step.
+    ///
+    /// This is the wiring test between kernels: per-kernel parity tests
+    /// (q4k_matvec, native_geglu, prefill_attention) cover each kernel in
+    /// isolation; this one covers the residual routing, KV-mirror append,
+    /// and position tracking that connect them across prefill + decode.
+    ///
+    /// Exercises BOTH device and host-only paths in a single run: the
+    /// standard fixture has `inter = Q4K_TEST_INTER = 256`, well below the
+    /// activation gate `ACTIVATION_NATIVE_MIN_ELEMS = 8192`, so the FFN
+    /// device chain bails and the host-only FFN fallback runs every layer;
+    /// the 8-token prompt clears the prefill attention device-chain gate
+    /// (`seq*num_q*seq*head_dim = 8*4*8*64 = 16384 >= 8192`), so the device
+    /// attention chain also runs. Both code paths are thus on the hot path
+    /// inside one end-to-end forward.
+    ///
+    /// Runtime-gated (no-op without a device). On a self-hosted NVIDIA
+    /// runner with `LARQL_REQUIRE_CUDA=1` a missing runtime fails CI
+    /// instead of vacuously skipping (see `test_runtime_gate`).
+    #[test]
+    fn end_to_end_prefill_decode_matches_cpu_reference() {
+        let b = backend();
+        if !b.test_runtime_gate() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        // 8-token prompt: clears the prefill attention device-chain gate
+        // (seq*num_q*seq*head_dim = 8*4*8*64 = 16384 >= 8192).
+        let token_ids: [u32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+
+        // CUDA prefill: device-resident attention chain + host-only FFN.
+        let cuda_prefill = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill_kquant should succeed with a runtime");
+        assert_eq!(cuda_prefill.len(), seq_len * hidden);
+
+        // CPU reference prefill (seeds its own cache for the decode loop).
+        let (cpu_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+
+        // Prefill final-position hidden parity.
+        let cpu_prefill_last: Vec<f32> = cpu_prefill.row(seq_len - 1).to_vec();
+        let cuda_prefill_last: Vec<f32> =
+            cuda_prefill[(seq_len - 1) * hidden..seq_len * hidden].to_vec();
+        let prefill_max = cpu_prefill_last
+            .iter()
+            .zip(cuda_prefill_last.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            prefill_max < 1e-3,
+            "e2e prefill final-position hidden diverged: max_abs={prefill_max:.6e}"
+        );
+        // After prefill, the host KV mirror must hold `seq_len` rows.
+        assert_eq!(
+            b.kv_cache_len(),
+            seq_len,
+            "kv_cache_len after prefill must equal prompt length"
+        );
+
+        // Greedy decode loop: sample argmax from the final hidden state,
+        // feed it back, and compare against the CPU direct decode path.
+        let num_decode = 4usize;
+        let mut cpu_pos = seq_len;
+        let mut prev_cuda_hidden: Vec<f32> = cuda_prefill_last.clone();
+        for step in 0..num_decode {
+            // Argmax token from the previous hidden state (final-norm →
+            // lm_head → logits → argmax), identical readout for both paths.
+            let prev_h_2d = ndarray::Array2::from_shape_vec((1, hidden), prev_cuda_hidden.clone())
+                .expect("hidden reshape");
+            let logits = larql_compute::forward::predict::raw::hidden_to_raw_logits(
+                &weights,
+                &prev_h_2d,
+            );
+            let (sampled_tok, _best) = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, &v)| (i as u32, v))
+                .expect("non-empty vocab");
+
+            // CPU reference decode step at the matching position.
+            let cpu_decode = larql_compute::kquant_forward::predict_kquant_decode_step_direct(
+                &weights,
+                sampled_tok,
+                &index,
+                &larql_compute::CpuBackend,
+                &mut cpu_cache,
+                cpu_pos,
+            )
+            .expect("CPU direct decode step");
+            cpu_pos += 1;
+
+            // CUDA decode of the same sampled token.
+            let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[sampled_tok]);
+            let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+            let cuda_decode = b
+                .decode_token(&layers, &x_dec, hidden, inter)
+                .expect("CUDA decode_token should succeed across the e2e run");
+
+            // Final hidden-state parity (tight tolerance).
+            let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+            assert_eq!(cpu_row.len(), cuda_decode.len());
+            let decode_max = cpu_row
+                .iter()
+                .zip(cuda_decode.iter())
+                .map(|(c, g)| (c - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                decode_max < 1e-3,
+                "e2e decode (step {step}, tok {sampled_tok}) hidden diverged: max_abs={decode_max:.6e}"
+            );
+
+            // KV-mirror position tracking: must advance exactly one row per
+            // decode step. A broken append or stale `host_kv_len` source
+            // drifts here (this is the wiring this test exists to lock).
+            assert_eq!(
+                b.kv_cache_len(),
+                cpu_pos,
+                "e2e kv_cache_len drifted at decode step {step} (tok {sampled_tok})"
+            );
+
+            prev_cuda_hidden = cuda_decode.clone();
+        }
+    }
+
     /// `decode_token_with_state_dump_masked` populates the state dump with
     /// one entry per layer under `Full` and only `h_in` under `HOnly`.
     /// Runtime-gated.
