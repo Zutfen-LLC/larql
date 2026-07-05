@@ -25,6 +25,10 @@ larql-router-protocol = { path = "../larql-router-protocol" }
 # selected experts on the GPU instead of running them per-expert on CPU.
 larql-compute = { path = "../larql-compute" }
 larql-compute-metal = { path = "../larql-compute-metal", optional = true }
+# Optional CUDA backend for shard-side GPU experts (Linux/NVIDIA). GPU-3003.
+# When the `cuda-experts` feature is enabled, the server can dispatch each
+# layer's selected experts on the GPU via `CudaBackend`'s native Q4_K kernels.
+larql-compute-cuda = { path = "../larql-compute-cuda", optional = true }
 
 axum = { version = "0.8", features = ["ws"] }
 half = "2"
@@ -92,6 +96,10 @@ default = []
 # the `larql-compute-metal` sibling crate directly (distinct from the
 # `gpu` umbrella feature on larql-cli/inference/kv/vindex).  macOS-only.
 metal-experts = ["dep:larql-compute-metal"]
+# Enable CUDA-backed GPU expert kernels on the shard server. Forwards to the
+# `larql-compute-cuda` sibling crate (Linux/NVIDIA). Opt-in at runtime via
+# `LARQL_USE_CUDA_EXPERTS=1`; CPU fallback when no CUDA runtime is present.
+cuda-experts = ["dep:larql-compute-cuda"]
 # ADR-0010 QUIC transport for the grid `Join` stream. Servers can connect
 # to the router via `--join quic://router:PORT` when this is on. Forwards
 # to larql-router-protocol so all QUIC code paths share one feature flag.

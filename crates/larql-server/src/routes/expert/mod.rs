@@ -29,6 +29,8 @@ use utoipa::ToSchema;
 
 pub mod batch_legacy;
 pub mod cpu;
+#[cfg(feature = "cuda-experts")]
+pub mod cuda;
 pub mod layer_batch;
 pub mod metal;
 pub mod multi_layer_batch;
@@ -42,6 +44,8 @@ pub mod warmup;
 
 pub use batch_legacy::handle_expert_batch;
 pub use cpu::run_experts_cpu_batch;
+#[cfg(feature = "cuda-experts")]
+pub use cuda::run_experts_cuda_batch;
 pub use layer_batch::{handle_experts_layer_batch, handle_experts_layer_batch_f16};
 #[cfg(all(feature = "metal-experts", target_os = "macos"))]
 pub use metal::run_experts_metal_batch;

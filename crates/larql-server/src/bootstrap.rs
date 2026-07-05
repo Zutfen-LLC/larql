@@ -368,6 +368,8 @@ pub fn load_single_vindex(
         moe_scratches: std::sync::Mutex::new(std::collections::HashMap::new()),
         #[cfg(all(feature = "metal-experts", target_os = "macos"))]
         metal_ffn_layer_bufs: std::sync::OnceLock::new(),
+        #[cfg(feature = "cuda-experts")]
+        cuda_backend: std::sync::OnceLock::new(),
     })
 }
 

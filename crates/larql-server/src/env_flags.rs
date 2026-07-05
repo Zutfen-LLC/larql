@@ -25,6 +25,11 @@ pub const USE_LEGACY_CPU: &str = "LARQL_USE_LEGACY_CPU";
 pub const USE_METAL_EXPERTS: &str = "LARQL_USE_METAL_EXPERTS";
 /// Hard-disable the Metal expert path even on `metal-experts` builds.
 pub const DISABLE_METAL_EXPERTS: &str = "LARQL_DISABLE_METAL_EXPERTS";
+/// Opt-in: route experts through CUDA (GPU-3003). Default-off while
+/// on-device throughput is validated; mirrors Metal's opt-in contract.
+pub const USE_CUDA_EXPERTS: &str = "LARQL_USE_CUDA_EXPERTS";
+/// Hard-disable the CUDA expert path even on `cuda-experts` builds.
+pub const DISABLE_CUDA_EXPERTS: &str = "LARQL_DISABLE_CUDA_EXPERTS";
 /// Disable the SDOT direct-Q4K matvec; fall back to BLAS-on-cached-f32.
 pub const DISABLE_Q4K_DIRECT: &str = "LARQL_DISABLE_Q4K_DIRECT";
 /// Server-side per-call A/B compare Metal vs CPU expert outputs.
@@ -81,6 +86,18 @@ pub fn use_metal_experts() -> bool {
 pub fn disable_metal_experts() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     cached_is_set(&CACHE, DISABLE_METAL_EXPERTS)
+}
+
+/// `LARQL_USE_CUDA_EXPERTS=1` — opt in to the CUDA expert kernel (GPU-3003).
+pub fn use_cuda_experts() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    cached_is_set(&CACHE, USE_CUDA_EXPERTS)
+}
+
+/// `LARQL_DISABLE_CUDA_EXPERTS=1` — hard-disable CUDA experts.
+pub fn disable_cuda_experts() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    cached_is_set(&CACHE, DISABLE_CUDA_EXPERTS)
 }
 
 /// `LARQL_DISABLE_Q4K_DIRECT=1` — fall back to BLAS for the gate/up matvec.
@@ -160,6 +177,8 @@ mod tests {
             USE_LEGACY_CPU,
             USE_METAL_EXPERTS,
             DISABLE_METAL_EXPERTS,
+            USE_CUDA_EXPERTS,
+            DISABLE_CUDA_EXPERTS,
             DISABLE_Q4K_DIRECT,
             METAL_VS_CPU_DEBUG,
             MOE_BATCH_MODE,
