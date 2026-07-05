@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Vulkan backend scaffold for LARQL. Implements the shared compute/KV traits while the kernel surface is brought up incrementally."
+description = "Vulkan backend for LARQL. First native kernel: Q4_K matvec via a build-time-compiled SPIR-V shader; remaining ops CPU-delegate."
 keywords = ["vulkan", "gpu", "quantization", "matmul"]
 categories = ["science"]
 
@@ -13,7 +13,28 @@ larql-compute = { path = "../larql-compute" }
 larql-models = { path = "../larql-models" }
 ndarray = "0.16"
 half = "2"
+# ash = thin unsafe bindings over the Vulkan C API. Loaded dynamically at
+# runtime via `Entry::load()` so a missing `libvulkan.so.1` becomes a clean
+# `BackendInitError` rather than a link failure — the crate still compiles
+# and runs on the CPU delegate on a GPU-less host (GPU-0002). We do NOT use
+# the `linked` feature (GPU-4001 §6.2).
+ash = "0.38"
+# bytemuck for zero-copy casts of f32/u32 buffers into the SPIR-V upload
+# paths and the push-constant staging slice.
+bytemuck = "1"
 
 [dev-dependencies]
 larql-compute = { path = "../larql-compute", features = ["test-utils"] }
 larql-models = { path = "../larql-models", features = ["test-utils"] }
+
+[features]
+default = []
+# Regenerate `spv/*.spv` from `shaders/*.comp` at build time via shaderc.
+# Off by default — CI embeds the committed `.spv`. Authors enable this to
+# rebuild shaders after editing `.comp` sources (GPU-4001 §3.3).
+shader-rebuild = ["dep:shaderc"]
+
+[build-dependencies]
+# shaderc vendors glslang, so the rebuild path needs no system
+# `glslangValidator`. Only pulled in when `shader-rebuild` is active.
+shaderc = { version = "0.8", optional = true }
