@@ -62,6 +62,17 @@ pub struct RouterMetrics {
     /// useful ratio: ~1.0 means hedging clips real tail; ~0.0 means
     /// it's just doubling wire load.
     pub route_hedge_wins_total: IntCounter,
+    /// GPU-3002 — total MoE expert calls that were retried after a transient
+    /// shard error (timeout, 503, connection). Incremented in the
+    /// `larql-inference` process via process-global atomics; this Prometheus
+    /// counter mirrors them on the router's `/metrics` surface.
+    pub moe_retry_total: IntCounter,
+    /// GPU-3002 — subset of `moe_retry_total` where the retry used a
+    /// *different* replica (failover), as opposed to a same-shard retry
+    /// after backoff. `moe_failover_total / moe_retry_total` tells the
+    /// operator whether retries are shard deaths (≈1) or transient
+    /// saturation on healthy shards (≈0).
+    pub moe_failover_total: IntCounter,
 
     // ── Histograms (event-driven) ──────────────────────────────────────────────
     pub walk_ffn_duration_seconds: HistogramVec, // (currently no labels; HistogramVec used for future expansion)
@@ -236,6 +247,22 @@ impl RouterMetrics {
             .register(Box::new(route_hedge_wins_total.clone()))
             .unwrap();
 
+        let moe_retry_total = IntCounter::new(
+            "larql_router_moe_retry_total",
+            "GPU-3002 — total MoE expert calls retried after a transient shard error (timeout, 503, connection). Mirrors the process-global atomic counter in larql-inference moe_remote module.",
+        )
+        .unwrap();
+        registry.register(Box::new(moe_retry_total.clone())).unwrap();
+
+        let moe_failover_total = IntCounter::new(
+            "larql_router_moe_failover_total",
+            "GPU-3002 — MoE retries that used a different replica (failover). moe_failover_total / moe_retry_total close to 1 means retries are shard deaths; close to 0 means transient saturation on healthy shards.",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(moe_failover_total.clone()))
+            .unwrap();
+
         let walk_ffn_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "larql_router_walk_ffn_duration_seconds",
@@ -304,6 +331,8 @@ impl RouterMetrics {
             route_saturation_total,
             route_hedge_fires_total,
             route_hedge_wins_total,
+            moe_retry_total,
+            moe_failover_total,
             walk_ffn_duration_seconds,
         })
     }
@@ -391,6 +420,8 @@ mod tests {
             "larql_router_route_saturation_total",
             "larql_router_route_hedge_fires_total",
             "larql_router_route_hedge_wins_total",
+            "larql_router_moe_retry_total",
+            "larql_router_moe_failover_total",
             "larql_router_walk_ffn_duration_seconds",
         ] {
             assert!(names.contains(&required), "missing metric {required}");

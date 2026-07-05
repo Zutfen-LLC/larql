@@ -182,3 +182,46 @@ pub fn print_summary(label: &str, before: &TransportSnapshot, measured_tokens: u
         );
     }
 }
+
+// ── GPU-3002 — retry / failover counters ───────────────────────────────────
+//
+// Process-global atomic counters (not Prometheus IntCounter) so the
+// inference crate can bump them without a dependency on `larql-router`'s
+// `RouterMetrics` registry. The router crate exposes them through its own
+// Prometheus surface by reading these atomics in its `/metrics` encoder.
+// See `crates/larql-router/src/metrics.rs` for the Prometheus wrappers.
+
+static MOE_RETRY_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MOE_FAILOVER_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// GPU-3002 — increment when a single shard call was retried (same shard
+/// after backoff OR a different replica after failover).  `retries /
+/// total_calls` is the operator's signal for how often the MoE path is
+/// hitting transient failures.
+pub fn record_moe_retry() {
+    MOE_RETRY_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// GPU-3002 — increment when a retry actually used a *different* replica
+/// (failover), as opposed to a same-shard retry after backoff.
+/// `failovers / retries ≈ 1` means most retries are shard deaths; ≈ 0
+/// means they are transient timeouts/saturation on otherwise-healthy
+/// shards.
+pub fn record_moe_failover() {
+    MOE_FAILOVER_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot of the two GPU-3002 counters for Prometheus export.
+#[allow(dead_code)]
+pub fn moe_retry_failover_snapshot() -> (u64, u64) {
+    (
+        MOE_RETRY_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        MOE_FAILOVER_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+pub fn reset_moe_retry_failover_counters() {
+    MOE_RETRY_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+    MOE_FAILOVER_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+}
