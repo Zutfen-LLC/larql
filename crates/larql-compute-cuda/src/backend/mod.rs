@@ -724,6 +724,35 @@ impl CudaBackend {
         }
     }
 
+    /// Advance every layer's cursor to `len` without any host->device upload.
+    /// Used by `prefill_kquant` on the lazy device-KV path (GPU-2002): the
+    /// active device-resident attention chain reads K/V from fresh per-layer
+    /// uploads rather than CudaKVCache, so the lockstep `populate_kv_layer`
+    /// upload is skipped. This cheap cursor advance keeps
+    /// `kv_cache_len_native` / `has_kv_cache` consistent with the post-prefill
+    /// length (the DecodeBackend lifecycle contract) while eliminating the
+    /// `seq*kv_dim*num_layers` transfer. No-op when no device cache is
+    /// allocated (`has_kv_cache` reports false regardless).
+    pub(crate) fn advance_kv_cursor_native(&self, len: usize) {
+        if let Ok(mut guard) = self.kv_cache.lock() {
+            if let Some(cache) = guard.as_mut() {
+                for layer in &mut cache.layers {
+                    layer.current_len = len;
+                }
+            }
+        }
+    }
+
+    /// Policy flag gating the lockstep device-KV upload in `prefill_kquant`.
+    /// The active device-resident attention chain reads K/V from fresh
+    /// per-layer uploads, NOT from CudaKVCache, so the upload is pure
+    /// overhead. This flips to `true` only when a future device-side
+    /// attention kernel reads CudaKVCache as the source of truth; until then
+    /// the lazy cursor-advance path is taken (GPU-2002).
+    pub(crate) fn device_kv_upload_enabled(&self) -> bool {
+        false
+    }
+
     pub(crate) fn runtime_summary(&self) -> &str {
         match (&self.runtime, &self.runtime_status) {
             (Some(runtime), _) => runtime.summary(),

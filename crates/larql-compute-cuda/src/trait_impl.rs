@@ -445,7 +445,10 @@ impl DecodeBackend for CudaBackend {
     /// (`pipeline::host_prefill_kquant`): projections use the amortised
     /// native CUDA q4k/q6k matmul kernels across all `seq_len` positions;
     /// causal attention + elementwise ops on host. Populates the host KV
-    /// mirror (and the device cache via `populate_kv_layer` in lockstep).
+    /// mirror; advances the device-KV cursor to keep `has_kv_cache` /
+    /// `kv_cache_len` consistent (the lockstep `populate_kv_layer` upload is
+    /// skipped while the device-resident attention chain reads fresh per-layer
+    /// uploads instead of CudaKVCache — see GPU-2002).
     /// `None` on the scaffold path or for unsupported layer features.
     fn prefill_kquant(
         &self,
@@ -461,10 +464,16 @@ impl DecodeBackend for CudaBackend {
             return None;
         }
         let h = self.host_prefill_kquant(layers, x, hidden, inter, seq_len, softcap)?;
-        // Populate the device KV cache in lockstep with the host mirror so
-        // `has_kv_cache` / `kv_cache_len` reflect the post-prefill state and
-        // subsequent `decode_token` calls see the right `pos`.
-        {
+        // Device-KV upload policy (GPU-2002): the active device-resident
+        // attention chain reads K/V from fresh per-layer uploads, NOT from
+        // CudaKVCache, so the lockstep full-mirror upload
+        // (`seq*kv_dim*num_layers` htod bytes) goes unused. Guard it behind
+        // `device_kv_upload_enabled()`, which flips true only when a future
+        // device-side attention kernel reads CudaKVCache as the source of
+        // truth. Until then, advance the per-layer cursor cheaply so
+        // `has_kv_cache` / `kv_cache_len_native` reflect the post-prefill
+        // length (the DecodeBackend lifecycle contract) without the transfer.
+        if self.device_kv_upload_enabled() {
             let kv = self.lock_host_kv();
             for (li, slot) in kv.iter().enumerate() {
                 let (k_cache, v_cache) = slot;
@@ -481,6 +490,11 @@ impl DecodeBackend for CudaBackend {
                     );
                 }
             }
+        } else {
+            // Cheap cursor-only update: no host->device transfer. Keeps
+            // `kv_cache_len_native` consistent with the host mirror length
+            // so position tracking and the lifecycle contract are unaffected.
+            self.advance_kv_cursor_native(seq_len);
         }
         Some(h)
     }
