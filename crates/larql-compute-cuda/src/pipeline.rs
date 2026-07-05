@@ -90,6 +90,40 @@ impl CudaBackend {
 
 impl CudaBackend {
     /// Decode one token through all layers with the host KV mirror.
+/// Append one decoded K/V row to the host mirror for layer `li`. Grows the
+/// `[len, kv_dim]` arrays by one row (rebuilt — `Array2` has no in-place row
+/// append). Shared by the decode-token paths so the K/V mirror growth lives in
+/// exactly one place.
+fn push_host_kv_row(
+    &self,
+    layer: &FullPipelineLayer<'_>,
+    li: usize,
+    k_new_row: &[f32],
+    v_new_row: &[f32],
+) -> Option<()> {
+    let mut kv = self.lock_host_kv();
+    if let Some((k_cache, v_cache)) = kv.get_mut(li) {
+        let kv_dim = layer.num_kv_heads * layer.head_dim;
+        let prev = k_cache.shape()[0];
+        let mut k_new = Array2::zeros((prev + 1, kv_dim));
+        let mut v_new = Array2::zeros((prev + 1, kv_dim));
+        if prev > 0 {
+            k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
+            v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+        }
+        k_new
+            .slice_mut(ndarray::s![prev..prev + 1, ..])
+            .assign(&Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec()).ok()?);
+        v_new
+            .slice_mut(ndarray::s![prev..prev + 1, ..])
+            .assign(&Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec()).ok()?);
+        *k_cache = k_new;
+        *v_cache = v_new;
+    }
+    Some(())
+}
+
+
     /// Returns the `[hidden]` post-layer residual. `None` if any layer's
     /// format isn't Q4_K/Q6_K (the only formats with native matvec today) or
     /// a projection returns `None` (caller falls back to the CPU path).
@@ -187,6 +221,185 @@ impl CudaBackend {
                 h_post_ffn.mapv_inplace(|v| v * scalar);
             }
             h = h_post_ffn;
+        }
+
+        h.row(0).to_vec().into()
+    }
+
+    /// Decode one token through all layers, dispatching MoE / remote-FFN layers
+    /// to the supplied `moe_fn` callback — the CUDA twin of Metal's
+    /// `decode_token_with_moe_fn`. Attention + norms + RoPE run locally via the
+    /// device-resident chain ([`host_attention_block`]); at each MoE / remote
+    /// layer (`layer.moe.is_some() || layer.ffn_is_remote`) the callback fires
+    /// with `h_post_attn` to produce the expert / FFN contribution, which is
+    /// combined exactly as Metal's `moe_combine::apply_outer_combine` does
+    /// (outer post-FFN norm on `h1+h2` + residual + layer_scalar). Dense
+    /// (non-MoE, non-remote) layers run the local FFN via [`host_ffn_block`].
+    ///
+    /// `None` when no runtime is present (the caller routes through the CPU
+    /// reference decode), the input length mismatches `hidden`, a projection
+    /// returns `None`, or a layer uses an unsupported feature (PLE).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn host_decode_token_with_moe(
+        &self,
+        layers: &[FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        let num_layers = layers.len();
+        if x.len() != hidden {
+            return None;
+        }
+        // Ensure the host KV mirror has one slot per layer (same setup as
+        // `host_decode_token`).
+        {
+            let mut kv = self.lock_host_kv();
+            if kv.len() != num_layers {
+                kv.clear();
+                kv.resize_with(num_layers, || {
+                    (Array2::zeros((0, 0)), Array2::zeros((0, 0)))
+                });
+            }
+        }
+
+        let abs_position = self.host_kv_len();
+        let mut h = Array2::from_shape_vec((1, hidden), x.to_vec()).ok()?;
+        for (li, layer) in layers.iter().enumerate() {
+            // PLE needs a precomputed per-layer embedding input not carried on
+            // `FullPipelineLayer` — bail (same rationale as `host_decode_token`).
+            if layer.ple_input_gate.is_some() {
+                return None;
+            }
+
+            let (h_post_attn, k_new_row, v_new_row) =
+                self.host_attention_block(layer, &h, li, abs_position)?;
+
+            self.push_host_kv_row(layer, li, &k_new_row, &v_new_row)?;
+
+            let is_moe_or_remote = layer.moe.is_some() || layer.ffn_is_remote;
+            let h_next = if is_moe_or_remote {
+                let ha: Vec<f32> = h_post_attn.row(0).to_vec();
+                // Fire the remote MoE callback with h_post_attn — the callback
+                // routes, dispatches to shards, and returns the router-weighted
+                // expert sum with post-experts norm applied (Metal's `h2`).
+                let moe_out = moe_fn(li, &ha);
+                // h1+h2 = dense_ffn_delta + expert_delta. For `ffn_is_remote`
+                // (pure remote, no local dense FFN) the expert output is the
+                // full delta. For hybrid MoE the local dense FFN contributes
+                // h1; when its weights are empty stubs (pure-MoE model) it
+                // returns `None` and the expert output alone is the delta.
+                let h1_plus_h2 = if layer.ffn_is_remote {
+                    moe_out
+                } else {
+                    match self.host_ffn_block(layer, &h_post_attn, hidden, inter) {
+                        Some(dense) => {
+                            let mut combined = vec![0.0f32; hidden];
+                            for i in 0..hidden {
+                                combined[i] = (dense[(0, i)] - ha[i]) + moe_out[i];
+                            }
+                            combined
+                        }
+                        None => moe_out,
+                    }
+                };
+                let out = combine_remote_moe_output(&ha, &h1_plus_h2, layer);
+                Array2::from_shape_vec((1, hidden), out).ok()?
+            } else {
+                self.host_ffn_block(layer, &h_post_attn, hidden, inter)?
+            };
+            h = h_next;
+        }
+
+        h.row(0).to_vec().into()
+    }
+
+    /// Split fire / collect variant — mirrors Metal's `handle_moe_interleave`
+    /// split path. At each MoE / remote layer the remote dispatch is **fired**
+    /// as soon as `h_post_attn` is ready, then the local dense FFN runs while
+    /// the network round trip is in flight, then the result is **collected**.
+    /// This overlaps the remote RTT with the local FFN compute — the same
+    /// overlap strategy Metal achieves with a second command buffer.
+    ///
+    /// `None` under the same conditions as [`host_decode_token_with_moe`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn host_decode_token_with_moe_split(
+        &self,
+        layers: &[FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        fire_fn: &mut dyn FnMut(usize, &[f32]),
+        collect_fn: &mut dyn FnMut(usize) -> Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        let num_layers = layers.len();
+        if x.len() != hidden {
+            return None;
+        }
+        {
+            let mut kv = self.lock_host_kv();
+            if kv.len() != num_layers {
+                kv.clear();
+                kv.resize_with(num_layers, || {
+                    (Array2::zeros((0, 0)), Array2::zeros((0, 0)))
+                });
+            }
+        }
+
+        let abs_position = self.host_kv_len();
+        let mut h = Array2::from_shape_vec((1, hidden), x.to_vec()).ok()?;
+        for (li, layer) in layers.iter().enumerate() {
+            if layer.ple_input_gate.is_some() {
+                return None;
+            }
+
+            let (h_post_attn, k_new_row, v_new_row) =
+                self.host_attention_block(layer, &h, li, abs_position)?;
+
+            self.push_host_kv_row(layer, li, &k_new_row, &v_new_row)?;
+
+            let is_moe_or_remote = layer.moe.is_some() || layer.ffn_is_remote;
+            let h_next = if is_moe_or_remote {
+                let ha: Vec<f32> = h_post_attn.row(0).to_vec();
+                // FIRE: dispatch the remote MoE call now. For gRPC streams
+                // this returns immediately; for HTTP it blocks (no overlap,
+                // but correct — the caller chose the split path for streams).
+                fire_fn(li, &ha);
+                // OVERLAP: run the local dense FFN while the remote round
+                // trip is in flight. Skipped for `ffn_is_remote` (no local
+                // FFN weights) and when the local FFN bails (pure-MoE model).
+                let dense_delta: Option<Vec<f32>> = if layer.ffn_is_remote {
+                    None
+                } else {
+                    self.host_ffn_block(layer, &h_post_attn, hidden, inter)
+                        .map(|dense| {
+                            let mut dd = vec![0.0f32; hidden];
+                            for i in 0..hidden {
+                                dd[i] = dense[(0, i)] - ha[i];
+                            }
+                            dd
+                        })
+                };
+                // COLLECT: block for the remote MoE result.
+                let moe_out = collect_fn(li);
+                // h1+h2 = dense_delta + expert_delta.
+                let h1_plus_h2 = match dense_delta {
+                    Some(dd) => {
+                        let mut combined = vec![0.0f32; hidden];
+                        for i in 0..hidden {
+                            combined[i] = dd[i] + moe_out[i];
+                        }
+                        combined
+                    }
+                    None => moe_out,
+                };
+                let out = combine_remote_moe_output(&ha, &h1_plus_h2, layer);
+                Array2::from_shape_vec((1, hidden), out).ok()?
+            } else {
+                self.host_ffn_block(layer, &h_post_attn, hidden, inter)?
+            };
+            h = h_next;
         }
 
         h.row(0).to_vec().into()
@@ -2523,6 +2736,29 @@ pub(crate) fn moe_outer_norm<'a>(layer: &'a FullPipelineLayer<'a>) -> Option<&'a
     } else {
         None
     }
+}
+
+/// Combine the remote-expert (+ optional local-dense) FFN output into the
+/// post-FFN residual. Mirrors Metal's `moe_combine::apply_outer_combine`:
+/// outer post-FFN norm on `h1_plus_h2` (the dense+expert delta) + residual add
+/// of `h_post_attn`, then whole-layer `layer_scalar` multiplication. The outer
+/// norm weight is selected via [`moe_outer_norm`] (same selection logic as the
+/// local MoE path and Metal's combine step).
+fn combine_remote_moe_output(
+    h_post_attn: &[f32],
+    h1_plus_h2: &[f32],
+    layer: &FullPipelineLayer<'_>,
+) -> Vec<f32> {
+    let outer_w = moe_outer_norm(layer);
+    let mut out =
+        outer_post_norm_residual(h_post_attn, h1_plus_h2, outer_w, layer.norm_offset, layer.eps);
+    let scalar = layer.layer_scalar;
+    if scalar != 0.0 && scalar != 1.0 {
+        for v in out.iter_mut() {
+            *v *= scalar;
+        }
+    }
+    out
 }
 
 /// Per-row MoE combine, shared by the decode (single-row) and prefill

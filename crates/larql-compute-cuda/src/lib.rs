@@ -160,6 +160,44 @@ mod tests {
         assert!(!backend.supports_quant(QuantFormat::Q4_K));
     }
 
+    /// GPU-2001: `DecodeMoe` must be advertised only once the override
+    /// lands AND a runtime is present. On the scaffold path (no device,
+    /// as on this CI host) it reports `false` so the engine routes the
+    /// remote-MoE decode through a backend that actually implements it
+    /// (Metal / CPU) instead of the trait default which ignores the
+    /// `moe_fn` hook.
+    #[test]
+    fn supports_decode_moe_is_false_on_scaffold() {
+        let backend = backend();
+        assert!(!backend.supports(larql_compute::Capability::DecodeMoe));
+    }
+
+    /// GPU-2001: `decode_token_with_moe` on the scaffold path returns
+    /// `None` (no runtime) so the caller falls back to a backend that
+    /// honours the moe_fn hook. The override exists; without a runtime it
+    /// is a clean bail.
+    #[test]
+    fn decode_token_with_moe_bails_on_scaffold() {
+        let backend = backend();
+        let layers: [larql_compute::FullPipelineLayer<'_>; 0] = [];
+        let mut moe_fn = |_layer: usize, _h: &[f32]| -> Vec<f32> { vec![] };
+        let out = <crate::CudaBackend as larql_compute::backend::DecodeBackend>::
+            decode_token_with_moe(&backend, &layers, &[0.0; 4], 4, 4, &mut moe_fn);
+        assert!(out.is_none());
+    }
+
+    /// GPU-2001: `decode_token_with_moe_split` bails on scaffold too.
+    #[test]
+    fn decode_token_with_moe_split_bails_on_scaffold() {
+        let backend = backend();
+        let layers: [larql_compute::FullPipelineLayer<'_>; 0] = [];
+        let mut fire = |_layer: usize, _h: &[f32]| {};
+        let mut collect = |_layer: usize| -> Vec<f32> { vec![] };
+        let out = <crate::CudaBackend as larql_compute::backend::DecodeBackend>::
+            decode_token_with_moe_split(&backend, &layers, &[0.0; 4], 4, 4, &mut fire, &mut collect);
+        assert!(out.is_none());
+    }
+
     #[test]
     fn device_info_reports_native_or_fallback_status() {
         let info = backend().device_info();
