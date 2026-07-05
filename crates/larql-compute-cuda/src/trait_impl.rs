@@ -371,6 +371,42 @@ impl DecodeBackend for CudaBackend {
         self.host_decode_token(layers, x, hidden, inter, pos, None, StateDumpMask::None)
     }
 
+    /// Decode with a remote-MoE callback. Runs attention on the GPU via the
+    /// host-orchestrated chain and dispatches FFN for MoE / remote layers to
+    /// `moe_fn`, mirroring Metal's `decode_token_with_moe`. `None` on the
+    /// scaffold path (no runtime) or when a layer uses an unsupported feature.
+    fn decode_token_with_moe(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        if !self.native_runtime_available() {
+            return None;
+        }
+        self.host_decode_token_with_moe(layers, x, hidden, inter, moe_fn)
+    }
+
+    /// Split fire / collect variant — fires the remote dispatch, runs the
+    /// local dense FFN while the round trip is in flight, then collects.
+    /// Mirrors Metal's `decode_token_with_moe_split` overlap pattern.
+    fn decode_token_with_moe_split(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        moe_fire_fn: &mut dyn FnMut(usize, &[f32]),
+        moe_collect_fn: &mut dyn FnMut(usize) -> Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        if !self.native_runtime_available() {
+            return None;
+        }
+        self.host_decode_token_with_moe_split(layers, x, hidden, inter, moe_fire_fn, moe_collect_fn)
+    }
+
     fn decode_token_with_state_dump(
         &self,
         layers: &[larql_compute::FullPipelineLayer<'_>],
@@ -475,7 +511,10 @@ impl ComputeBackend for CudaBackend {
         }
         matches!(
             cap,
-            Capability::QuantMatVec | Capability::DecodeToken | Capability::PrefillQ4
+            Capability::QuantMatVec
+                | Capability::DecodeToken
+                | Capability::DecodeMoe
+                | Capability::PrefillQ4
         )
     }
 
