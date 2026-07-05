@@ -6,7 +6,7 @@
 //! Pure post-processing lives in `remote_moe.rs` and is gated to 90%+.
 
 use super::args::BenchArgs;
-use super::remote_ffn::combine_concurrent_rows;
+use super::remote_ffn::{combine_concurrent_rows, compute_wire_bytes_per_tok};
 use super::remote_moe::{format_moe_backend_label, parse_shard_segments, summarize_moe_result};
 use super::row::BenchRow;
 
@@ -123,6 +123,12 @@ pub(super) fn run_remote_moe_bench(
 
     let _ = run_once(args.warmup.max(1));
 
+    // Snapshot transport counters AFTER warmup so the wire-bytes delta
+    // covers only the measured tokens. Mirrors the remote_ffn path
+    // (`remote_ffn_runtime.rs`). Returns 0 when `LARQL_MOE_BYTES` is off,
+    // yielding `None` (no wire column) — same behaviour as before.
+    let before_bytes = remote.wire_bytes_total();
+
     let result = run_once(max_tokens).map_err(|e| format!("moe bench generate failed: {e}"))?;
 
     let summary = summarize_moe_result(
@@ -130,6 +136,11 @@ pub(super) fn run_remote_moe_bench(
         &result.ffn_rtt_ms,
         args.warmup,
         args.tokens,
+    );
+
+    let wire_bytes_per_tok = compute_wire_bytes_per_tok(
+        remote.wire_bytes_total().saturating_sub(before_bytes),
+        summary.n_steps,
     );
 
     Ok(BenchRow {
@@ -142,7 +153,7 @@ pub(super) fn run_remote_moe_bench(
         stages: None,
         ffn_rtt_ms: summary.ffn_rtt_ms,
         attn_ms: summary.attn_ms,
-        wire_bytes_per_tok: None,
+        wire_bytes_per_tok,
         shard_efficiency: None,
         n_steps: summary.n_steps,
         note: summary.note,
