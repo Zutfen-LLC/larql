@@ -47,7 +47,7 @@ impl TransportSnapshot {
         TransportSnapshot { by_shard: out }
     }
 
-    fn total(&self) -> ShardTransportTotals {
+    pub(crate) fn total(&self) -> ShardTransportTotals {
         self.by_shard
             .values()
             .fold(ShardTransportTotals::default(), |mut acc, v| {

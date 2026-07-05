@@ -80,6 +80,22 @@ impl RemoteMoeBackend {
             .collect()
     }
 
+    /// Total bytes (request + response) recorded by the transport counters
+    /// across all shards since process start. Returns 0 when
+    /// `LARQL_MOE_BYTES` is off (no counters recorded). Used by the `larql
+    /// bench` harness to populate `payload_bytes/token` via a before/after
+    /// delta around the measured run.
+    pub fn wire_bytes_total(&self) -> u64 {
+        let t = crate::ffn::moe_remote::metrics::snapshot().total();
+        t.request_bytes + t.response_bytes
+    }
+
+    /// Total number of transport calls recorded across all shards since
+    /// process start. Used to derive `remote_calls/token`.
+    pub fn remote_calls_total(&self) -> u64 {
+        crate::ffn::moe_remote::metrics::snapshot().total().calls
+    }
+
     /// Run one MoE layer forward pass with experts dispatched remotely.
     ///
     /// Steps:
