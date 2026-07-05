@@ -86,7 +86,7 @@ jobs:
       - name: Install BLAS (CPU forward path uses OpenBLAS)
         run: |
           apt-get update
-          apt-get install -y libopenblas-dev pkg-config
+          apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
 
       - name: Build larql-cli (release)
         run: cargo build --release -p larql-cli

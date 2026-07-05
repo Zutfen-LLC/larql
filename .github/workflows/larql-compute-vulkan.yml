@@ -57,7 +57,7 @@ jobs:
         # no external system dependency.
         run: |
           apt-get update
-          apt-get install -y libopenblas-dev pkg-config
+          apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5
