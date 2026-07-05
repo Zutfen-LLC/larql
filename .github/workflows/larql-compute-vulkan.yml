@@ -1,0 +1,87 @@
+# larql-compute-vulkan CI (CPU-only compile check).
+#
+# Vulkan GPU backend for larql-compute.  This workflow is CPU-only:
+# `larql-compute-vulkan` has no external (non-Rust) dependencies, so it
+# compiles cleanly on a stock ubuntu-latest runner.  The goal is to catch
+# compile regressions -- API drift, trait-impl mismatches -- in CI instead
+# of only on a developer machine with a GPU.
+#
+# No GPU is required, and no runtime tests are executed.
+
+name: larql-compute-vulkan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/larql-compute-vulkan/**
+      - crates/larql-compute/**
+      - crates/larql-models/**
+      - crates/larql-vindex/**
+      - crates/larql-inference/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/larql-compute-vulkan.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - crates/larql-compute-vulkan/**
+      - crates/larql-compute/**
+      - crates/larql-models/**
+      - crates/larql-vindex/**
+      - crates/larql-inference/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/larql-compute-vulkan.yml
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    name: check · ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install OpenBLAS
+        # `larql-compute` and `larql-inference` link BLAS on Linux via
+        # `openblas-src` (system feature); the vulkan crate itself has
+        # no external system dependency.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Cache cargo registry + build artefacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: Linux-cargo-compute-vulkan-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            Linux-cargo-compute-vulkan-
+
+      - name: Format check
+        run: cargo fmt -p larql-compute-vulkan -- --check
+
+      - name: Check (all targets)
+        run: cargo check -p larql-compute-vulkan --all-targets
+
+      - name: Clippy (no-deps)
+        # `--no-deps` so warnings in sibling crates in-flight work do
+        # not promote to errors here; matches the local `make` lint
+        # targets and the other compute CI workflows.
+        run: cargo clippy -p larql-compute-vulkan --all-targets --no-deps -- -D warnings
+
+      - name: Check larql-inference --features vulkan
+        # Ensures the vulkan activation path through the inference
+        # facade (optional dep + `larql-vindex/vulkan`) still compiles
+        # end-to-end.
+        run: cargo check -p larql-inference --features vulkan
