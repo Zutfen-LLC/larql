@@ -2,7 +2,7 @@
 #
 # Vulkan GPU backend for larql-compute.  This workflow is CPU-only:
 # `larql-compute-vulkan` has no external (non-Rust) dependencies, so it
-# compiles cleanly on a stock ubuntu-latest runner.  The goal is to catch
+# compiles cleanly on the self-hosted Linux x64 runner.  The goal is to catch
 # compile regressions -- API drift, trait-impl mismatches -- in CI instead
 # of only on a developer machine with a GPU.
 #
@@ -37,8 +37,8 @@ on:
 
 jobs:
   check:
-    name: check · ubuntu-latest
-    runs-on: ubuntu-latest
+    name: check · self-hosted-linux-x64
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 35
 
     steps:

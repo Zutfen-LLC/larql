@@ -39,8 +39,8 @@ on:
 
 jobs:
   check:
-    name: check · ubuntu-latest
-    runs-on: ubuntu-latest
+    name: check · self-hosted-linux-x64
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 35
 
     steps:
@@ -76,7 +76,7 @@ jobs:
       - name: Check (all targets)
         # Compile-only; no GPU needed. `fallback-dynamic-loading` means
         # cudarc resolves the driver at runtime via dlopen, never at link
-        # time, so this is green on a stock ubuntu-latest runner.
+        # time, so this stays green on the self-hosted Linux x64 runner.
         run: cargo check -p larql-compute-cuda --all-targets
 
       - name: Clippy (no-deps)

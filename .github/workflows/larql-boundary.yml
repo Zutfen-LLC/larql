@@ -27,14 +27,20 @@ on:
 
 jobs:
   test:
-    name: test · ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: test · ${{ matrix.name }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     timeout-minutes: 20
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        include:
+          - name: self-hosted-linux-x64
+            runs_on: '["self-hosted", "Linux", "X64"]'
+          - name: windows-latest
+            runs_on: '"windows-latest"'
+          - name: macos-14
+            runs_on: '"macos-14"'
 
     steps:
       - uses: actions/checkout@v6
@@ -76,8 +82,8 @@ jobs:
           cargo run -p larql-boundary --example gate_decision
 
   coverage:
-    name: coverage · ubuntu
-    runs-on: ubuntu-latest
+    name: coverage · self-hosted-linux-x64
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
 
     steps:
