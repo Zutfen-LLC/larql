@@ -1011,6 +1011,183 @@ mod tests {
         );
     }
 
+
+    // ── Session 12: end-to-end prefill + decode parity (device vs CPU) ─────
+
+    /// Greedy argmax over the final-norm + lm_head logits for one hidden row.
+    /// Both the CUDA and CPU reference hidden states are projected through the
+    /// same host lm_head path, so an argmax mismatch can only come from a
+    /// hidden-state divergence — i.e. a wiring bug in the residual routing,
+    /// the KV mirror, or position tracking between prefill and decode.
+    fn argmax_token(weights: &larql_models::ModelWeights, hidden_row: &[f32]) -> u32 {
+        let h = Array2::from_shape_vec((1, hidden_row.len()), hidden_row.to_vec())
+            .expect("hidden row -> Array2");
+        let logits = larql_compute::forward::predict::raw::hidden_to_raw_logits(weights, &h);
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .expect("non-empty logits")
+    }
+
+    /// Run a full prefill + N-step decode on the CUDA backend and on the CPU
+    /// reference (`predict_kquant_prefill` + `predict_kquant_decode_step`),
+    /// then assert the sampled argmax tokens and the per-step hidden states
+    /// match end-to-end. `prompt_len` controls which attention/FFN gate
+    /// regime the run lands in (device-resident chain vs host-only fallback).
+    fn assert_e2e_prefill_decode_parity(prompt_len: usize, num_decode: usize) {
+        let b = backend();
+        if !b.test_runtime_gate() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let token_ids: Vec<u32> = (0..prompt_len as u32).map(|i| i % 16).collect();
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        // ── CUDA path ────────────────────────────────────────────────────
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let cuda_prefill = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill_kquant should succeed with a runtime");
+        assert_eq!(cuda_prefill.len(), seq_len * hidden);
+
+        // host_kv_len must reflect the committed prefill length before the
+        // first decode step runs.
+        assert_eq!(
+            b.host_kv_len(),
+            seq_len,
+            "host_kv_len must equal prefill length after prefill_kquant"
+        );
+
+        let mut cuda_hidden_last: Vec<f32> =
+            cuda_prefill[(seq_len - 1) * hidden..seq_len * hidden].to_vec();
+        let mut cuda_tokens: Vec<u32> = Vec::with_capacity(num_decode + 1);
+        cuda_tokens.push(argmax_token(&weights, &cuda_hidden_last));
+
+        for step in 0..num_decode {
+            // The CUDA decode_token reads host_kv_len() as the RoPE position
+            // internally, so we pass the post-prefill / post-step hidden row
+            // straight through. Embed the last sampled token for the input.
+            let next_id = *cuda_tokens.last().unwrap();
+            let h_embed = larql_compute::forward::embed_tokens_pub(&weights, &[next_id]);
+            let x_in: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
+            assert_eq!(x_in.len(), hidden);
+
+            let h_decoded = b
+                .decode_token(&layers, &x_in, hidden, inter)
+                .unwrap_or_else(|| {
+                    panic!("decode_token step {step} returned None with a runtime available")
+                });
+            assert_eq!(h_decoded.len(), hidden);
+
+            // host_kv_len must advance by exactly one per decode step.
+            assert_eq!(
+                b.host_kv_len(),
+                seq_len + step + 1,
+                "host_kv_len must advance by one per decode step (step {step})"
+            );
+
+            cuda_hidden_last = h_decoded.clone();
+            cuda_tokens.push(argmax_token(&weights, &cuda_hidden_last));
+        }
+
+        // ── CPU reference path ───────────────────────────────────────────
+        let (cpu_h_2d, mut cpu_cache, _t) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let mut cpu_hidden_last: Vec<f32> = cpu_h_2d.row(seq_len - 1).to_vec();
+        let mut cpu_tokens: Vec<u32> = Vec::with_capacity(num_decode + 1);
+        cpu_tokens.push(argmax_token(&weights, &cpu_hidden_last));
+
+        // Prefill final-position hidden parity (<1e-3).
+        let prefill_max_abs = cpu_hidden_last
+            .iter()
+            .zip(cuda_hidden_last.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            prefill_max_abs < 1e-3,
+            "prefill final-position hidden diverged: max_abs={prefill_max_abs:.6e}"
+        );
+
+        for step in 0..num_decode {
+            let abs_position = seq_len + step;
+            let next_id = *cpu_tokens.last().unwrap();
+            let (h_decoded, _t) = larql_compute::kquant_forward::predict_kquant_decode_step(
+                &weights,
+                next_id,
+                &index,
+                &mut cpu_cache,
+                abs_position,
+            )
+            .unwrap_or_else(|| panic!("CPU decode step {step} must succeed for the reference"));
+            cpu_hidden_last = h_decoded.row(0).to_vec();
+            cpu_tokens.push(argmax_token(&weights, &cpu_hidden_last));
+        }
+
+        // ── End-to-end assertions ────────────────────────────────────────
+        // Sampled argmax tokens must match exactly (a wiring bug in residual
+        // routing, KV mirror, or position tracking would flip at least one).
+        assert_eq!(
+            cuda_tokens, cpu_tokens,
+            "sampled tokens diverged (cuda={cuda_tokens:?} cpu={cpu_tokens:?})"
+        );
+
+        // Final hidden state within tight tolerance (<1e-3).
+        let final_max_abs = cpu_hidden_last
+            .iter()
+            .zip(cuda_hidden_last.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            final_max_abs < 1e-3,
+            "final decode hidden diverged: max_abs={final_max_abs:.6e}"
+        );
+    }
+
+    /// End-to-end parity on the device-resident attention chain: an 8-token
+    /// prefill clears the prefill-attention gate
+    /// (`seq*num_q*seq*head_dim = 8*4*8*64 = 16384 >= 8192`) so the
+    /// device-resident attention chain runs, and the decode steps exercise
+    /// the host-orchestrated attention/FFN (decode shapes stay below the
+    /// gates). Runtime-gated (no-op without a device). Asserts sampled
+    /// argmax tokens, per-step hidden (<1e-3), and host_kv_len advancement
+    /// against the CPU reference.
+    #[test]
+    fn prefill_decode_e2e_device_chain_matches_cpu_reference_when_runtime_available() {
+        // 8-token prompt: clears the device-resident prefill attention gate.
+        assert_e2e_prefill_decode_parity(8, 4);
+    }
+
+    /// End-to-end parity on the host-only fallback: a 3-token prefill stays
+    /// below every native gate (`3*256=768 < 1024 floor` for FFN;
+    /// `3*4*3*64=2304 < 8192` for attention), so the entire pipeline runs on
+    /// the host-orchestrated path. This is the wiring oracle for the host
+    /// fallback — a KV-mirror/position-tracking bug here cannot hide behind
+    /// a device-kernel divergence. Runtime-gated. Mirrors the structure of
+    /// the device-chain test so the two share the failure surface.
+    #[test]
+    fn prefill_decode_e2e_hostonly_fallback_matches_cpu_reference_when_runtime_available() {
+        // 3-token prompt: below every native gate → host-only path.
+        assert_e2e_prefill_decode_parity(3, 4);
+    }
+
     /// Scaffold path (no CUDA runtime): the device-resident FFN chain
     /// ([`CudaBackend::host_prefill_ffn_block_device`]) returns `None` so the
     /// dispatcher falls through to the host-orchestrated path, and that path
