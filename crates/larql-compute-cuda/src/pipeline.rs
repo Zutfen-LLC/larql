@@ -124,6 +124,446 @@ fn push_host_kv_row(
 }
 
 
+    /// Device-resident full decode chain (GPU-2003): runs every layer's
+    /// attention + FFN + residuals on the device, keeping the per-layer output
+    /// residual `h` resident on the device across **all** layers and reading
+    /// it back to the host exactly once at the end. Collapses the per-layer
+    /// dtoh(input-residual)+htod(normed-input) pair the host-orchestrated path
+    /// ([`host_decode_token`]) pays for each layer, so the per-token
+    /// dtoh+htod count drops from `O(num_layers)` to `O(1)` on the dense path.
+    ///
+    /// Composition. Per layer, all on one CUDA stream (stream-ordered, so no
+    /// inter-kernel sync): upload-once-resident `h` -> input-norm (`rms_norm_dev`)
+    /// -> Q/K/V matvec (`matvec_dev_by_fmt`, share the resident normed input) ->
+    /// QK-norm/V-norm (`rms_norm_heads_dev`) -> RoPE (`rope_dev_with_invfreq`) ->
+    /// decode-attention (`decode_attention_dev`, KV uploaded fresh from the host
+    /// mirror + the new row) -> O matvec -> **device** post-attn residual
+    /// (`residual_add_dev`, fuses the optional post-attn norm + scaled add) ->
+    /// FFN device chain (`rms_norm_dev` pre-ffn -> gate/up matvec ->
+    /// `geglu_*_dev`/`activation_*_dev` -> down matvec -> `residual_add_dev`
+    /// post-ffn residual). The post-residual `h` is the next layer's input;
+    /// no dtoh until the loop ends.
+    ///
+    /// Bails to `None` (caller falls back to [`host_decode_token`]) when:
+    ///   - no runtime (the scaffold path);
+    ///   - the caller requested a [`DecodeStateDump`] (the per-layer h/K/V
+    ///     capture needs the host loop's per-layer readbacks -- the fast path is
+    ///     a black box by design);
+    ///   - any layer is MoE / PLE / remote-FFN (handled by the dedicated paths);
+    ///   - any layer uses LayerNorm (the device `rms_norm` kernel is RMSNorm-
+    ///     only; the host path covers LayerNorm);
+    ///   - any layer's attention / FFN projections aren't all Q4_K/Q6_K, or the
+    ///     work is below the attention / FFN device gates;
+    ///   - any device launch / upload / sync returns `Err` (the documented
+    ///     contract for every native dispatch in this backend).
+    ///
+    /// The host KV mirror is still appended to (the source of truth for
+    /// position) and is NOT duplicated as a device copy of `h` -- `h` lives
+    /// only on the device for the duration of this call.
+    fn host_decode_token_device_resident(
+        &self,
+        layers: &[FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        abs_position: usize,
+    ) -> Option<Vec<f32>> {
+        let runtime = self.runtime()?;
+        if x.len() != hidden || layers.is_empty() {
+            return None;
+        }
+        // Feature gate: every layer must be a dense, RMSNorm, non-MoE,
+        // non-remote-FFN, non-PLE k-quant layer the device chain handles.
+        for layer in layers {
+            if layer.ple_input_gate.is_some()
+                || layer.ffn_is_remote
+                || layer.moe.is_some()
+                || layer.norm_type != NormType::RmsNorm
+            {
+                return None;
+            }
+            if !(matches!(layer.wq.format, QuantFormat::Q4_K | QuantFormat::Q6_K)
+                && matches!(layer.wk.format, QuantFormat::Q4_K | QuantFormat::Q6_K)
+                && matches!(layer.wv.format, QuantFormat::Q4_K | QuantFormat::Q6_K)
+                && matches!(layer.wo.format, QuantFormat::Q4_K | QuantFormat::Q6_K))
+            {
+                return None;
+            }
+            if !matches!(
+                (layer.gate.format, layer.up.format, layer.down.format),
+                (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K)
+                    | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
+            ) {
+                return None;
+            }
+            // FFN device-chain contract: down must contract exactly `inter`
+            // columns (no stored-width padding) and the work must clear the
+            // adaptive activation gate.
+            if down_stored_cols(layer, hidden, inter)? != inter {
+                return None;
+            }
+            if !self.ffn_activation_gate_worthwhile(inter) {
+                return None;
+            }
+        }
+
+        // Upload the input residual once. This is the single htod for the whole
+        // dense decode chain; subsequent layers read the resident post-residual
+        // `h_dev` produced by the previous layer's residual-add kernel.
+        let mut h_dev = runtime.upload_f32(x).ok()?;
+
+        for (li, layer) in layers.iter().enumerate() {
+            // Attention block (device-resident).
+            h_dev = self.device_resident_attention_layer(
+                runtime,
+                layer,
+                &h_dev,
+                li,
+                hidden,
+                abs_position,
+            )?;
+            // FFN block (device-resident).
+            h_dev = self.device_resident_ffn_layer(runtime, layer, &h_dev, hidden, inter)?;
+            // Per-layer scalar (Gemma 4). Skip 0.0 (absent) / 1.0 (identity).
+            // Implemented as residual_add_dev against a zeroed buffer:
+            // `0 + scalar * h = scalar * h` (no dedicated scale kernel needed).
+            let scalar = layer.layer_scalar;
+            if scalar != 0.0 && scalar != 1.0 {
+                let zeros = runtime.alloc_zeros_f32(hidden).ok()?;
+                h_dev = runtime.launch_residual_add_dev(&zeros, &h_dev, scalar, hidden).ok()?;
+            }
+        }
+
+        // Single final readback of the post-all-layers residual.
+        let h_out = runtime.sync_dtoh_f32(&h_dev).ok()?;
+        if h_out.len() != hidden {
+            return None;
+        }
+        Some(h_out)
+    }
+
+    /// Device-resident attention block for one decode layer. Reads the resident
+    /// `h_dev` (`[hidden]`), returns the post-attn-residual `h_dev` (`[hidden]`),
+    /// and appends the new K/V row to the host mirror (position source of
+    /// truth). Mirrors the arithmetic of `host_attention_block_device` +
+    /// `host_attention_block_hostonly`'s residual exactly, but keeps the
+    /// residual fused onto the device chain. Bails to `None` on any launch /
+    /// upload / sync error or below-gate work.
+    #[allow(clippy::too_many_arguments)]
+    fn device_resident_attention_layer(
+        &self,
+        runtime: &crate::backend::CudaRuntime,
+        layer: &FullPipelineLayer<'_>,
+        h_dev: &cudarc::driver::CudaSlice<f32>,
+        li: usize,
+        hidden: usize,
+        abs_position: usize,
+    ) -> Option<cudarc::driver::CudaSlice<f32>> {
+        let head_dim = layer.head_dim;
+        let num_q = layer.num_q_heads;
+        let num_kv = layer.num_kv_heads;
+        let reps = num_q.checked_div(num_kv)?;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        // `decode_token` carries no attention softcap (Gemma 4 attention
+        // softcap is 0; the host path applies none either).
+        let softcap_opt: Option<f32> = None;
+
+        let prev = self
+            .lock_host_kv()
+            .get(li)
+            .map(|(k, _)| k.shape()[0])
+            .unwrap_or(0);
+        let total_len = prev + 1;
+        let work = num_q.saturating_mul(total_len).saturating_mul(head_dim);
+        if !Self::native_decode_attention_worthwhile(work) {
+            return None;
+        }
+
+        // Input norm (device). The body input_norm is always present for a
+        // pre-norm transformer; the post-attention norm is separate (applied
+        // to O below).
+        let h_norm_dev = runtime
+            .launch_rms_norm_dev(
+                h_dev,
+                Some(layer.input_norm),
+                1,
+                hidden,
+                layer.eps as f64,
+                layer.norm_offset,
+            )
+            .ok()?;
+
+        // Q/K/V projections share the resident normed input.
+        let q_proj =
+            matvec_dev_by_fmt(runtime, layer.wq.format, layer.wq.data, &h_norm_dev, q_dim, hidden)
+                .ok()?;
+        let k_proj =
+            matvec_dev_by_fmt(runtime, layer.wk.format, layer.wk.data, &h_norm_dev, kv_dim, hidden)
+                .ok()?;
+        let v_proj =
+            matvec_dev_by_fmt(runtime, layer.wv.format, layer.wv.data, &h_norm_dev, kv_dim, hidden)
+                .ok()?;
+
+        // QK-norm (per-head RMSNorm; Gemma 3/4). seq_len = 1.
+        let qk_eps = larql_compute::residual::DEFAULT_EPS;
+        let qk_off = layer.qk_norm_offset;
+        let q_normed = match layer.q_norm_weight {
+            Some(w) => runtime
+                .launch_rms_norm_heads_dev(&q_proj, Some(w), 1, num_q, head_dim, qk_eps, qk_off)
+                .ok()?,
+            None => q_proj,
+        };
+        let k_normed = match layer.k_norm_weight {
+            Some(w) => runtime
+                .launch_rms_norm_heads_dev(&k_proj, Some(w), 1, num_kv, head_dim, qk_eps, qk_off)
+                .ok()?,
+            None => k_proj,
+        };
+        // V-norm (parameter-free, Gemma 4). Optional.
+        let v_normed = if layer.has_v_norm {
+            runtime
+                .launch_rms_norm_heads_dev(&v_proj, None, 1, num_kv, head_dim, qk_eps, 0.0)
+                .ok()?
+        } else {
+            v_proj
+        };
+
+        // RoPE on Q and K at `abs_position`.
+        let frac = rope_fraction(layer);
+        let pos_div = layer.rope_position_divisor as f64;
+        let llama3 = layer.rope_llama3_scaling;
+        let (_rotary_dim, half_rotary, inv_freq) =
+            build_rope_inv_freq(layer.rope_base as f64, head_dim, frac, llama3);
+        let inv_freq_dev = runtime.upload_f64(&inv_freq).ok()?;
+        let q_rope = runtime
+            .launch_rope_dev_with_invfreq(
+                &inv_freq_dev,
+                &q_normed,
+                1,
+                num_q,
+                head_dim,
+                half_rotary,
+                abs_position,
+                pos_div,
+            )
+            .ok()?;
+        let k_rope = runtime
+            .launch_rope_dev_with_invfreq(
+                &inv_freq_dev,
+                &k_normed,
+                1,
+                num_kv,
+                head_dim,
+                half_rotary,
+                abs_position,
+                pos_div,
+            )
+            .ok()?;
+
+        // Read back the new post-RoPE K / post-V-norm V row (one sync). Needed
+        // to build the full KV the decode-attention kernel attends over, and
+        // the row appended to the host mirror.
+        let k_new_row = runtime.sync_dtoh_f32(&k_rope).ok()?;
+        let v_new_row = runtime.sync_dtoh_f32(&v_normed).ok()?;
+        if k_new_row.len() != kv_dim || v_new_row.len() != kv_dim {
+            return None;
+        }
+
+        // Build the full KV [total_len, kv_dim] from the prior host mirror +
+        // the new row (the host reference concatenates the same way).
+        let (k_full, v_full): (Vec<f32>, Vec<f32>) = {
+            let kv = self.lock_host_kv();
+            match kv.get(li) {
+                Some((k_cache, v_cache)) if prev > 0 => {
+                    let kc = k_cache.as_slice().unwrap_or(&[]);
+                    let vc = v_cache.as_slice().unwrap_or(&[]);
+                    let need = prev * kv_dim;
+                    if kc.len() < need || vc.len() < need {
+                        return None;
+                    }
+                    let mut k_full = Vec::with_capacity(total_len * kv_dim);
+                    let mut v_full = Vec::with_capacity(total_len * kv_dim);
+                    k_full.extend_from_slice(&kc[..need]);
+                    v_full.extend_from_slice(&vc[..need]);
+                    k_full.extend_from_slice(&k_new_row);
+                    v_full.extend_from_slice(&v_new_row);
+                    (k_full, v_full)
+                }
+                _ => (k_new_row.clone(), v_new_row.clone()),
+            }
+        };
+        let k_dev = runtime.upload_f32(&k_full).ok()?;
+        let v_dev = runtime.upload_f32(&v_full).ok()?;
+
+        // Decode attention over the full KV.
+        let score_len = num_q.checked_mul(total_len)?;
+        let mut scores_dev = runtime.alloc_zeros_f32(score_len).ok()?;
+        let attn_dev = runtime
+            .launch_decode_attention_dev(
+                &q_rope,
+                &k_dev,
+                &v_dev,
+                &mut scores_dev,
+                layer.attn_scale as f32,
+                softcap_opt,
+                num_q,
+                head_dim,
+                kv_dim,
+                reps,
+                total_len,
+            )
+            .ok()?;
+
+        // O projection: resident attention output -> [hidden].
+        let o_dev = matvec_dev_by_fmt(
+            runtime,
+            layer.wo.format,
+            layer.wo.data,
+            &attn_dev,
+            hidden,
+            q_dim,
+        )
+        .ok()?;
+
+        // Post-attention residual (+ optional post-attn norm) on the device.
+        // When `has_post_norms`, normalise O with `post_attn_norm` before the
+        // scaled residual add; otherwise add O straight onto `h`.
+        let res_mult = layer.residual_multiplier;
+        let to_add = if layer.has_post_norms {
+            runtime
+                .launch_rms_norm_dev(
+                    &o_dev,
+                    Some(layer.post_attn_norm),
+                    1,
+                    hidden,
+                    layer.eps as f64,
+                    layer.norm_offset,
+                )
+                .ok()?
+        } else {
+            o_dev
+        };
+        // Append the new K/V row to the host mirror (position source of truth).
+        self.push_host_kv_row(layer, li, &k_new_row, &v_new_row)?;
+        // Fused residual add: out = h + res_mult * to_add, resident.
+        runtime
+            .launch_residual_add_dev(h_dev, &to_add, res_mult, hidden)
+            .ok()
+    }
+
+    /// Device-resident FFN block for one decode layer. Reads the resident
+    /// `h_dev` (`[hidden]`, the post-attn residual), returns the post-ffn
+    /// residual `h_dev` (`[hidden]`). Mirrors the arithmetic of
+    /// `host_ffn_block_device` + `apply_post_ffn_residual` exactly, but keeps
+    /// the residual fused onto the device chain. Bails to `None` on any launch
+    /// / upload / sync error.
+    fn device_resident_ffn_layer(
+        &self,
+        runtime: &crate::backend::CudaRuntime,
+        layer: &FullPipelineLayer<'_>,
+        h_dev: &cudarc::driver::CudaSlice<f32>,
+        hidden: usize,
+        inter: usize,
+    ) -> Option<cudarc::driver::CudaSlice<f32>> {
+        // Pre-FFN norm on the device. When `has_post_norms`, the pre-ffn norm
+        // weight is `pre_ffn_norm` (Some) or falls back to `post_attn_norm`
+        // (the host `host_ffn_block_device` mirrors this exactly); otherwise
+        // the no-weight `w = 1.0` RMSNorm path (the parameter-free pre-ffn
+        // norm when there are no post-norms).
+        let pre_norm_dev = if layer.has_post_norms {
+            let w = layer.pre_ffn_norm.unwrap_or(layer.post_attn_norm);
+            runtime
+                .launch_rms_norm_dev(
+                    h_dev,
+                    Some(w),
+                    1,
+                    hidden,
+                    layer.eps as f64,
+                    layer.norm_offset,
+                )
+                .ok()?
+        } else {
+            // No-weight RMSNorm (`w = 1.0`), offset/eps from the layer.
+            runtime
+                .launch_rms_norm_dev(
+                    h_dev,
+                    None,
+                    1,
+                    hidden,
+                    layer.eps as f64,
+                    layer.norm_offset,
+                )
+                .ok()?
+        };
+
+        // gate/up projections share the resident normed input.
+        let gate_dev =
+            matvec_dev_by_fmt(runtime, layer.gate.format, layer.gate.data, &pre_norm_dev, inter, hidden)
+                .ok()?;
+        let up_dev =
+            matvec_dev_by_fmt(runtime, layer.up.format, layer.up.data, &pre_norm_dev, inter, hidden)
+                .ok()?;
+
+        // Activation: activation(gate) * up (Gated) or activation(up) (Standard).
+        let act_dev = match layer.ffn_type {
+            larql_compute::FfnType::Gated => match layer.activation {
+                Activation::Silu => runtime.launch_geglu_silu_dev(&gate_dev, &up_dev, inter).ok()?,
+                Activation::GeluTanh => {
+                    runtime.launch_geglu_gelu_tanh_dev(&gate_dev, &up_dev, inter).ok()?
+                }
+                _ => return None,
+            },
+            larql_compute::FfnType::Standard => match layer.activation {
+                Activation::Silu => runtime.launch_activation_silu_dev(&up_dev, inter).ok()?,
+                Activation::GeluTanh => runtime.launch_activation_gelu_tanh_dev(&up_dev, inter).ok()?,
+                _ => return None,
+            },
+        };
+
+        let stored_cols = down_stored_cols(layer, hidden, inter)?;
+        // down projection -> [hidden].
+        let down_dev =
+            matvec_dev_by_fmt(runtime, layer.down.format, layer.down.data, &act_dev, hidden, stored_cols)
+                .ok()?;
+
+        // Post-FFN norm + residual on the device. Mirrors
+        // `apply_post_ffn_residual`: when `has_post_norms`, normalise `down`
+        // with `post_ffn_norm` (Some) or the no-weight path (None) before the
+        // scaled residual add; otherwise add `down` straight onto `h`.
+        let res_mult = layer.residual_multiplier;
+        let to_add = if layer.has_post_norms {
+            match layer.post_ffn_norm {
+                Some(w) => runtime
+                    .launch_rms_norm_dev(
+                        &down_dev,
+                        Some(w),
+                        1,
+                        hidden,
+                        layer.eps as f64,
+                        layer.norm_offset,
+                    )
+                    .ok()?,
+                None => runtime
+                    .launch_rms_norm_dev(
+                        &down_dev,
+                        None,
+                        1,
+                        hidden,
+                        layer.eps as f64,
+                        layer.norm_offset,
+                    )
+                    .ok()?,
+            }
+        } else {
+            down_dev
+        };
+        // Fused residual add: out = h + res_mult * to_add, resident.
+        runtime
+            .launch_residual_add_dev(h_dev, &to_add, res_mult, hidden)
+            .ok()
+    }
+
     /// Returns the `[hidden]` post-layer residual. `None` if any layer's
     /// format isn't Q4_K/Q6_K (the only formats with native matvec today) or
     /// a projection returns `None` (caller falls back to the CPU path).
@@ -155,6 +595,21 @@ fn push_host_kv_row(
 
         let want_h = !matches!(mask, StateDumpMask::None);
         let want_kv = matches!(mask, StateDumpMask::Full);
+
+        // GPU-2003 fast path: the device-resident full decode chain keeps `h`
+        // on the device across all layers (one htod + one dtoh per token
+        // instead of O(num_layers)). Tried first only when no per-layer state
+        // dump is requested (the fast path is a black box by design — it has
+        // no per-layer h/K/V readbacks to capture). On `None` (no runtime,
+        // an unsupported layer feature, below-gate work, or any launch error)
+        // the host-orchestrated loop below is the documented parity fallback.
+        if !want_h && !want_kv {
+            if let Some(h_out) =
+                self.host_decode_token_device_resident(layers, x, hidden, inter, abs_position)
+            {
+                return Some(h_out);
+            }
+        }
 
         let mut h = Array2::from_shape_vec((1, hidden), x.to_vec()).ok()?;
         for (li, layer) in layers.iter().enumerate() {

@@ -1098,6 +1098,29 @@ impl CudaRuntime {
         )
     }
 
+    /// Device-resident scaled residual add: `out[i] = h[i] + b_scale * x[i]`,
+    /// one thread per element, with `h` / `x` already on the device and `out`
+    /// returned as a device buffer (no sync, no readback). The device twin of
+    /// [`launch_residual_add`]; lets the device-residual slice (GPU-2003) fuse
+    /// the post-attn / post-ffn residual add onto the device chain so `h`
+    /// stays resident across layers instead of returning to host every layer.
+    pub(crate) fn launch_residual_add_dev(
+        &self,
+        h_dev: &CudaSlice<f32>,
+        x_dev: &CudaSlice<f32>,
+        b_scale: f32,
+        n: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.launch_elementwise_binary_dev(
+            &self.residual_add,
+            h_dev,
+            x_dev,
+            Some(b_scale),
+            n,
+            "residual_add",
+        )
+    }
+
     /// Native RoPE launch over a `[seq_len, num_heads * head_dim]` Q/K tensor.
     /// `inv_freq` is `half_rotary = rotary_dim/2` precomputed `f64`
     /// frequencies (the host builds them identically to the reference, so the
