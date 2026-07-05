@@ -1,8 +1,8 @@
-# larql-core cross-platform CI
+# larql-core Linux CI
 #
 # Runs fmt + feature matrix + clippy + tests + examples + bench test-mode on
-# Linux, Windows, and macOS. The crate is model-architecture agnostic and these
-# checks require no model weights or platform-specific backends.
+# the Linux self-hosted runner. The crate is model-architecture agnostic and
+# these checks require no model weights or platform-specific backends.
 
 name: larql-core
 
@@ -27,20 +27,9 @@ on:
 
 jobs:
   test:
-    name: test · ${{ matrix.name }}
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    name: test · self-hosted-linux-x64
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 25
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: self-hosted-linux-x64
-            runs_on: '["self-hosted", "Linux", "X64"]'
-          - name: windows-latest
-            runs_on: '"windows-latest"'
-          - name: macos-14
-            runs_on: '"macos-14"'
 
     steps:
       - uses: actions/checkout@v6

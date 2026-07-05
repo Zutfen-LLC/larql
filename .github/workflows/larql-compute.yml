@@ -1,8 +1,8 @@
-# larql-compute cross-platform CI
+# larql-compute Linux CI
 #
-# Validates the CPU baseline on Linux, Windows, and macOS.  After the
-# Metal extraction (ADR-019), this workflow is CPU-only — Metal GPU
-# validation lives in `.github/workflows/larql-compute-metal.yml`.
+# Validates the CPU baseline on the Linux self-hosted runner. After the
+# Metal extraction (ADR-019), this workflow is CPU-only; the macOS
+# Metal workflow is paused until that runner surface is needed again.
 
 name: larql-compute
 
@@ -29,20 +29,9 @@ on:
 
 jobs:
   test:
-    name: test · ${{ matrix.name }}
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    name: test · self-hosted-linux-x64
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 35
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: self-hosted-linux-x64
-            runs_on: '["self-hosted", "Linux", "X64"]'
-          - name: windows-latest
-            runs_on: '"windows-latest"'
-          - name: macos-14
-            runs_on: '"macos-14"'
 
     steps:
       - uses: actions/checkout@v6
@@ -53,22 +42,9 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install OpenBLAS (Linux)
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libopenblas-dev pkg-config
-
-      - name: Install OpenBLAS (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $root = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $root) {
-            $root = 'C:\vcpkg'
-          }
-          & "$root\vcpkg.exe" install openblas:x64-windows
-          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "$root\installed\x64-windows\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5

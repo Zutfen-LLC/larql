@@ -1,4 +1,4 @@
-# larql-inference cross-platform CI
+# larql-inference Linux CI
 #
 # Transformer inference engine — forward pass, attention, FFN, layer
 # norm. Tests that need real model weights are gated `#[ignore]`
@@ -41,20 +41,9 @@ on:
 
 jobs:
   test:
-    name: test - ${{ matrix.name }}
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    name: test - self-hosted-linux-x64
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 45
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: self-hosted-linux-x64
-            runs_on: '["self-hosted", "Linux", "X64"]'
-          - name: windows-latest
-            runs_on: '"windows-latest"'
-          - name: macos-14
-            runs_on: '"macos-14"'
 
     steps:
       - uses: actions/checkout@v6
@@ -65,26 +54,9 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install OpenBLAS (Linux)
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libopenblas-dev pkg-config
-
-      - name: Install OpenBLAS (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
-          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
-          & "$vcpkgRoot\vcpkg.exe" install openblas:x64-windows
-
-      # protoc on PATH satisfies the `cfg(not(windows))` skip in
-      # `larql-router-protocol`. See its build.rs for the rationale.
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: choco install protoc -y --no-progress
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5
@@ -105,30 +77,6 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -p larql-inference --lib --tests --benches --no-deps -- -D warnings
-
-      # On Windows OpenBLAS' matmul intermittently emits
-      # `BLAS : Bad memory unallocation!` and returns a
-      # partially-stale buffer, causing sync-vs-async (and
-      # sync-vs-legacy) parity tests to randomly diverge.
-      # `OPENBLAS_NUM_THREADS=1` + `OMP_NUM_THREADS=1` disable
-      # OpenBLAS' internal threading, and `RUST_TEST_THREADS=1`
-      # serialises the cargo test runner so multiple Rust threads
-      # can't race on OpenBLAS' global buffer pool. The combination
-      # eliminates the warning on Windows. Linux + macOS keep
-      # multi-threaded execution. The inference test set finishes
-      # in ~3 s, so single-threaded on Windows is negligible.
-      #
-      # These env vars MUST be unset (not empty) on non-Windows:
-      # `RUST_TEST_THREADS=''` panics the test runner. We use a
-      # gated GITHUB_ENV write rather than a step-level `env:` map,
-      # because the latter materialises empty strings on non-Windows.
-      - name: Force single-threaded BLAS + test runner (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "OPENBLAS_NUM_THREADS=1" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "OMP_NUM_THREADS=1" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "RUST_TEST_THREADS=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # `cargo test` runs lib tests + integration tests; #[ignore]
       # markers on weight-dependent goldens keep them out of the

@@ -1,10 +1,7 @@
-# larql-models cross-platform CI
+# larql-models Linux CI
 #
-# Runs fmt + check + clippy + tests + bench test-mode on Linux, Windows, and macOS
-# for every change to the larql-models crate. Validates cross-platform compatibility:
-#   - Linux  (x86_64-unknown-linux-gnu)
-#   - Windows (x86_64-pc-windows-msvc) — HF cache path, mmap, path separators
-#   - macOS  (aarch64-apple-darwin)    — NEON SIMD paths
+# Runs fmt + check + clippy + tests + bench test-mode on the Linux self-hosted
+# runner for every change to the larql-models crate.
 
 name: larql-models
 
@@ -27,20 +24,9 @@ on:
 
 jobs:
   test:
-    name: test · ${{ matrix.name }}
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    name: test · self-hosted-linux-x64
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: self-hosted-linux-x64
-            runs_on: '["self-hosted", "Linux", "X64"]'
-          - name: windows-latest
-            runs_on: '"windows-latest"'
-          - name: macos-14
-            runs_on: '"macos-14"'
 
     steps:
       - uses: actions/checkout@v6

@@ -1,10 +1,10 @@
-# larql-kv cross-platform CI
+# larql-kv Linux CI
 #
 # Pluggable KV-cache engines (markov-rs, unlimited-context, turbo-quant,
 # apollo). The crate is model-architecture agnostic: tests use synthetic
 # `larql_inference::test_utils` fixtures, no real model weights, no
-# platform-specific GPU backends. Same surface runs on Linux, Windows,
-# and macOS.
+# platform-specific GPU backends. Same surface runs on the Linux
+# self-hosted runner.
 
 name: larql-kv
 
@@ -48,20 +48,9 @@ env:
 
 jobs:
   test:
-    name: test - ${{ matrix.name }}
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    name: test - self-hosted-linux-x64
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 35
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: self-hosted-linux-x64
-            runs_on: '["self-hosted", "Linux", "X64"]'
-          - name: windows-latest
-            runs_on: '"windows-latest"'
-          - name: macos-14
-            runs_on: '"macos-14"'
 
     steps:
       - uses: actions/checkout@v6
@@ -72,32 +61,9 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install OpenBLAS (Linux)
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libopenblas-dev pkg-config
-
-      - name: Install OpenBLAS (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
-          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
-          & "$vcpkgRoot\vcpkg.exe" install openblas:x64-windows
-
-      # protoc on PATH satisfies the `cfg(not(windows))` skip in
-      # `larql-router-protocol`. See its build.rs for the rationale.
-      # protoc on PATH satisfies the `cfg(not(windows))` skip in
-      # `larql-router-protocol`'s build.rs. Use chocolatey rather than
-      # `arduino/setup-protoc@v3` — the action hits a GitHub API path
-      # that intermittently fails with `Bad credentials` even when
-      # `repo-token` is passed (Node-20 deprecation surface also).
-      # Chocolatey is preinstalled on the windows-latest runner.
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: choco install protoc -y --no-progress
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5

@@ -1,7 +1,7 @@
-# Bench regression detector — runs `make bench-check` on every PR
-# against a baseline saved on `main`. Fails the workflow if any cell
-# in the criterion bench suite regresses past Criterion's noise
-# threshold.
+# Bench regression detector — manual-only while macOS CI is paused.
+# Runs `make bench-check` against a baseline saved from `main` and
+# fails if any cell in the criterion bench suite regresses past
+# Criterion's noise threshold.
 #
 # Surface covered (`make bench-save` / `make bench-check`):
 #   - `quant_matvec`: Q4_0 / Q4_K / Q4_KF / Q6_K × 3 shapes × cpu/metal
@@ -16,12 +16,8 @@
 name: bench-regress
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   # Manual trigger so a maintainer can re-baseline after intentional
-  # perf changes without waiting for the next merge to main.
+  # perf changes without requiring a macOS runner in the normal CI path.
   workflow_dispatch: {}
 
 jobs:

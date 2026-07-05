@@ -1,33 +1,13 @@
-# larql-compute-metal CI (Apple Silicon).
+# larql-compute-metal CI (Apple Silicon, paused).
 #
 # Metal GPU backend for larql-compute.  Extracted from `larql-compute`
-# per ADR-019 so non-Mac CI hosts (Linux, Windows) don't have to build
-# or check Metal-specific code.  All jobs run on macos-14 (the latest
-# Apple-silicon GitHub-hosted runner with Metal available).
+# per ADR-019 so non-Mac CI hosts don't have to build or check
+# Metal-specific code. This workflow is manual-only until macOS
+# runners are available again.
 
 name: larql-compute-metal
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/larql-compute-metal/**'
-      - 'crates/larql-compute/**'
-      - 'crates/larql-models/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Makefile'
-      - '.github/workflows/larql-compute-metal.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/larql-compute-metal/**'
-      - 'crates/larql-compute/**'
-      - 'crates/larql-models/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Makefile'
-      - '.github/workflows/larql-compute-metal.yml'
   workflow_dispatch: {}
 
 jobs:
