@@ -14,6 +14,10 @@ larql-compute = { path = "../larql-compute" }
 larql-models = { path = "../larql-models" }
 ndarray = "0.16"
 half = "2"
+# GPU-1005: on-disk PTX cache — dirs for the cache directory, sha2 for the
+# stable (kernel-source, cc) cache key.
+dirs = "5"
+sha2 = "0.10"
 
 [dev-dependencies]
 larql-compute = { path = "../larql-compute", features = ["test-utils"] }
