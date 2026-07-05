@@ -37,6 +37,19 @@ larql-compute-metal  Metal GPU backend (first-class peer, NOT a thin layer).
                      Implements ComputeBackend / KvDispatch / AsyncComputeBackend
                      for MetalBackend; ships custom MSL shaders, multi-layer
                      pipelining, stage-bisected kernels.
+larql-compute-cuda   NVIDIA CUDA backend. Native k-quant + GEMV kernels
+                     (Q4_K/Q6_K matvec/matmul/dual-matvec, f32/f16 GEMV,
+                     Q4 matvec/vecmat) compiled via NVRTC, plus a
+                     host-orchestrated decode/prefill pipeline. Advertises
+                     QuantMatVec | DecodeToken | PrefillQ4 via supports()
+                     when a native runtime is present; CPU-delegates
+                     matmul/matmul_transb, small GEMV (<500M flops), and the
+                     entire KvDispatch trait surface. See docs/gpu.md.
+larql-compute-vulkan Vulkan backend — pure CPU-delegate scaffold today.
+                     Implements the trait surface so backend-selection wiring
+                     compiles, but supports() returns false for everything and
+                     every method routes through CpuBackend. No device kernels,
+                     no Vulkan SDK dependency. See docs/gpu.md.
     ↓
 larql-vindex      vindex lifecycle: extract, load, query, mutate, patch, save,
                   Vindexfile. Implements `KvIndex for VectorIndex` (Step 3a).
@@ -67,8 +80,10 @@ model-compute         bounded native kernels (arithmetic/datetime) and optional
 ```
 
 **Metal is a first-class peer** (ADR-0022, 2026-05-18). `larql-compute-metal`
-is the same shape as a future `larql-compute-vulkan` / `larql-compute-cuda` —
-its own crate, implements the same trait surface, owns its kernels. Inference
+is the same shape as `larql-compute-cuda` / `larql-compute-vulkan` —
+its own crate, implements the same trait surface, owns its kernels. CUDA is
+the second live backend (native k-quant + GEMV + host-orchestrated
+decode/prefill; Vulkan is a CPU-delegate scaffold). Inference
 factories (`default_engine_backend()`, `default_async_engine_backend()`,
 `default_compute_backend()` in `larql-inference/src/lib.rs`) compose Metal +
 CPU fallback explicitly; engine-level orchestration in `layer_graph/` still
@@ -92,7 +107,7 @@ LQL parser and executor are split symmetrically: [crates/larql-lql/src/parser/](
 
 ```bash
 cargo build --release                             # optimised build
-cargo build --release --features gpu              # GPU backend (Metal today; Vulkan/CUDA later)
+cargo build --release --features gpu              # GPU backend (Metal on macOS; use --features cuda for CUDA, --features vulkan for the Vulkan scaffold; --features gpu-all for all three). See docs/gpu.md.
 cargo test                                        # entire workspace
 cargo test -p larql-lql                           # single crate (272 tests)
 cargo test -p larql-inference --features gpu      # +GPU tests (Metal on Apple Silicon)
