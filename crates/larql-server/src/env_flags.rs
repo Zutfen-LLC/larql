@@ -41,6 +41,11 @@ pub const MOE_BATCH_MODE: &str = "LARQL_MOE_BATCH_MODE";
 pub const F16_WIRE_DISABLE: &str = "LARQL_F16_WIRE_DISABLE";
 /// Opt-in to i8 symmetric quantised residuals on the wire.
 pub const I8_WIRE: &str = "LARQL_I8_WIRE";
+/// Opt-in: per-expert output cache on the expert dispatch path (GPU-3004).
+/// When set, repeated identical (layer, expert, residual) dispatches hit the
+/// `ExpertOutputCache` instead of recomputing the Q4_K/Q8_K matvec chain.
+/// Default-off — the residual hash + lookup only run when enabled.
+pub const EXPERT_OUTPUT_CACHE: &str = "LARQL_EXPERT_OUTPUT_CACHE";
 
 // ── Cached presence ────────────────────────────────────────────────────────────
 //
@@ -110,6 +115,12 @@ pub fn disable_q4k_direct() -> bool {
 pub fn metal_vs_cpu_debug() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     cached_is_set(&CACHE, METAL_VS_CPU_DEBUG)
+}
+
+/// `LARQL_EXPERT_OUTPUT_CACHE=1` — opt in to the per-expert output cache (GPU-3004).
+pub fn expert_output_cache_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    cached_is_set(&CACHE, EXPERT_OUTPUT_CACHE)
 }
 
 /// `LARQL_MOE_BATCH_MODE=<mode>` — override the auto-selected batch mode.
@@ -184,6 +195,7 @@ mod tests {
             MOE_BATCH_MODE,
             F16_WIRE_DISABLE,
             I8_WIRE,
+            EXPERT_OUTPUT_CACHE,
         ];
         for n in names {
             assert!(n.starts_with("LARQL_"), "{n} must be LARQL_-prefixed");

@@ -81,6 +81,11 @@ pub struct LoadedModel {
     pub probe_labels: HashMap<(usize, usize), String>,
     /// L2 FFN output cache — shared across all clients, persists for server lifetime.
     pub ffn_l2_cache: FfnL2Cache,
+    /// Per-expert output cache (GPU-3004) — keyed by (layer, expert_id,
+    /// hash(residual)). Opt-in via LARQL_EXPERT_OUTPUT_CACHE=1. Mirrors
+    /// FfnL2Cache's shape but caches individual expert outputs (length =
+    /// hidden) rather than the dense WalkFFN output.
+    pub expert_output_cache: crate::routes::expert::ExpertOutputCache,
     /// Per-layer latency tracker — records compute time per walk-ffn layer.
     /// Snapshots are sent to the router in HeartbeatMsg.layer_stats (GT3).
     pub layer_latency_tracker: std::sync::Arc<crate::metrics::LayerLatencyTracker>,
@@ -468,6 +473,7 @@ mod loaded_model_tests {
             weights_init: std::sync::Mutex::new(()),
             probe_labels: HashMap::new(),
             ffn_l2_cache: crate::ffn_l2_cache::FfnL2Cache::new(1),
+            expert_output_cache: crate::routes::expert::ExpertOutputCache::new(1),
             layer_latency_tracker: std::sync::Arc::new(crate::metrics::LayerLatencyTracker::new()),
             requests_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             requests_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
