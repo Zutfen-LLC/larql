@@ -1,6 +1,7 @@
 use half::f16;
 use larql_compute::backend::{Capability, ComputeBackend, DecodeBackend, MatMul, QuantMatVec};
 use larql_compute::CpuBackend;
+use larql_compute::QuantFormat;
 use ndarray::{Array2, ArrayView2};
 
 use crate::VulkanBackend;
@@ -110,6 +111,17 @@ impl QuantMatVec for VulkanBackend {
         num_rows: usize,
         hidden: usize,
     ) -> Option<Vec<f32>> {
+        // Native Vulkan path: only when a device is present and the shape is
+        // a valid Q4_K block multiple (256). On any failure (launch error,
+        // no device, non-multiple hidden) fall through to the CPU reference
+        // — correctness always wins (GPU-4001 §5 rule 4).
+        if let Some(rt) = self.runtime() {
+            if hidden > 0 && hidden.is_multiple_of(256) {
+                if let Ok(out) = rt.launch_q4k_matvec(q4k_data, x, num_rows, hidden) {
+                    return Some(out);
+                }
+            }
+        }
         CPU.q4k_matvec(q4k_data, x, num_rows, hidden)
     }
 
@@ -132,6 +144,11 @@ impl QuantMatVec for VulkanBackend {
         hidden: usize,
         seq_len: usize,
     ) -> Option<Vec<f32>> {
+        // seq == 1 collapses to the matvec path; the dedicated matmul shader
+        // lands in a follow-up task.
+        if seq_len == 1 {
+            return self.q4k_matvec(q4k_data, x, num_rows, hidden);
+        }
         CPU.q4k_matmul(q4k_data, x, num_rows, hidden, seq_len)
     }
 
@@ -156,9 +173,10 @@ impl QuantMatVec for VulkanBackend {
         CPU.q6k_matmul(q6k_data, x, num_rows, hidden, seq_len)
     }
 
-    fn supports_quant(&self, format: larql_compute::QuantFormat) -> bool {
-        let _ = format;
-        false
+    fn supports_quant(&self, format: QuantFormat) -> bool {
+        // Honest: only Q4_K is native, and only when a device is present
+        // (GPU-4001 §5 rule 1-2). Every other format stays CPU.
+        self.native_runtime_available() && matches!(format, QuantFormat::Q4_K)
     }
 }
 
@@ -166,16 +184,20 @@ impl DecodeBackend for VulkanBackend {}
 
 impl ComputeBackend for VulkanBackend {
     fn name(&self) -> &str {
-        "vulkan (cpu-delegate scaffold)"
+        if self.native_runtime_available() {
+            "vulkan (native q4_k matvec; remaining ops CPU fallback)"
+        } else {
+            "vulkan (cpu-delegate scaffold)"
+        }
     }
 
     fn device_info(&self) -> String {
-        "Vulkan scaffold backend (CPU delegate)".to_string()
+        self.runtime_summary().to_string()
     }
 
     fn supports(&self, cap: Capability) -> bool {
-        let _ = cap;
-        false
+        // Only QuantMatVec is advertised, native-gated (GPU-4001 §5 rule 1,3).
+        self.native_runtime_available() && matches!(cap, Capability::QuantMatVec)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
