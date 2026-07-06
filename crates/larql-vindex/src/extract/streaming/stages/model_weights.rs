@@ -18,32 +18,39 @@ impl<'a> StreamingContext<'a> {
         if !needs_weights {
             return Ok(());
         }
-        // `StreamingWeights` is a safetensors-only writer subsystem
-        // (Q4_K + f32 weight writers walk safetensors crate views
-        // directly). GGUF input is supported at browse level (where
-        // `needs_weights == false`) and below only; inference / Q4K
-        // levels for GGUF need a separate writer pass that streams
-        // per-tensor through `larql_models::quant::ggml::dequantize` —
-        // tracked as a follow-on PR.
-        let (shard_mmaps, tensor_index) = match (
-            self.tensor_source.safetensors_mmap_refs(),
-            self.tensor_source.safetensors_index(),
-        ) {
-            (Some(m), Some(i)) => (m, i),
-            _ => {
-                return Err(VindexError::Parse(
-                    "GGUF input + extract-level requiring attention/FFN weights is not yet \
-                     implemented (browse-level GGUF works; inference/Q4K GGUF requires \
-                     per-tensor streaming through ggml::dequantize)"
-                        .to_string(),
-                ));
-            }
+        // Dispatch the WeightSource by tensor backend:
+        //  - safetensors -> `StreamingWeights` (mmap views, f32 on demand)
+        //  - GGUF        -> `GgufStreamingWeights` (mmap, f32 dequant on
+        //                   demand + raw packed-byte fast path for Q4_K /
+        //                   Q6_K tensors via `get_packed_quant`).
+        //
+        // The GGUF path is the quant-preserving import: Q4_K GGUF tensors
+        // are byte-copied into the vindex without f32 reification.
+        // Resolve the tensor backend first so the safetensors mmaps/index
+        // borrows live long enough for StreamingWeights to hold &[&[u8]].
+        let st_mmaps = self.tensor_source.safetensors_mmap_refs();
+        let st_index = self.tensor_source.safetensors_index();
+
+        enum SourceRef<'b> {
+            Safetensors(crate::format::weights::StreamingWeights<'b>),
+            Gguf(crate::format::weights::write_f32::GgufStreamingWeights<'b>),
+        }
+        let source_ref: SourceRef<'_> = match (st_mmaps.as_deref(), st_index) {
+            (Some(m), Some(i)) => SourceRef::Safetensors(crate::format::weights::StreamingWeights {
+                shard_mmaps: m,
+                tensor_index: i,
+                arch: &*self.arch,
+                num_layers: self.num_layers,
+            }),
+            _ => SourceRef::Gguf(crate::format::weights::write_f32::GgufStreamingWeights {
+                tensor_source: &self.tensor_source,
+                arch: &*self.arch,
+                num_layers: self.num_layers,
+            }),
         };
-        let streaming_source = crate::format::weights::StreamingWeights {
-            shard_mmaps: &shard_mmaps,
-            tensor_index,
-            arch: &*self.arch,
-            num_layers: self.num_layers,
+        let streaming_source: &dyn crate::format::weights::write_f32::WeightSource = match &source_ref {
+            SourceRef::Safetensors(s) => s,
+            SourceRef::Gguf(g) => g,
         };
         // Thread the extract level into the write options so the
         // writer can skip attn/FFN/lm_head sections per tier.
@@ -52,7 +59,7 @@ impl<'a> StreamingContext<'a> {
         match self.quant {
             QuantFormat::None => {
                 crate::format::weights::write_model_weights_with_opts(
-                    &streaming_source,
+                    streaming_source,
                     self.output_dir,
                     self.callbacks,
                     level_opts,
@@ -65,7 +72,7 @@ impl<'a> StreamingContext<'a> {
                 // gating for Q4K is a future refinement (today Q4K
                 // always writes the full set).
                 crate::format::weights::write_model_weights_kquant_with_opts(
-                    &streaming_source,
+                    streaming_source,
                     self.output_dir,
                     self.callbacks,
                     self.q4k_opts,

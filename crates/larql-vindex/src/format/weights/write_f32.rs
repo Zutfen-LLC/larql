@@ -62,13 +62,53 @@ pub struct WeightEntry {
 
 // ── WeightSource trait ──
 
+/// A raw block-quantised tensor (GGUF Q4_K / Q6_K / ...) in its packed wire
+/// form, bypassing dequantisation to f32.
+///
+/// Returned by [`WeightSource::get_packed_quant`] when the source can
+/// supply a tensor's bytes directly in a K-quant format the Q4K writer
+/// can emit verbatim. This is the quant-preserving import path: a Q4_K
+/// GGUF tensor whose columns are a multiple of 256 and which is already
+/// in canonical HF orientation is byte-copied into the vindex without
+/// ever being reified as f32 -- keeping peak memory bounded on large
+/// MoE models.
+///
+/// `cols_padded` records whether each row is already padded to a
+/// multiple of 256 (the vindex layout). When `cols == cols_padded` the
+/// bytes are row-major `[rows, cols]` of contiguous super-blocks and
+/// need no further padding; when they differ the bytes are flat and the
+/// caller must dequant -> pad -> requantise (the non-fast path).
+#[derive(Debug, Clone)]
+pub struct PackedQuant {
+    /// Raw block-quantised bytes (ggml-canonical: 144 B/super-block for Q4_K).
+    pub bytes: Vec<u8>,
+    /// Logical rows (HF Linear convention).
+    pub rows: usize,
+    /// Logical cols (HF Linear convention). May differ from the GGUF
+    /// dims when orientation was canonicalised.
+    pub cols: usize,
+    /// Cols after per-row 256-padding. Equals `cols` when already padded.
+    pub cols_padded: usize,
+    /// Block format tag matching the on-disk `QuantBlockFormat`.
+    pub format: super::write_kquant::QuantBlockFormat,
+}
+
 /// Abstraction over where model weights come from.
 ///
-/// Implemented by `ModelWeights` (build path — everything in RAM)
-/// and `StreamingWeights` (streaming path — mmap'd safetensors on demand).
+/// Implemented by `ModelWeights` (build path -- everything in RAM)
+/// and `StreamingWeights` (streaming path -- mmap'd safetensors on demand).
 pub trait WeightSource {
     /// Get a 2D weight tensor by normalized key. Returns (data, rows, cols).
     fn get_tensor(&self, key: &str) -> Option<(Vec<f32>, usize, usize)>;
+
+    /// Get a 2D weight tensor as raw block-quantised bytes, bypassing
+    /// dequantisation. Returns `None` when the source does not store
+    /// the tensor in a directly-emittable K-quant format (f32 / f16 /
+    /// safetensors sources, or GGUF tensors needing orientation or
+    /// padding fixes). Callers must fall back to `get_tensor` then.
+    fn get_packed_quant(&self, _key: &str) -> Option<PackedQuant> {
+        None
+    }
 
     /// Get a 1D vector (norm weights, biases) by normalized key.
     fn get_vector(&self, key: &str) -> Option<Vec<f32>>;
@@ -211,6 +251,94 @@ impl<'a> WeightSource for StreamingWeights<'a> {
             return None;
         }
         Some(view.data().to_vec())
+    }
+}
+
+// ── GGUF-backed WeightSource (streaming, mmap, no full dequant) ──
+
+/// Weight source backed by a mmap'd GGUF file set. Like
+/// [`StreamingWeights`] but for GGUF input: `get_tensor` dequantises to
+/// f32 on demand (one tensor at a time), and `get_packed_quant`
+/// supplies raw Q4_K / Q6_K bytes when the tensor qualifies for the
+/// quant-preserving import path (see
+/// [`crate::extract::streaming::tensor_io::TensorSource::get_packed_quant`]).
+///
+/// This is what unblocks `--quant q4k` on GGUF input: the Q4K writer
+/// asks the source for packed bytes first and only falls back to f32
+/// when the source cannot supply them, so a Q4_K GGUF model extracts to
+/// a Q4_K vindex without f32 reification of the weights.
+pub struct GgufStreamingWeights<'a> {
+    pub(crate) tensor_source: &'a crate::extract::streaming::tensor_io::TensorSource,
+    pub(crate) arch: &'a dyn larql_models::ModelArchitecture,
+    pub(crate) num_layers: usize,
+}
+
+impl<'a> WeightSource for GgufStreamingWeights<'a> {
+    fn get_tensor(&self, key: &str) -> Option<(Vec<f32>, usize, usize)> {
+        // Delegate to the GGUF tensor source's f32 dequantiser.
+        // `TensorSource::get_tensor_f32` is the same path the browse-level
+        // streaming pipeline uses, so attn/FFN orientation is handled.
+        match self.tensor_source.get_tensor_f32(key) {
+            Ok(Some(arr)) => {
+                let s = arr.shape();
+                if s.len() != 2 {
+                    return None;
+                }
+                let (r, c) = (s[0], s[1]);
+                Some((arr.as_slice().unwrap_or(&[]).to_vec(), r, c))
+            }
+            Ok(None) => None,
+            Err(_) => None,
+        }
+    }
+
+    fn get_vector(&self, key: &str) -> Option<Vec<f32>> {
+        // 1D GGUF tensor (norms, biases, scalars). Dequantise directly
+        // -- these are tiny (hidden_size floats) so the f32 cost is
+        // negligible and irrelevant to the quant-preserving goal.
+        match self.tensor_source.get_vector_f32(key) {
+            Ok(Some(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn arch(&self) -> &dyn larql_models::ModelArchitecture {
+        self.arch
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    fn lm_head(&self) -> Option<(Vec<f32>, usize, usize)> {
+        for key in &["lm_head.weight", "output.weight"] {
+            if let Some(t) = self.get_tensor(key) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn vector_names(&self) -> Vec<String> {
+        // The GGUF tensor source exposes its hf_key index; filter to
+        // norm/bias keys the same way StreamingWeights does. We don't
+        // have direct access to the index here, but the kquant norms
+        // writer only calls get_vector on keys it derives from the
+        // architecture -- it doesn't iterate vector_names() for the
+        // GGUF path (the safetensors path does, for non-Q4K writes).
+        // Return empty; the per-key get_vector lookups still work.
+        Vec::new()
+    }
+
+    fn get_packed_bf16(&self, _key: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn get_packed_quant(&self, key: &str) -> Option<PackedQuant> {
+        match self.tensor_source.get_packed_quant(key) {
+            Ok(Some(pq)) => Some(pq),
+            _ => None,
+        }
     }
 }
 

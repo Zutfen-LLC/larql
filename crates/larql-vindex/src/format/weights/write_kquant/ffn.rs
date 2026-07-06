@@ -61,6 +61,65 @@ pub(super) fn write_interleaved_ffn_kquant(
         .iter()
         .enumerate()
         {
+            // Desired per-slot format: gate (i=0) + up (i=1) always Q4_K;
+            // down (i=2) controlled by `opts.down_proj`.
+            let is_down = i == 2;
+            let use_q6 = is_down && opts.down_proj == super::DownProjFormat::Q6K;
+            let want_format = if use_q6 {
+                QuantBlockFormat::Q6K
+            } else {
+                QuantBlockFormat::Q4K
+            };
+
+            // Quant-preserving fast path: if the source can hand us raw
+            // bytes already in `want_format` and already 256-padded (cols
+            // == cols_padded), emit them verbatim -- no f32 reification,
+            // no requantisation. This is the GGUF Q4_K -> vindex Q4_K
+            // passthrough that keeps MoE imports memory-bounded.
+            //
+            // If the source offers packed bytes but in the *wrong* format
+            // (e.g. Q4_K when we want Q6_K for down, or Q6_K when we
+            // want Q4_K), we cannot reuse them and fall through to the
+            // f32 path -- mixing formats would corrupt the decode.
+            if let Some(pq) = source.get_packed_quant(key) {
+                if pq.format == want_format && pq.cols == pq.cols_padded {
+                    let length = pq.bytes.len() as u64;
+                    ff_file.write_all(&pq.bytes)?;
+                    ff_manifest.push(Q4kManifestEntry {
+                        key: key.clone(),
+                        shape: vec![pq.rows, pq.cols_padded],
+                        format: want_format.clone(),
+                        offset: ff_offset,
+                        length,
+                    });
+                    ff_offset += length;
+
+                    if is_down {
+                        if let Some(state) = fm_state.as_mut() {
+                            // Feature-major down still needs the f32 data
+                            // (it re-quantises a transposed view). The
+                            // packed bytes can't be transposed in-place,
+                            // so dequantise just for the sidecar when
+                            // opted in. This is a bounded cost: one
+                            // layer's down tensor at a time.
+                            if let Some((data, rows, cols)) = source.get_tensor(key) {
+                                let (padded, padded_cols) =
+                                    pad_rows_to_block(&data, rows, cols);
+                                state.append_layer(
+                                    key.clone(),
+                                    &padded,
+                                    rows,
+                                    padded_cols,
+                                    want_format,
+                                )?;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Standard path: dequantise to f32, pad rows to 256, requantise.
             if let Some((data, rows, cols)) = source.get_tensor(key) {
                 // Row-pad to 256 so each row aligns to a super-block boundary.
                 // Without this, matrices with `cols % 256 != 0` (e.g. Gemma 4
@@ -68,21 +127,12 @@ pub(super) fn write_interleaved_ffn_kquant(
                 // quantisation that every row past row 0 reads wrong. See
                 // `pad_rows_to_block` docs.
                 let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
-                // Gate (i=0) and up (i=1) always Q4_K. Down (i=2) format
-                // is controlled by `opts.down_proj` (Q6_K by default for
-                // llama.cpp compatibility, Q4_K when the caller opts in).
-                let is_down = i == 2;
-                let use_q6 = is_down && opts.down_proj == super::DownProjFormat::Q6K;
                 let q_bytes = if use_q6 {
                     quantize_q6_k(&padded)
                 } else {
                     quantize_q4_k(&padded)
                 };
-                let format = if use_q6 {
-                    QuantBlockFormat::Q6K
-                } else {
-                    QuantBlockFormat::Q4K
-                };
+                let format = want_format;
                 ff_file.write_all(&q_bytes)?;
                 let length = q_bytes.len() as u64;
                 ff_manifest.push(Q4kManifestEntry {

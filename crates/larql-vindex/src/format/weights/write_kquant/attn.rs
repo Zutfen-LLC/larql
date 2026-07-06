@@ -58,13 +58,39 @@ pub(super) fn write_attn_weights_kquant(
         ];
 
         for (i, (key, tensor)) in slots.iter().enumerate() {
+            // V (index 2) gets Q6_K, others get Q4_K.
+            let is_v = i == 2;
+            let want_format = if is_v {
+                QuantBlockFormat::Q6K
+            } else {
+                QuantBlockFormat::Q4K
+            };
+
+            // Quant-preserving fast path: GGUF Q4_K/Q6_K attention tensors
+            // whose cols are a multiple of 256 emit verbatim. Attention
+            // projections are usually hidden×hidden, so this hits for most
+            // GGUF models and avoids f32 reification.
+            if let Some(pq) = source.get_packed_quant(key) {
+                if pq.format == want_format && pq.cols == pq.cols_padded {
+                    let length = pq.bytes.len() as u64;
+                    attn_file.write_all(&pq.bytes)?;
+                    attn_manifest.push(Q4kManifestEntry {
+                        key: key.to_string(),
+                        shape: vec![pq.rows, pq.cols_padded],
+                        format: want_format,
+                        offset: attn_offset,
+                        length,
+                    });
+                    attn_offset += length;
+                    continue;
+                }
+            }
+
             let (data, rows, cols) = match tensor {
                 Some(t) => t.clone(),
                 None => continue, // tensor genuinely absent — skip
             };
 
-            // V (index 2) gets Q6_K, others get Q4_K.
-            let is_v = i == 2;
             // Row-pad to 256 so each row aligns to a super-block boundary.
             // Critical for models with non-256 inner dims (e.g. Gemma 4 26B A4B
             // where the dense intermediate is 2112). `padded_cols` is what the
@@ -76,18 +102,13 @@ pub(super) fn write_attn_weights_kquant(
             } else {
                 quantize_q4_k(&padded)
             };
-            let format = if is_v {
-                QuantBlockFormat::Q6K
-            } else {
-                QuantBlockFormat::Q4K
-            };
 
             attn_file.write_all(&q_bytes)?;
             let length = q_bytes.len() as u64;
             attn_manifest.push(Q4kManifestEntry {
                 key: key.to_string(),
                 shape: vec![rows, padded_cols],
-                format,
+                format: want_format,
                 offset: attn_offset,
                 length,
             });
