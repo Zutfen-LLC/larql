@@ -169,6 +169,9 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let qk_nope_head_dim = text_config["qk_nope_head_dim"].as_u64().map(|v| v as usize);
     let qk_rope_head_dim = text_config["qk_rope_head_dim"].as_u64().map(|v| v as usize);
     let v_head_dim = text_config["v_head_dim"].as_u64().map(|v| v as usize);
+    // DS-V3 grouped routing fields (HF config.json uses "n_group" / "topk_group")
+    let n_group = field_u64(text_config, &["n_group"]).map(|v| v as usize);
+    let topk_group = field_u64(text_config, &["topk_group"]).map(|v| v as usize);
 
     // RoPE scaling. Four shapes appear in the wild:
     //
@@ -304,6 +307,8 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         qk_nope_head_dim,
         qk_rope_head_dim,
         v_head_dim,
+        n_group,
+        topk_group,
         rope_scaling,
         attn_logit_softcapping,
         final_logit_softcapping,

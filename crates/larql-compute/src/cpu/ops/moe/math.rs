@@ -141,6 +141,80 @@ pub(super) fn top_k(v: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
     (indices, values)
 }
 
+/// DS-V3 aux-loss-free grouped top-K routing.
+///
+/// Experts are split into `n_group` contiguous groups of
+/// `num_experts / n_group` each. Within each group, the top `topk_group`
+/// experts are selected by score. Then, across all surviving experts, the
+/// global top-K is selected. This is the two-level softmax from the DS-V3
+/// paper (HuggingFace `topk_group` / `n_group` config fields).
+///
+/// `scores` must already be softmax probabilities over all experts.
+/// Returns `(indices, values)` — the global top-K expert indices and their
+/// surviving scores, descending.
+///
+/// The intra-group and inter-group selection both use the standard
+/// descending sort. When `n_group` does not evenly divide `num_experts`,
+/// the last group is smaller (matching HF/llama.cpp behaviour).
+pub(super) fn grouped_top_k(
+    scores: &[f32],
+    num_experts: usize,
+    top_k_val: usize,
+    n_group: usize,
+    topk_group: usize,
+) -> (Vec<usize>, Vec<f32>) {
+    debug_assert_eq!(scores.len(), num_experts);
+    let group_size = num_agents_div_ceil(num_experts, n_group);
+
+    // Mask: only experts that survive their in-group top-k are eligible.
+    let mut eligible = vec![false; num_experts];
+    for g in 0..n_group {
+        let start = g * group_size;
+        let end = (start + group_size).min(num_experts);
+        if start >= end {
+            break;
+        }
+        // Collect (index, score) for this group, pick top topk_group.
+        let mut group: Vec<(usize, f32)> = (start..end)
+            .map(|i| (i, scores[i]))
+            .collect();
+        let keep = topk_group.min(group.len());
+        if keep == 0 || keep >= group.len() {
+            // Keep all in this group (topk_group == 0 is treated as "no
+            // in-group filter" defensively, though the caller gates on > 0).
+            for (i, _) in &group {
+                eligible[*i] = true;
+            }
+        } else {
+            group.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (i, _) in group.iter().take(keep) {
+                eligible[*i] = true;
+            }
+        }
+    }
+
+    // Global top-K among eligible experts.
+    let mut candidates: Vec<(usize, f32)> = (0..num_experts)
+        .filter(|&i| eligible[i])
+        .map(|i| (i, scores[i]))
+        .collect();
+    candidates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let k = top_k_val.min(candidates.len());
+    candidates.truncate(k);
+    let indices: Vec<usize> = candidates.iter().map(|(i, _)| *i).collect();
+    let values: Vec<f32> = candidates.iter().map(|(_, v)| *v).collect();
+    (indices, values)
+}
+
+#[inline]
+fn num_agents_div_ceil(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        a.div_ceil(b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +288,71 @@ mod tests {
         // k > len — get all in descending order.
         let (idx, _) = top_k(&[0.1, 0.5, 0.3], 99);
         assert_eq!(idx, vec![1, 2, 0]);
+    }
+
+    // ── grouped_top_k (DS-V3 aux-loss-free routing) ──
+
+    /// DS-V3 reference: 8 experts, 2 groups of 4, topk_group=2, global top_k=4.
+    /// Each group keeps its top-2 by score; then global top-4 among survivors.
+    #[test]
+    fn grouped_top_k_matches_reference() {
+        // Scores (already softmax-ish): [0.1, 0.4, 0.05, 0.3,  |  0.2, 0.45, 0.15, 0.35]
+        // Group 0 = experts 0-3: scores 0.1, 0.4, 0.05, 0.3 → top-2 = {0.4 (e1), 0.3 (e3)}
+        // Group 1 = experts 4-7: scores 0.2, 0.45, 0.15, 0.35 → top-2 = {0.45 (e5), 0.35 (e7)}
+        // Survivors: e1=0.4, e3=0.3, e5=0.45, e7=0.35
+        // Global top-4 (all survivors): e5=0.45, e1=0.4, e7=0.35, e3=0.3
+        let scores = vec![0.1, 0.4, 0.05, 0.3, 0.2, 0.45, 0.15, 0.35];
+        let (idx, val) = grouped_top_k(&scores, 8, 4, 2, 2);
+        assert_eq!(idx, vec![5, 1, 7, 3]);
+        assert_eq!(val, vec![0.45, 0.4, 0.35, 0.3]);
+    }
+
+    /// When topk_group >= group_size, every expert survives the in-group
+    /// filter, so grouped_top_k degenerates to standard global top_k.
+    #[test]
+    fn grouped_top_k_degenerates_to_global_when_topk_group_geq_group_size() {
+        let scores = vec![0.1, 0.5, 0.3, 0.9, 0.2, 0.4];
+        // 2 groups of 3, topk_group=3 → keep all in each group
+        // Global top-3: 0.9 (e3), 0.5 (e1), 0.4 (e5)
+        let (idx, val) = grouped_top_k(&scores, 6, 3, 2, 3);
+        assert_eq!(idx, vec![3, 1, 5]);
+        assert_eq!(val, vec![0.9, 0.5, 0.4]);
+    }
+
+    /// The in-group filter can eliminate a high-global-score expert that
+    /// is not in its group's top-k — this is the core of aux-loss-free
+    /// routing. Expert 4 has score 0.95 (highest overall) but is not in
+    /// group 1's top-2, so it must be excluded.
+    #[test]
+    fn grouped_top_k_excludes_high_score_expert_not_in_group_topk() {
+        // Group 0 = experts 0-3: scores 0.8, 0.7, 0.1, 0.05 → top-2 = {0.8, 0.7}
+        // Group 1 = experts 4-7: scores 0.95, 0.6, 0.01, 0.02 → top-2 = {0.95, 0.6}
+        // Wait — e4=0.95 IS in group 1's top-2. Let's make it NOT be:
+        // Group 1 = experts 4-7: scores 0.01, 0.6, 0.95, 0.02 → top-2 = {0.6 (e5), 0.95 (e6)}
+        // e4=0.01 is NOT in top-2.
+        let scores = vec![0.8, 0.7, 0.1, 0.05, 0.01, 0.6, 0.95, 0.02];
+        // top_k=4: survivors from group0={e0,e1}, group1={e5,e6}
+        // Global top-4: e6=0.95, e0=0.8, e1=0.7, e5=0.6
+        let (idx, _) = grouped_top_k(&scores, 8, 4, 2, 2);
+        assert!(!idx.contains(&4), "expert 4 (score 0.01) must be excluded — not in group top-2");
+        assert!(idx.contains(&6), "expert 6 (score 0.95) must be included");
+        assert_eq!(idx.len(), 4);
+    }
+
+    /// Uneven group sizes (last group smaller) are handled correctly.
+    #[test]
+    fn grouped_top_k_handles_uneven_last_group() {
+        // 7 experts, 3 groups → group sizes: 3, 3, 1 (7/3 ceil = 3 per group)
+        // Group 0 = experts 0-2, Group 1 = experts 3-5, Group 2 = expert 6
+        let scores = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.95];
+        // topk_group=1: keep only the top-1 in each group
+        // Group 0 top-1: e2=0.3
+        // Group 1 top-1: e5=0.6
+        // Group 2 top-1: e6=0.95
+        // Survivors: {e2, e5, e6}. Global top-2: e6=0.95, e5=0.6
+        let (idx, val) = grouped_top_k(&scores, 7, 2, 3, 1);
+        assert_eq!(idx, vec![6, 5]);
+        assert_eq!(val, vec![0.95, 0.6]);
     }
 
     /// `softmax` produces a probability distribution.

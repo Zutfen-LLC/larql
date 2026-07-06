@@ -355,4 +355,123 @@ mod tests {
             );
         }
     }
+
+    /// Absorbed MLA weights produce a forward pass that matches the
+    /// non-absorbed MLA reference, proving the Q4K writer's absorb-then-
+    /// quantise path starts from a correct f32 base (requirement b of GPU-5003).
+    ///
+    /// The Q4K writer absorbs MLA geometry into dense Q/K/V, quantises to
+    /// Q4_K/Q6_K, and the resulting vindex must produce attention output
+    /// within tolerance of the f32-only absorbed reference. This test
+    /// validates the absorption correctness at f32 precision — the Q4_K
+    /// quantisation step adds bounded noise on top of this correct base.
+    #[test]
+    fn absorbed_forward_matches_reference_within_tolerance() {
+        use larql_inference::attention::gqa::gqa_attention_asym;
+
+        let g = geometry();
+        let (kv_a, kv_b, q_a, q_b) = weights(&g);
+        let hidden = 16usize;
+        let qk_head_dim = g.qk_head_dim();
+        let seq = 5usize;
+
+        // Compute absorbed weight matrices
+        let (w_q, w_k, w_v) = absorb(&kv_a, &kv_b, &q_a, &q_b, &g);
+
+        // Verify absorbed tensors are finite (no NaN/Inf from the matmuls).
+        for arr in [&w_q, &w_k, &w_v] {
+            for &v in arr.iter() {
+                assert!(v.is_finite(), "absorbed tensor contains non-finite value");
+            }
+        }
+
+        // Reference path: project through MLA, then gqa_attention_asym.
+        let x = randn(seq, hidden, 99);
+        let (q_ref, k_ref, v_ref) = mla_reference_forward(&x, &kv_a, &kv_b, &q_a, &q_b, &g);
+        let reps = g.num_q / g.num_kv;
+        let scale = 1.0 / (qk_head_dim as f64).sqrt();
+        let ref_out = gqa_attention_asym(
+            &q_ref, &k_ref, &v_ref, g.num_q, qk_head_dim, g.v_hd, reps, scale, seq,
+        );
+
+        // Absorbed path: project through absorbed weight matrices, then gqa.
+        let q_abs = x.dot(&w_q.t());
+        let k_abs = x.dot(&w_k.t());
+        let v_abs = x.dot(&w_v.t());
+        let abs_out = gqa_attention_asym(
+            &q_abs, &k_abs, &v_abs, g.num_q, qk_head_dim, g.v_hd, reps, scale, seq,
+        );
+
+        // Must match numerically (within float precision).
+        assert_eq!(ref_out.shape(), abs_out.shape());
+        let max_diff = ref_out
+            .iter()
+            .zip(abs_out.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "absorbed forward must match reference within tolerance, max_diff={max_diff}"
+        );
+
+        // Output must be non-trivial (not all zeros).
+        let l2: f32 = abs_out.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(l2 > 1e-6, "absorbed forward output must be non-trivial, l2={l2}");
+    }
+
+    /// Absorbed MLA weights can be zero-padded to a 256-multiple and quantised
+    /// to Q4_K without error — this is the exact path the Q4K writer takes
+    /// (requirement a of GPU-5003: absorb then quantise).
+    #[test]
+    fn absorbed_weights_quantize_to_q4k_after_padding() {
+        use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
+
+        // Use a geometry whose hidden dim is a 256-multiple so the quantiser
+        // accepts the data without padding (the writer pads non-256 dims
+        // via pad_rows_to_block; here we test the common case directly).
+        let g = MlaGeometry {
+            num_q: 4,
+            num_kv: 2,
+            qk_nope: 4,
+            qk_rope: 2,
+            v_hd: 4,
+            kv_lora: 8,
+            q_lora: 8,
+        };
+        let hidden = 256usize; // 256-multiple
+        let qk_head_dim = g.qk_head_dim();
+
+        let kv_a = randn(g.kv_lora + g.qk_rope, hidden, 10);
+        let kv_b = randn(g.num_kv * (g.qk_nope + g.v_hd), g.kv_lora, 20);
+        let q_a = randn(g.q_lora, hidden, 30);
+        let q_b = randn(g.num_q * qk_head_dim, g.q_lora, 40);
+
+        let (w_q, w_k, w_v) = absorb(&kv_a, &kv_b, &q_a, &q_b, &g);
+
+        // All absorbed tensors must have cols = hidden = 256 (a Q4_K block).
+        assert_eq!(w_q.ncols(), 256);
+        assert_eq!(w_k.ncols(), 256);
+        assert_eq!(w_v.ncols(), 256);
+
+        // Quantise to Q4_K (Q, K) and Q6_K (V) — matching the writer's
+        // format assignment (attn.rs: V gets Q6K, others Q4K).
+        let q_bytes = quantize_q4_k(w_q.as_slice().unwrap());
+        let k_bytes = quantize_q4_k(w_k.as_slice().unwrap());
+        let v_bytes = quantize_q6_k(w_v.as_slice().unwrap());
+
+        assert!(!q_bytes.is_empty(), "Q4_K Q bytes must be non-empty");
+        assert!(!k_bytes.is_empty(), "Q4_K K bytes must be non-empty");
+        assert!(!v_bytes.is_empty(), "Q6_K V bytes must be non-empty");
+
+        // Byte length sanity: Q4_K super-block = 256 elements → 144 bytes.
+        // Q rows = num_q * qk_head_dim = 4 * 6 = 24 rows.
+        let q_expected = 24 * 144; // 24 super-blocks (1 per row since cols=256)
+        assert_eq!(q_bytes.len(), q_expected, "Q4_K Q byte length mismatch");
+        // K rows = num_kv * qk_head_dim = 2 * 6 = 12 rows.
+        let k_expected = 12 * 144;
+        assert_eq!(k_bytes.len(), k_expected, "Q4_K K byte length mismatch");
+        // V rows = num_kv * v_hd = 2 * 4 = 8 rows. Q6_K super-block = 256 → 210 bytes.
+        let v_expected = 8 * 210;
+        assert_eq!(v_bytes.len(), v_expected, "Q6_K V byte length mismatch");
+    }
 }

@@ -183,6 +183,8 @@ fn moe_model_config() -> VindexModelConfig {
             router_type: "top_k_softmax".into(),
             moe_intermediate_size: Some(INTERMEDIATE_SIZE),
             hybrid: false,
+n_group: None,
+topk_group: None,
         }),
         global_head_dim: None,
         num_global_kv_heads: None,

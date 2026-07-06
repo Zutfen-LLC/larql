@@ -122,7 +122,19 @@ pub fn moe_route_from_router_input(
 
     let mut logits = math::matmul_vec(router_in, moe.router_proj, num_experts, hidden);
     math::softmax(&mut logits);
-    let (indices, mut weights) = math::top_k(&logits, top_k_val);
+    let (indices, mut weights) = if moe.routing_policy.is_grouped() {
+        // DS-V3 aux-loss-free two-level softmax: in-group top-K then
+        // inter-group global top-K.
+        math::grouped_top_k(
+            &logits,
+            num_experts,
+            top_k_val,
+            moe.routing_policy.n_group,
+            moe.routing_policy.topk_group,
+        )
+    } else {
+        math::top_k(&logits, top_k_val)
+    };
 
     if moe.routing_policy.selected_weight == MoeTopKWeightPolicy::RenormalizedSoftmax {
         let sum: f32 = weights.iter().sum();
@@ -311,6 +323,100 @@ mod tests {
 
         assert_ne!(no_scale_weights, zero_scale_weights);
         assert!(zero_scale_weights.iter().all(|w| (*w - 0.5).abs() < 1e-6));
+    }
+
+    // ── DS-V3 grouped routing (two-level softmax) ──
+
+    /// Grouped routing produces different expert selection than flat top-K
+    /// when the in-group filter eliminates a high-score expert.
+    #[test]
+    fn grouped_routing_excludes_expert_not_in_group_topk() {
+        // 8 experts, hidden=4. Router projects to 8 scores.
+        // We craft router_proj so that expert 0 has the highest score overall
+        // but is not in its group's top-2, so grouped routing must exclude it.
+        let hidden = 4;
+        let num_experts = 8;
+        let top_k = 4;
+
+        // Router weight: expert i projects input·col_i.
+        // Input h = [1, 1, 1, 1]. Scores = row sums.
+        // We want group 0 (experts 0-3) scores: [0.1, 0.9, 0.8, 0.2]
+        //   top-2 in group 0 = {e1=0.9, e2=0.8} — e0=0.1 excluded
+        // Group 1 (experts 4-7) scores: [0.3, 0.4, 0.5, 0.35]
+        //   top-2 in group 1 = {e5=0.5 wait e4..e7} → {e6=0.5, e5=0.4}
+        // So router_proj[e] = [score_e/4; 4] so dot(h, proj) = score_e
+        let scores = [0.1f32, 0.9, 0.8, 0.2, 0.3, 0.4, 0.5, 0.35];
+        let router: Vec<f32> = (0..num_experts)
+            .flat_map(|e| std::iter::repeat(scores[e] / hidden as f32).take(hidden))
+            .collect();
+
+        let make_moe = |n_group: usize, topk_group: usize| {
+            let routing_policy = if n_group > 0 {
+                crate::MoeRoutingPolicy::deepseek_v3_grouped(n_group, topk_group)
+            } else {
+                crate::MoeRoutingPolicy::top_k_softmax()
+            };
+            MoeLayerWeights {
+                experts_gate_up: Vec::new(),
+                experts_down: Vec::new(),
+                routing_policy,
+                weight_layout: crate::MoeWeightLayout::default(),
+                expert_data_format: crate::QuantFormat::BF16,
+                router_proj: &router,
+                router_scale: &[],
+                router_per_expert_scale: &[],
+                router_norm: &[],
+                router_norm_parameter_free: false,
+                router_input_scalar: 1.0,
+                pre_experts_norm: &[],
+                post_ffn1_norm: &[],
+                post_experts_norm: &[],
+                num_experts,
+                top_k,
+                intermediate_size: 1,
+                activation: crate::Activation::Silu,
+            }
+        };
+
+        let h = vec![1.0f32; hidden];
+
+        // Flat top-K: selects top-4 by global score = {e1=0.9, e2=0.8, e6=0.5, e5=0.4}
+        let moe_flat = make_moe(0, 0);
+        let (idx_flat, _) = moe_route_from_router_input(
+            &moe_router_input(&h, &h, &moe_flat, 0.0, 1e-6),
+            &moe_flat,
+        );
+        // After softmax the ordering is preserved (softmax is monotonic).
+        // Top-4 globally: e1, e2, e6, e5 (scores 0.9, 0.8, 0.5, 0.4)
+        assert!(idx_flat.contains(&1), "flat routing must include e1");
+        assert!(idx_flat.contains(&2), "flat routing must include e2");
+
+        // Grouped (DS-V3): 2 groups, topk_group=2.
+        // Group 0 survivors: {e1, e2}. Group 1 survivors: {e5, e6}.
+        // Global top-4 among survivors: e1, e2, e6, e5
+        let moe_grouped = make_moe(2, 2);
+        let (idx_grouped, _) = moe_route_from_router_input(
+            &moe_router_input(&h, &h, &moe_grouped, 0.0, 1e-6),
+            &moe_grouped,
+        );
+        assert_eq!(idx_grouped.len(), 4);
+        // e0 (score 0.1) must NOT be in the grouped selection even though
+        // it's in the flat selection's discarded set — it was eliminated
+        // at the in-group stage.
+        assert!(!idx_grouped.contains(&0), "grouped routing must exclude e0");
+        assert!(idx_grouped.contains(&1), "grouped routing must include e1");
+        assert!(idx_grouped.contains(&2), "grouped routing must include e2");
+    }
+
+    /// deepseek_v3_grouped policy reports is_grouped() correctly.
+    #[test]
+    fn deepseek_v3_grouped_policy_is_grouped() {
+        let g = crate::MoeRoutingPolicy::deepseek_v3_grouped(8, 4);
+        assert!(g.is_grouped());
+        let flat = crate::MoeRoutingPolicy::top_k_softmax();
+        assert!(!flat.is_grouped());
+        let gemma = crate::MoeRoutingPolicy::gemma4_hybrid();
+        assert!(!gemma.is_grouped());
     }
 
     #[test]

@@ -267,6 +267,8 @@ mod tests {
             router_type: "softmax".into(),
             moe_intermediate_size: Some(1024),
             hybrid: false,
+            n_group: None,
+            topk_group: None,
         });
         let config = minimal_config(model_cfg.clone());
 
@@ -289,6 +291,8 @@ mod tests {
             router_type: "topk".into(),
             moe_intermediate_size: None, // no override
             hybrid: true,
+            n_group: None,
+            topk_group: None,
         });
         let config = minimal_config(model_cfg.clone());
 

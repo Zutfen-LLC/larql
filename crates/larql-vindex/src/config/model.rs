@@ -115,6 +115,13 @@ pub struct MoeConfig {
     /// True for Gemma 4 A4B. False for pure MoE (Mixtral, DeepSeek).
     #[serde(default)]
     pub hybrid: bool,
+    /// DS-V3 aux-loss-free grouped routing: number of expert groups for the
+    /// two-level softmax. None (or 0) disables grouping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_group: Option<usize>,
+    /// DS-V3 aux-loss-free grouped routing: experts per group (in-group top-K).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topk_group: Option<usize>,
 }
 
 fn default_router_type() -> String {
@@ -146,6 +153,14 @@ impl VindexModelConfig {
                         None
                     },
                     hybrid: arch.is_hybrid_moe(),
+                    n_group: {
+                        let ng = arch.moe_n_group();
+                        if ng > 0 { Some(ng) } else { None }
+                    },
+                    topk_group: {
+                        let tg = arch.moe_topk_group();
+                        if tg > 0 { Some(tg) } else { None }
+                    },
                 })
             } else {
                 None
@@ -244,6 +259,8 @@ mod tests {
             router_type: "top_k_softmax".into(),
             moe_intermediate_size: Some(2048),
             hybrid: false,
+            n_group: None,
+            topk_group: None,
         });
         let j = serde_json::to_string(&cfg).unwrap();
         let back: VindexModelConfig = serde_json::from_str(&j).unwrap();
@@ -383,6 +400,8 @@ mod tests {
             router_type: "top_k_softmax".into(),
             moe_intermediate_size: None,
             hybrid: false,
+            n_group: None,
+            topk_group: None,
         };
         let json = serde_json::to_string(&moe).unwrap();
         assert!(json.contains("\"shared_expert\":true"), "{json}");

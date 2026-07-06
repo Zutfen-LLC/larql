@@ -274,7 +274,7 @@ pub fn build_moe_weights<'a>(
     Some(MoeLayerWeights {
         experts_gate_up,
         experts_down,
-        routing_policy: moe_routing_policy(arch.moe_router_type()),
+        routing_policy: moe_routing_policy(arch),
         weight_layout: MoeWeightLayout::default(),
         expert_data_format,
         router_proj,
@@ -547,7 +547,7 @@ fn build_moe_stub<'a>(
     MoeLayerWeights {
         experts_gate_up: vec![],
         experts_down: vec![],
-        routing_policy: moe_routing_policy(arch.moe_router_type()),
+        routing_policy: moe_routing_policy(arch),
         weight_layout: MoeWeightLayout::default(),
         expert_data_format,
         router_proj: &[],
@@ -569,9 +569,14 @@ fn build_moe_stub<'a>(
     }
 }
 
-fn moe_routing_policy(router_type: &str) -> MoeRoutingPolicy {
+fn moe_routing_policy(arch: &dyn larql_models::ModelArchitecture) -> MoeRoutingPolicy {
+    let router_type = arch.moe_router_type();
     match router_type {
         "gemma4_top_k_softmax" => MoeRoutingPolicy::gemma4_hybrid(),
+        "deepseek_v3_grouped" => MoeRoutingPolicy::deepseek_v3_grouped(
+            arch.moe_n_group(),
+            arch.moe_topk_group(),
+        ),
         _ => MoeRoutingPolicy::top_k_softmax(),
     }
 }
@@ -636,10 +641,44 @@ mod tests {
 
     #[test]
     fn moe_routing_policy_maps_gemma4_tag() {
-        // Gemma 4 hybrid tag → Gemma 4 routing.
-        let _ = moe_routing_policy("gemma4_top_k_softmax");
-        // Unknown tag → top-K softmax default.
-        let _ = moe_routing_policy("unknown");
+        // Non-MoE arch defaults to top_k_softmax; grouped routing is only
+        // reached when the arch reports "deepseek_v3_grouped" router type.
+        let llama = larql_models::detect_from_json(&serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+        }));
+        let policy = moe_routing_policy(llama.as_ref());
+        assert_eq!(policy, MoeRoutingPolicy::top_k_softmax());
+        assert!(!policy.is_grouped());
+    }
+
+    #[test]
+    fn moe_routing_policy_deepseek_v3_grouped() {
+        // DS-V3 with n_group/topk_group → deepseek_v3_grouped routing.
+        let dsv3 = larql_models::detect_from_json(&serde_json::json!({
+            "model_type": "deepseek_v3",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "kv_lora_rank": 64,
+            "q_lora_rank": 64,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 2,
+            "n_group": 4,
+            "topk_group": 2,
+        }));
+        let policy = moe_routing_policy(dsv3.as_ref());
+        assert!(policy.is_grouped(), "DS-V3 with n_group=4 must be grouped");
+        assert_eq!(policy.n_group, 4);
+        assert_eq!(policy.topk_group, 2);
     }
 
     /// `resolve_attn_weights` falls through to the Q8 branch when the

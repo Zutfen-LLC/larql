@@ -45,6 +45,17 @@ impl ModelArchitecture for DeepSeekArch {
         self.config.num_shared_experts.unwrap_or(2)
     }
 
+    /// DS-V3 uses aux-loss-free grouped routing (two-level softmax) when
+    /// n_group/topk_group are present in config.json. Falls back to
+    /// "top_k_softmax" for DS-V2 (no grouped routing).
+    fn moe_router_type(&self) -> &str {
+        if self.config.n_group.unwrap_or(0) > 0 && self.config.topk_group.unwrap_or(0) > 0 {
+            "deepseek_v3_grouped"
+        } else {
+            "top_k_softmax"
+        }
+    }
+
     fn moe_router_key(&self, layer: usize) -> Option<String> {
         Some(format!("{}mlp.gate.weight", self.layer_prefix(layer)))
     }
