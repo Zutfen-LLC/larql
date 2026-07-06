@@ -45,24 +45,11 @@ on:
 
 env:
   LARQL_KV_COVERAGE_MIN: 85
-  # This self-hosted runner's CPU does not expose AVX2 (confirmed by the
-  # scalar-fallback fix in
-  # `larql-vindex/src/index/storage/gate_store.rs`, which had to work
-  # around the same class of crash locally). System OpenBLAS (installed
-  # below, a transitive dep via larql-inference/larql-compute) picks a
-  # SIMD kernel at runtime via its own CPU-model dispatch table
-  # ("DYNAMIC_ARCH"), and on this host it was landing on a kernel that
-  # assumes AVX2 anyway — hence the SIGILL/SIGSEGV crashes mid-test-run.
-  # Pinning a pre-AVX coretype (Nehalem: SSE4.2 baseline, ~2008+) forces
-  # OpenBLAS onto a kernel this CPU can actually execute, at the cost of
-  # some BLAS throughput. Don't "upgrade" this to Haswell/Sandybridge
-  # etc. without confirming the runner actually has AVX2 — that's what
-  # caused this in the first place.
-  OPENBLAS_CORETYPE: NEHALEM
-  # Likewise, `nproc`-based thread-pool sizing (OpenBLAS's own pthread
-  # pool) can oversubscribe if the container's visible CPU count doesn't
-  # match its actual cgroup quota — capping this removes a second source
-  # of the same class of crash.
+  # `nproc`-based thread-pool sizing (OpenBLAS's own pthread pool) can
+  # oversubscribe if the container's visible CPU count doesn't match its
+  # actual cgroup quota, which has been a contributor to SIGILL/SIGSEGV
+  # crashes mid-test-run on this runner fleet. Capping it is cheap
+  # insurance regardless of which host a job lands on.
   OPENBLAS_NUM_THREADS: '4'
 
 jobs:
@@ -85,6 +72,25 @@ jobs:
         run: |
           apt-get update
           apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
+
+      - name: Pin a safe OpenBLAS kernel on AVX2-less hosts
+        # This self-hosted runner fleet is heterogeneous — some hosts
+        # lack AVX2 (confirmed by the scalar-fallback fix in
+        # `crates/larql-vindex/src/index/storage/gate_store.rs`, added
+        # after hitting the same crash class there), and on those hosts
+        # system OpenBLAS's own runtime dispatch ("DYNAMIC_ARCH") has
+        # been observed landing on an AVX2-assuming kernel anyway,
+        # causing SIGILL/SIGSEGV mid-test-run. Only override the kernel
+        # choice when *this* host actually lacks AVX2 — a blanket
+        # `OPENBLAS_CORETYPE=NEHALEM` regressed a previously-passing run
+        # on a different (AVX2-capable) host in this fleet (see
+        # larql-compute's workflow), so don't reintroduce that as an
+        # unconditional env var.
+        run: |
+          if ! grep -qw avx2 /proc/cpuinfo; then
+            echo "host lacks AVX2 — pinning OPENBLAS_CORETYPE=NEHALEM"
+            echo "OPENBLAS_CORETYPE=NEHALEM" >> "$GITHUB_ENV"
+          fi
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5
@@ -137,6 +143,14 @@ jobs:
         run: |
           apt-get update
           apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
+
+      - name: Pin a safe OpenBLAS kernel on AVX2-less hosts
+        # See the `test` job above for the full rationale.
+        run: |
+          if ! grep -qw avx2 /proc/cpuinfo; then
+            echo "host lacks AVX2 — pinning OPENBLAS_CORETYPE=NEHALEM"
+            echo "OPENBLAS_CORETYPE=NEHALEM" >> "$GITHUB_ENV"
+          fi
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
