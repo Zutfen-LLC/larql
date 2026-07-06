@@ -91,14 +91,21 @@ jobs:
       - name: Build larql-cli (release)
         run: cargo build --release -p larql-cli
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
+      - name: Install Python
+        # `actions/setup-python` downloads a prebuilt interpreter from
+        # `actions/python-versions` releases, which only ship for tagged
+        # distros (effectively Ubuntu) — it can't resolve any version for
+        # this Debian-based container on a self-hosted runner ("The
+        # version '3.12' ... was not found for debian 12"). apt's own
+        # Python (3.11 on bookworm) has no version-specific requirement
+        # here — `shannon_score_hf.py` doesn't use anything past 3.9
+        # syntax — so just install it directly instead.
+        run: |
+          apt-get install -y python3 python3-venv python3-pip
 
       - name: Install HF reference scorer deps
         run: |
-          python -m venv .venv
+          python3 -m venv .venv
           .venv/bin/pip install --upgrade pip
           # CPU-only torch — about 200 MB, ~30 s. Skips CUDA libs.
           .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch

@@ -35,6 +35,27 @@ jobs:
     container:
       image: rust:1-bookworm
 
+    env:
+      # This self-hosted runner's CPU does not expose AVX2 (confirmed by
+      # the scalar-fallback fix in
+      # `larql-vindex/src/index/storage/gate_store.rs`, which had to work
+      # around the same class of crash locally). System OpenBLAS
+      # (installed below) picks a SIMD kernel at runtime via its own
+      # CPU-model dispatch table ("DYNAMIC_ARCH"), and on this host it was
+      # landing on a kernel that assumes AVX2 anyway — hence the
+      # SIGILL/SIGSEGV crashes mid-test-run. Pinning a pre-AVX coretype
+      # (Nehalem: SSE4.2 baseline, ~2008+) forces OpenBLAS onto a kernel
+      # this CPU can actually execute, at the cost of some BLAS
+      # throughput. Don't "upgrade" this to Haswell/Sandybridge etc.
+      # without confirming the runner actually has AVX2 — that's what
+      # caused this in the first place.
+      OPENBLAS_CORETYPE: NEHALEM
+      # Likewise, `nproc`-based thread-pool sizing (OpenBLAS's own pthread
+      # pool) can oversubscribe if the container's visible CPU count
+      # doesn't match its actual cgroup quota — capping this removes a
+      # second source of the same class of crash.
+      OPENBLAS_NUM_THREADS: '4'
+
     steps:
       - uses: actions/checkout@v6
 
@@ -89,6 +110,13 @@ jobs:
     timeout-minutes: 25
     container:
       image: rust:1-bookworm
+
+    env:
+      # See the `test` job above for why these are pinned — same runner,
+      # same system OpenBLAS, same crash class (this job is the one that
+      # actually hit the SIGILL).
+      OPENBLAS_CORETYPE: NEHALEM
+      OPENBLAS_NUM_THREADS: '4'
 
     steps:
       - uses: actions/checkout@v6

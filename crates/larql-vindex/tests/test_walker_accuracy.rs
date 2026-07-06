@@ -3,44 +3,45 @@
 //! Walker output is a function of `(model weights, config, host
 //! floating-point order)`. The first two are fully deterministic — the
 //! mock fixture in `walker::test_fixture` is byte-identical across runs
-//! and platforms. The third is not: the matmul that feeds the top-k
-//! selection runs through SIMD code paths that differ between x86 and
-//! ARM, which is enough to flip tie-breaking on edges with sub-ULP
-//! score differences. macOS-aarch64 and linux-x86_64 therefore produce
-//! consistent-but-different edge lists.
+//! and platforms. The third is not: any code path that runs a BLAS matmul
+//! — the top-k selection in the weight/attention walkers, *and* the
+//! `embed @ w_down` projection the vector extractor uses to derive its
+//! top-k token metadata — is exposed to reduction-order differences
+//! between BLAS builds/CPUs, which is enough to flip tie-breaking on
+//! sub-ULP score differences. macOS-aarch64, linux-x86_64, and even two
+//! different linux-x86_64 BLAS builds can therefore produce
+//! consistent-but-different top-k lists.
 //!
-//! Two-tier strategy:
-//!   * Within a single platform / run, walker output must be exactly
-//!     reproducible — we walk the fixture twice and demand byte-equal
-//!     canonical output.
-//!   * Across platforms, we pin **structural invariants** (edge counts,
-//!     normalisation sanity, metadata presence) instead of a SHA. Any
-//!     real regression (count drift, broken normalisation, missing
-//!     fields, empty tokens) flips a structural assertion; pure
-//!     SIMD-driven reordering doesn't.
-//!
-//! The vector-extractor file output is still hashed byte-for-byte — it
-//! doesn't go through the top-k path and is genuinely cross-platform.
+//! Three-tier strategy, applied per code path:
+//!   * Within a single platform / run, output must be exactly
+//!     reproducible — we run twice and demand byte-equal canonical
+//!     output.
+//!   * Fields with no arithmetic in their derivation (raw weight bytes,
+//!     ids, indices) are pinned with an exact hash — they can't drift
+//!     from a different BLAS build, so an exact pin costs nothing and
+//!     catches everything.
+//!   * Fields derived from a BLAS matmul + top-k (edge confidence, top
+//!     tokens) get **structural invariants** (sorted, in range,
+//!     internally consistent) instead of a hash — any real regression
+//!     (count drift, broken normalisation, missing fields) flips a
+//!     structural assertion, but pure reduction-order reordering
+//!     doesn't. Where extra regression-catching power is worth a bit of
+//!     golden-refresh maintenance, invariants are paired with a
+//!     tolerance-pinned expected value (± epsilon, set-equality on
+//!     token-id lists) — the same approach `larql-inference`'s
+//!     `test_logits_goldens.rs` uses for whole-model logits.
 
 use std::path::Path;
 
-#[cfg(not(windows))]
 use sha2::{Digest, Sha256};
 
 use larql_core::Graph;
+use larql_models::VectorRecord;
 use larql_vindex::walker::{
     attention_walker::AttentionWalker,
     test_fixture::create_mock_model,
+    vector_extractor::{ExtractConfig, SilentExtractCallbacks, VectorExtractor},
     weight_walker::{SilentWalkCallbacks, WalkConfig, WeightWalker},
-};
-
-// Vector-extractor imports are only used by the byte-identical golden
-// test, which is gated off on Windows (BLAS f32 round-tripping drifts
-// the JSONL hash). Keep the imports under the same gate so a Windows
-// build doesn't flag them as unused.
-#[cfg(not(windows))]
-use larql_vindex::walker::vector_extractor::{
-    ExtractConfig, SilentExtractCallbacks, VectorExtractor,
 };
 
 fn fixture(slug: &str) -> std::path::PathBuf {
@@ -54,12 +55,15 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[cfg(not(windows))]
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     let out = h.finalize();
     out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn print_mode() -> bool {
+    std::env::var("LARQL_PRINT_GOLDEN").is_ok()
 }
 
 /// Canonical edge form: tab-separated fields, sorted, one edge per line.
@@ -86,29 +90,207 @@ fn canonicalise_edges(graph: &Graph, layer_field: &str, feature_field: &str) -> 
 
 // ── Goldens ──────────────────────────────────────────────────────────────
 //
-// Only the vector-extractor stays byte-identical: it doesn't run a
-// top-k selection on matmul output, so it's not exposed to SIMD-level
-// reordering. Regenerate after an intentional change with:
+// Regenerate after an intentional change with:
 //   LARQL_PRINT_GOLDEN=1 cargo test -p larql-vindex --test \
 //     test_walker_accuracy -- --nocapture
-// then paste the printed hex string below.
+// then paste the printed hash and `FeatureGolden` lines below.
 //
-// Regenerated 2026-05-10: the canonicalisation strips the `_header`
-// record so the wall-clock `extraction_date` field doesn't make the
-// golden drift every day.
-#[cfg(not(windows))]
-const GOLDEN_VECTOR_EXTRACTOR_FFN_DOWN_LAYER0: &str =
-    "8b5e221b150147ed40b0cfa67fdfc264e0628ab6cd6c59c2f9419e9350589b83";
-
-#[cfg(not(windows))]
+// `GOLDEN_EXACT_FIELDS_HASH` covers only `id`/`layer`/`feature`/`dim`/
+// `vector` — a raw column copy off the weight tensor with no arithmetic
+// involved, so it's genuinely identical across platforms and BLAS
+// builds. `FEATURE_GOLDENS` covers the BLAS-derived fields
+// (`top_token_id`, `c_score`, `top_k`), which come out of
+// `embed.dot(w_down)` + top-k selection — see module doc for why those
+// get tolerance/set checks instead of an exact pin.
 fn check_or_print(label: &str, actual: &str, golden: &str) {
-    if std::env::var("LARQL_PRINT_GOLDEN").is_ok() {
+    if print_mode() {
         eprintln!("{label} = {actual:?}");
         return;
     }
     assert_eq!(
         actual, golden,
         "{label}: walker output drifted — review the change and update the golden if intentional"
+    );
+}
+
+/// Canonical form for the BLAS-free subset of a vector-extractor record.
+/// `vector` is a direct column copy off the weight tensor (no
+/// arithmetic), so this hash can't drift from a different BLAS build —
+/// unlike `top_token`/`c_score`/`top_k`, which come out of a matmul.
+fn canonicalise_exact_fields(records: &[VectorRecord]) -> Vec<u8> {
+    let mut lines: Vec<String> = records
+        .iter()
+        .map(|r| {
+            let vector_hex: String = r
+                .vector
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                r.id, r.layer, r.feature, r.dim, vector_hex
+            )
+        })
+        .collect();
+    lines.sort();
+    let mut out = lines.join("\n").into_bytes();
+    out.push(b'\n');
+    out
+}
+
+fn parse_records(path: &Path) -> Vec<VectorRecord> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut records: Vec<VectorRecord> = text
+        .lines()
+        .filter(|l| !l.contains("\"_header\":true"))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    records.sort_by_key(|r| r.feature);
+    records
+}
+
+/// Structural invariants for a single record's BLAS-derived fields.
+/// These hold regardless of BLAS build/reduction order — they only
+/// break on a genuine regression (empty top-k, an inconsistent top-1,
+/// wrong shape), not on harmless tie-break reordering.
+fn assert_record_structural_invariants(r: &VectorRecord, configured_top_k: usize) {
+    assert_eq!(
+        r.dim,
+        r.vector.len(),
+        "record {}: dim != vector.len()",
+        r.id
+    );
+    assert!(!r.vector.is_empty(), "record {}: empty vector", r.id);
+    assert!(!r.top_k.is_empty(), "record {}: empty top_k", r.id);
+    assert!(
+        r.top_k.len() <= configured_top_k,
+        "record {}: top_k longer than configured top_k",
+        r.id
+    );
+    assert!(
+        r.top_k.windows(2).all(|w| w[0].logit >= w[1].logit),
+        "record {}: top_k not sorted descending by logit",
+        r.id
+    );
+    let top1 = &r.top_k[0];
+    assert_eq!(
+        r.top_token_id, top1.token_id,
+        "record {}: top_token_id != top_k[0].token_id",
+        r.id
+    );
+    assert_eq!(
+        r.top_token, top1.token,
+        "record {}: top_token != top_k[0].token",
+        r.id
+    );
+    assert_eq!(
+        r.c_score, top1.logit,
+        "record {}: c_score != top_k[0].logit",
+        r.id
+    );
+    assert!(!r.top_token.is_empty(), "record {}: empty top_token", r.id);
+    for entry in &r.top_k {
+        assert!(
+            !entry.token.is_empty(),
+            "record {}: empty top_k token",
+            r.id
+        );
+        assert!(
+            entry.logit.is_finite(),
+            "record {}: non-finite top_k logit",
+            r.id
+        );
+    }
+}
+
+/// Per-feature pin for the BLAS-derived subset of a vector-extractor
+/// record. Captured once from an actual run — see the module-level
+/// regeneration instructions above.
+struct FeatureGolden {
+    feature: usize,
+    top_token_id: u32,
+    c_score: f32,
+    top_k_token_ids: &'static [u32],
+}
+
+/// Absolute tolerance on `c_score`. Wide enough to absorb BLAS
+/// reduction-order noise across builds, tight enough to catch a real
+/// regression — same idea as `test_logits_goldens.rs`'s
+/// `LOGIT_TOLERANCE`, sized down for this fixture's small synthetic
+/// logit magnitudes.
+const TOP1_SCORE_TOLERANCE: f32 = 1e-3;
+
+// Captured 2026-07-05.
+const GOLDEN_EXACT_FIELDS_HASH: &str =
+    "b6a6dc4cd0ef85ac252e401fcf5da5c18f8f23ef6b3b49aefedee8d19f1237eb";
+
+const FEATURE_GOLDENS: &[FeatureGolden] = &[
+    FeatureGolden {
+        feature: 0,
+        top_token_id: 10,
+        c_score: 0.02654723,
+        top_k_token_ids: &[6, 7, 10],
+    },
+    FeatureGolden {
+        feature: 1,
+        top_token_id: 7,
+        c_score: 0.024061209,
+        top_k_token_ids: &[6, 7, 13],
+    },
+    FeatureGolden {
+        feature: 2,
+        top_token_id: 7,
+        c_score: 0.030054377,
+        top_k_token_ids: &[7, 10, 15],
+    },
+    FeatureGolden {
+        feature: 3,
+        top_token_id: 10,
+        c_score: 0.02863936,
+        top_k_token_ids: &[5, 7, 10],
+    },
+];
+
+/// Check (or, under `LARQL_PRINT_GOLDEN=1`, print) one record's
+/// BLAS-derived fields against its pinned golden. Order-independent on
+/// `top_k` — a different BLAS build can swap rank within the set
+/// without that being a regression (see module doc).
+fn check_feature_golden(r: &VectorRecord) {
+    let mut ids: Vec<u32> = r.top_k.iter().map(|t| t.token_id).collect();
+    ids.sort_unstable();
+
+    if print_mode() {
+        eprintln!(
+            "FeatureGolden {{ feature: {}, top_token_id: {}, c_score: {:?}, top_k_token_ids: &{:?} }},",
+            r.feature, r.top_token_id, r.c_score, ids
+        );
+        return;
+    }
+
+    let golden = FEATURE_GOLDENS
+        .iter()
+        .find(|g| g.feature == r.feature)
+        .unwrap_or_else(|| panic!("no golden pinned for feature {}", r.feature));
+
+    assert_eq!(
+        r.top_token_id, golden.top_token_id,
+        "feature {}: top_token_id drifted",
+        r.feature
+    );
+    let score_diff = (r.c_score - golden.c_score).abs();
+    assert!(
+        score_diff < TOP1_SCORE_TOLERANCE,
+        "feature {}: c_score drifted by {score_diff} (tolerance {TOP1_SCORE_TOLERANCE})",
+        r.feature
+    );
+
+    let mut want: Vec<u32> = golden.top_k_token_ids.to_vec();
+    want.sort_unstable();
+    assert_eq!(
+        ids, want,
+        "feature {}: top_k token-id set drifted",
+        r.feature
     );
 }
 
@@ -252,15 +434,14 @@ fn assert_structural_invariants(graph: &Graph, second_field: &str, expected_laye
     );
 }
 
-// The golden is byte-keyed on the BLAS implementation's f32 output:
-// canonicalised JSONL → sha256. Linux (OpenBLAS) and macOS (Accelerate)
-// happen to produce matching textual output; Windows OpenBLAS rounds the
-// last digit of some entries differently, so the hash drifts. The test
-// stays useful as a same-platform regression on Linux/macOS — skipping
-// it on Windows rather than weakening it to a "shape only" check.
-#[cfg(not(windows))]
+/// Extracts FFN-down vectors for layer 0 of the mock fixture and checks
+/// them at three tiers (see module doc): structural invariants
+/// (all platforms, always), an exact hash on the BLAS-free subset (all
+/// platforms, always), and a tolerance-pinned golden on the BLAS-derived
+/// subset (skipped on Windows — see `weight_walker_layer0_invariants`
+/// for why OpenBLAS there isn't even deterministic within a run).
 #[test]
-fn vector_extractor_ffn_down_byte_identical() {
+fn vector_extractor_ffn_down_golden() {
     let dir = fixture("vex");
     let extractor = VectorExtractor::load(dir.to_str().unwrap()).unwrap();
     let out = dir.join("output");
@@ -275,23 +456,24 @@ fn vector_extractor_ffn_down_byte_identical() {
     extractor.extract_all(&cfg, &out, false, &mut cb).unwrap();
 
     let path = out.join("ffn_down.vectors.jsonl");
-    let text = std::fs::read_to_string(&path).unwrap();
-    // Sort lines so re-ordering of feature loops doesn't break the
-    // golden — content is what we care about. Skip the `_header`
-    // record: it carries `extraction_date` (today's date), which would
-    // otherwise drift the hash every wall-clock day.
-    let mut lines: Vec<&str> = text
-        .lines()
-        .filter(|l| !l.contains("\"_header\":true"))
-        .collect();
-    lines.sort();
-    let canonical = lines.join("\n");
-    let hex = sha256_hex(canonical.as_bytes());
+    let records = parse_records(&path);
+    assert!(!records.is_empty(), "no records extracted");
+
+    for r in &records {
+        assert_record_structural_invariants(r, cfg.top_k);
+    }
+
+    let exact_hash = sha256_hex(&canonicalise_exact_fields(&records));
     check_or_print(
-        "vector_extractor_ffn_down_layer0",
-        &hex,
-        GOLDEN_VECTOR_EXTRACTOR_FFN_DOWN_LAYER0,
+        "vector_extractor_ffn_down_exact_fields",
+        &exact_hash,
+        GOLDEN_EXACT_FIELDS_HASH,
     );
+
+    #[cfg(not(windows))]
+    for r in &records {
+        check_feature_golden(r);
+    }
 
     cleanup(&dir);
 }
