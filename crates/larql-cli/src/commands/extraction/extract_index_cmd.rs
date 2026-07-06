@@ -109,6 +109,18 @@ pub struct ExtractIndexArgs {
     /// Skip stages that already have output files (resume interrupted builds).
     #[arg(long)]
     resume: bool,
+
+    /// After extraction, emit a deployment slice into `<output>-<preset>`
+    /// containing only the parts the preset selects. The full extract
+    /// remains at `<output>`; this is a convenience that runs the
+    /// equivalent of `larql slice <output> -o <slice> --preset <preset>`
+    /// in the same pass so a distributed node builds only its parts.
+    ///
+    /// Valid presets: client, attn, embed, server, browse, router,
+    /// expert-server, all. See `larql slice --help` for what each
+    /// preset includes.
+    #[arg(long)]
+    emit_slice: Option<String>,
 }
 
 fn parse_quant(s: &str) -> Result<larql_vindex::QuantFormat, String> {
@@ -376,15 +388,19 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         // Dispatch:
         //
-        //  - Safetensors (always) and GGUF at browse level go through the
-        //    streaming pipeline — no full model in RAM.
-        //  - GGUF at inference / attention / all levels (or any level
-        //    with `--quant q4k`) still hits the in-memory loader: the
-        //    `StreamingWeights` writer subsystem is safetensors-only,
-        //    and porting it to GGUF is a follow-on PR.
-        let route_gguf_through_streaming = is_gguf_source
-            && matches!(level, larql_vindex::ExtractLevel::Browse)
-            && args.quant == larql_vindex::QuantFormat::None;
+        //  - Safetensors and GGUF both go through the streaming pipeline
+        //    at every extract level and quant tier. The streaming GGUF
+        //    weight source (`GgufStreamingWeights`) dequantises to f32 on
+        //    demand and supplies raw packed Q4_K / Q6_K bytes via
+        //    `get_packed_quant` -- the quant-preserving import path that
+        //    keeps large MoE models from blowing up memory.
+        //
+        //  - The only remaining reason to use the in-memory loader is
+        //    when the caller explicitly bypasses streaming (no current
+        //    CLI flag does). A non-streaming fallback would go through
+        //    `larql_models::load_model_dir_validated`, which fully
+        //    dequantises GGUF to f32.
+        let route_gguf_through_streaming = is_gguf_source;
 
         if is_gguf_source && !route_gguf_through_streaming {
             // GGUF + attention/inference/all (or any level with q4k) →
@@ -475,6 +491,39 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ── Optional: emit a deployment slice ──
+    //
+    // `--emit-slice <preset>` carves the just-built vindex into a
+    // deployment-ready slice so a distributed node doesn't need a
+    // separate `larql slice` pass. Equivalent to:
+    //   larql slice <output> -o <output>-<preset> --preset <preset>
+    if let Some(ref preset) = args.emit_slice {
+        let parts = crate::commands::primary::slice_cmd::preset_parts(preset)?;
+        // Slice dir is a sibling: <output>-<preset>. Output is a directory,
+        // so append the preset tag as a suffix rather than using
+        // with_extension (which would treat the dir name as a filename).
+        let preset_tag = preset.replace('/', "-");
+        let slice_dir = {
+            let mut p = args.output.clone().into_os_string();
+            p.push(format!("-{preset_tag}"));
+            std::path::PathBuf::from(p)
+        };
+        eprintln!("\n── Emitting slice: {} ({}) ──", slice_dir.display(), preset);
+        let outcome = crate::commands::primary::slice_cmd::slice_vindex(
+            &args.output,
+            &slice_dir,
+            parts,
+            /* force */ true,
+            /* dry_run */ false,
+        )?;
+        eprintln!(
+            "  Wrote {} -- {} ({} file(s))",
+            slice_dir.display(),
+            human_slice_size(outcome.total_bytes),
+            outcome.copied.len(),
+        );
+    }
+
     callbacks.feature_bar.finish_and_clear();
     let build_elapsed = build_start.elapsed();
 
@@ -541,4 +590,23 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+
+/// Human-readable byte size for slice-emission reporting. Mirrors the
+/// private `human_size` in `slice_cmd.rs` -- duplicated rather than
+/// refactored to avoid widening visibility for one call site.
+fn human_slice_size(bytes: u64) -> String {
+    const K: u64 = 1024;
+    const M: u64 = K * 1024;
+    const G: u64 = M * 1024;
+    if bytes >= G {
+        format!("{:.2} GB", bytes as f64 / G as f64)
+    } else if bytes >= M {
+        format!("{:.1} MB", bytes as f64 / M as f64)
+    } else if bytes >= K {
+        format!("{:.1} KB", bytes as f64 / K as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
