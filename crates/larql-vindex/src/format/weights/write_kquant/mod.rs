@@ -243,17 +243,39 @@ pub fn write_model_weights_kquant_with_opts(
     let start = std::time::Instant::now();
 
     let arch = source.arch();
-    if arch.uses_mla() {
-        return Err(VindexError::UnsupportedArchitecture {
-            family: arch.family().to_string(),
-            feature: "multi-head latent attention (MLA)".into(),
-            surface: SURFACE_Q4K_WEIGHT_WRITER.into(),
-        });
+    // MLA absorption: if the architecture uses MLA and all geometry dims are
+    // present, the Q4K writer absorbs Q/K/V in-flight (reusing mla_absorb.rs)
+    // and then quantises the absorbed dense tensors — mirroring the f32
+    // writer's path from #96. Otherwise fall through to the standard guard
+    // (which rejects MLA without geometry).
+    let mla_geom: Option<super::mla_absorb::MlaGeometry> = if arch.uses_mla() {
+        match (
+            arch.mla_qk_nope_head_dim(),
+            arch.mla_qk_rope_head_dim(),
+            arch.mla_v_head_dim(),
+        ) {
+            (Some(qk_nope), Some(qk_rope), Some(v_hd)) => {
+                Some(super::mla_absorb::MlaGeometry {
+                    num_q: arch.config().num_q_heads,
+                    num_kv: arch.config().num_kv_heads,
+                    qk_nope,
+                    qk_rope,
+                    v_hd,
+                    kv_lora: arch.kv_lora_rank(),
+                    q_lora: arch.q_lora_rank(),
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if mla_geom.is_none() {
+        ensure_standard_attention_supported(arch, SURFACE_Q4K_WEIGHT_WRITER)?;
     }
-    ensure_standard_attention_supported(arch, SURFACE_Q4K_WEIGHT_WRITER)?;
     let num_layers = source.num_layers();
 
-    attn::write_attn_weights_kquant(source, dir, num_layers, callbacks)?;
+    attn::write_attn_weights_kquant(source, dir, num_layers, mla_geom.as_ref(), callbacks)?;
     ffn::write_interleaved_ffn_kquant(source, dir, num_layers, opts, callbacks)?;
     moe_layers::write_per_layer_moe_kquant(source, dir, num_layers)?;
     let mut entries = norms::write_norms_and_router(source, dir, num_layers)?;

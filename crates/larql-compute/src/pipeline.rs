@@ -309,6 +309,12 @@ pub struct MoeRoutingPolicy {
     pub selected_weight: MoeTopKWeightPolicy,
     pub expert_scale: MoeExpertScalePolicy,
     pub post_expert_norm: MoePostExpertNormPolicy,
+    /// DS-V3 aux-loss-free grouped routing: number of expert groups.
+    /// 0 disables grouping (standard global top-K softmax).
+    pub n_group: usize,
+    /// DS-V3 aux-loss-free grouped routing: experts per group (in-group top-K).
+    /// 0 disables grouping.
+    pub topk_group: usize,
 }
 
 impl MoeRoutingPolicy {
@@ -324,6 +330,8 @@ impl MoeRoutingPolicy {
             selected_weight: MoeTopKWeightPolicy::RenormalizedSoftmax,
             expert_scale: MoeExpertScalePolicy::PerExpert,
             post_expert_norm: MoePostExpertNormPolicy::RmsNorm,
+            n_group: 0,
+            topk_group: 0,
         }
     }
 
@@ -338,7 +346,32 @@ impl MoeRoutingPolicy {
             selected_weight: MoeTopKWeightPolicy::RawSoftmax,
             expert_scale: MoeExpertScalePolicy::None,
             post_expert_norm: MoePostExpertNormPolicy::None,
+            n_group: 0,
+            topk_group: 0,
         }
+    }
+
+    /// DS-V3 aux-loss-free grouped routing: conventional sparse-MoE input
+    /// source and weight policy, plus the two-level softmax (in-group top-K
+    /// then inter-group top-K) parameters. `n_group` experts are split into
+    /// `n_group` groups; the top `topk_group` experts within each group are
+    /// kept, then the global top-K across all surviving experts is selected.
+    pub const fn deepseek_v3_grouped(n_group: usize, topk_group: usize) -> Self {
+        Self {
+            expert_input: MoeInputSource::Residual,
+            router_input: MoeInputSource::Residual,
+            router_norm: MoeRouterNormPolicy::None,
+            selected_weight: MoeTopKWeightPolicy::RenormalizedSoftmax,
+            expert_scale: MoeExpertScalePolicy::None,
+            post_expert_norm: MoePostExpertNormPolicy::None,
+            n_group,
+            topk_group,
+        }
+    }
+
+    /// True when this policy enables DS-V3 two-level grouped routing.
+    pub fn is_grouped(&self) -> bool {
+        self.n_group > 0 && self.topk_group > 0
     }
 }
 

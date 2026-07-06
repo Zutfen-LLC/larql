@@ -100,6 +100,8 @@ mod tests {
             qk_nope_head_dim: None,
             qk_rope_head_dim: None,
             v_head_dim: None,
+            n_group: None,
+            topk_group: None,
             rope_scaling: None,
             attn_logit_softcapping: None,
             final_logit_softcapping: None,

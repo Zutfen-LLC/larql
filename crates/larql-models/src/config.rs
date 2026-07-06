@@ -123,6 +123,11 @@ pub struct ModelConfig {
     pub qk_rope_head_dim: Option<usize>,
     /// DS-V3 MLA: V head dim (may differ from qk_nope+rope total).
     pub v_head_dim: Option<usize>,
+    /// DS-V3 grouped routing: number of expert groups for aux-loss-free
+    /// two-level softmax routing. None (or 0) disables grouping.
+    pub n_group: Option<usize>,
+    /// DS-V3 grouped routing: experts selected per group (in-group top-K).
+    pub topk_group: Option<usize>,
     // RoPE scaling
     pub rope_scaling: Option<RopeScaling>,
     // Softcapping (Gemma2)
@@ -611,6 +616,18 @@ pub trait ModelArchitecture: Send + Sync {
     /// Override in architectures with non-standard routing (e.g., Gemma 4's normalised softmax + per-expert scale).
     fn moe_router_type(&self) -> &str {
         "top_k_softmax"
+    }
+
+    /// DS-V3 aux-loss-free grouped routing: number of expert groups.
+    /// Returns 0 when the architecture does not use grouped routing.
+    fn moe_n_group(&self) -> usize {
+        self.config().n_group.unwrap_or(0)
+    }
+
+    /// DS-V3 aux-loss-free grouped routing: experts per group (in-group top-K).
+    /// Returns 0 when the architecture does not use grouped routing.
+    fn moe_topk_group(&self) -> usize {
+        self.config().topk_group.unwrap_or(0)
     }
 
     /// Expert FFN gate weight key.

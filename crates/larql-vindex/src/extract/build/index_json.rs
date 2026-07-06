@@ -58,6 +58,14 @@ impl<'a> BuildContext<'a> {
                                 None
                             },
                             hybrid: a.is_hybrid_moe(),
+                            n_group: (|| {
+                                let ng = a.moe_n_group();
+                                if ng > 0 { Some(ng) } else { None }
+                            })(),
+                            topk_group: (|| {
+                                let tg = a.moe_topk_group();
+                                if tg > 0 { Some(tg) } else { None }
+                            })(),
                         })
                     } else {
                         None

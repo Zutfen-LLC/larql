@@ -1409,6 +1409,8 @@ fn make_moe_test_vindex_dir(tag: &str) -> std::path::PathBuf {
             router_type: "top_k_softmax".into(),
             moe_intermediate_size: None,
             hybrid: false,
+n_group: None,
+topk_group: None,
         }),
         global_head_dim: None,
         num_global_kv_heads: None,
@@ -1473,6 +1475,8 @@ fn make_moe_test_vindex_dir(tag: &str) -> std::path::PathBuf {
                 router_type: "top_k_softmax".into(),
                 moe_intermediate_size: None,
                 hybrid: false,
+n_group: None,
+topk_group: None,
             });
         }
         std::fs::write(&index_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
