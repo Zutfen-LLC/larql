@@ -103,6 +103,42 @@ impl ModelArchitecture for GptOssArch {
         ))
     }
 
-    // Per-expert keys are not available for GPT-OSS (packed format).
-    // Callers should check expert_format() and use packed_* keys instead.
+    // ── Per-expert keys (post-dequant) ──
+    //
+    // The safetensors loader (`load_mxfp4_expert_tensors`) dequantizes the
+    // packed MXFP4 blocks+scales into per-expert f32 tensors and emits them
+    // under Mixtral-style `block_sparse_moe.experts.{E}.{w1,w2,w3}.weight`
+    // keys. Advertising those keys here lets the f32 weight writer's MoE
+    // branch (and the gate-vectors / down_meta build stages) find them via
+    // `source.get_tensor(key)` — unblocking inference/all extract for
+    // GPT-OSS without a native MXFP4 matvec kernel.
+    //
+    // The streaming Q4_K path does NOT use these keys (the raw MXFP4 bytes
+    // are accessed via `get_packed_mxfp4` + the packed_*_blocks/scales keys
+    // and transcoded to Q4_K in `moe_layers.rs`).
+
+    fn expert_ffn_gate_key(&self, layer: usize, expert_id: usize) -> Option<String> {
+        Some(format!(
+            "{}block_sparse_moe.experts.{expert_id}.w1.weight",
+            self.layer_prefix(layer)
+        ))
+    }
+
+    fn expert_ffn_up_key(&self, layer: usize, expert_id: usize) -> Option<String> {
+        Some(format!(
+            "{}block_sparse_moe.experts.{expert_id}.w3.weight",
+            self.layer_prefix(layer)
+        ))
+    }
+
+    fn expert_ffn_down_key(&self, layer: usize, expert_id: usize) -> Option<String> {
+        Some(format!(
+            "{}block_sparse_moe.experts.{expert_id}.w2.weight",
+            self.layer_prefix(layer)
+        ))
+    }
+
+    fn moe_intermediate_size(&self) -> usize {
+        self.config.moe_intermediate_size.unwrap_or(0)
+    }
 }

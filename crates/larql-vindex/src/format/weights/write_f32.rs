@@ -28,6 +28,23 @@ use super::capabilities::{ensure_standard_attention_supported, SURFACE_F32_WEIGH
 use super::mla_absorb::{self, MlaGeometry};
 use larql_models::ModelWeights;
 
+/// Raw MXFP4 packed expert tensor: the block nibbles and the e8m0 scale
+/// bytes for a single `[num_experts, out_features, groups, 16]` blocks
+/// tensor plus its `[num_experts, out_features, groups]` scales companion.
+///
+/// Returned by [`WeightSource::get_packed_mxfp4`] so the weight writer
+/// can dequantize + transcode to Q4_K without the caller re-reading the
+/// safetensors shard. `out_features` for a fused gate_up tensor is
+/// `2 * intermediate`; for a down projection it is `hidden`.
+#[derive(Clone)]
+pub struct Mxfp4Packed {
+    pub blocks: Vec<u8>,
+    pub scales: Vec<u8>,
+    pub num_experts: usize,
+    pub out_features: usize,
+    pub groups: usize,
+}
+
 /// Manifest `kind` discriminators — wire-format strings written into
 /// `weights.json`. Constants exist so writers and the loader's match
 /// arm dispatch on the same source-of-truth. A typo on a constant
@@ -128,6 +145,19 @@ pub trait WeightSource {
     /// Raw BF16 bytes for a packed expert tensor (e.g. Gemma 4 experts.gate_up_proj).
     /// Returns None if the key is absent or the tensor is not BF16.
     fn get_packed_bf16(&self, key: &str) -> Option<Vec<u8>>;
+
+    /// Raw MXFP4 packed expert tensor (GPT-OSS / DeepSeek-V4 fused expert
+    /// weights). `blocks_key` is the U8 nibble tensor key (e.g.
+    /// `layers.L.mlp.experts.gate_up_proj_blocks`); the implementation
+    /// resolves the companion `*_scales` key and returns both byte
+    /// payloads plus the leading three shape dims so the caller can
+    /// dequantize without a shape lookup. Returns `None` when either
+    /// tensor is absent or not U8. Default `None` keeps existing
+    /// `WeightSource` implementors source-compatible.
+    fn get_packed_mxfp4(&self, blocks_key: &str) -> Option<Mxfp4Packed> {
+        let _ = blocks_key;
+        None
+    }
 }
 
 // ── ModelWeights implementation ──
@@ -162,6 +192,12 @@ impl WeightSource for ModelWeights {
     fn get_packed_bf16(&self, key: &str) -> Option<Vec<u8>> {
         self.raw_bytes.get(key).cloned()
     }
+
+    // ModelWeights uses the default `None` get_packed_mxfp4: the build
+    // path dequantizes MXFP4 at safetensors load time (see
+    // loading/safetensors.rs) and does not retain the raw nibble/scale
+    // bytes, so there is nothing packed to hand back. Only the
+    // streaming path (mmap'd safetensors) serves packed MXFP4.
 }
 
 // ── Streaming implementation ──
@@ -251,6 +287,39 @@ impl<'a> WeightSource for StreamingWeights<'a> {
             return None;
         }
         Some(view.data().to_vec())
+    }
+
+    fn get_packed_mxfp4(&self, blocks_key: &str) -> Option<Mxfp4Packed> {
+        // Resolve the *_blocks tensor and its *_scales companion.
+        // GPT-OSS layout:
+        //   blocks: [num_experts, out_features, groups, 16] U8
+        //   scales: [num_experts, out_features, groups]      U8
+        // The scales key is derived by replacing `_blocks` with `_scales`
+        // (matches packed_gate_up_blocks_key / packed_gate_up_scales_key).
+        let scales_key = blocks_key.replace("_blocks", "_scales");
+        let (b_shard, b_name) = self.tensor_index.get(blocks_key)?;
+        let (s_shard, s_name) = self.tensor_index.get(&scales_key)?;
+        let b_st = safetensors::SafeTensors::deserialize(self.shard_mmaps[*b_shard]).ok()?;
+        let s_st = safetensors::SafeTensors::deserialize(self.shard_mmaps[*s_shard]).ok()?;
+        let b_view = b_st.tensor(b_name).ok()?;
+        let s_view = s_st.tensor(s_name).ok()?;
+        if b_view.dtype() != safetensors::Dtype::U8
+            || s_view.dtype() != safetensors::Dtype::U8
+        {
+            return None;
+        }
+        let bshape = b_view.shape();
+        // blocks is 4-D: [num_experts, out_features, groups, 16].
+        if bshape.len() != 4 {
+            return None;
+        }
+        Some(Mxfp4Packed {
+            blocks: b_view.data().to_vec(),
+            scales: s_view.data().to_vec(),
+            num_experts: bshape[0],
+            out_features: bshape[1],
+            groups: bshape[2],
+        })
     }
 }
 

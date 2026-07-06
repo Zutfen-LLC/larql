@@ -93,12 +93,23 @@ fn gpt_oss_attn_keys() {
 }
 
 #[test]
-fn gpt_oss_no_per_expert_keys() {
+fn gpt_oss_per_expert_keys() {
+    // The safetensors loader dequantizes packed MXFP4 into per-expert f32
+    // tensors under Mixtral-style keys; GptOssArch advertises those keys so
+    // the f32 weight writer and gate/down_meta stages can find them.
     let arch = gpt_oss_arch();
-    // PackedMxfp4 doesn't have per-expert keys
-    assert!(arch.expert_ffn_gate_key(0, 0).is_none());
-    assert!(arch.expert_ffn_up_key(0, 0).is_none());
-    assert!(arch.expert_ffn_down_key(0, 0).is_none());
+    assert_eq!(
+        arch.expert_ffn_gate_key(0, 3).unwrap(),
+        "layers.0.block_sparse_moe.experts.3.w1.weight"
+    );
+    assert_eq!(
+        arch.expert_ffn_up_key(0, 3).unwrap(),
+        "layers.0.block_sparse_moe.experts.3.w3.weight"
+    );
+    assert_eq!(
+        arch.expert_ffn_down_key(0, 3).unwrap(),
+        "layers.0.block_sparse_moe.experts.3.w2.weight"
+    );
 }
 
 #[test]
