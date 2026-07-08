@@ -1,16 +1,12 @@
 use larql_inference::ComputeBackendKind;
 
+/// Parse a single backend name.
+///
+/// Thin wrapper over [`ComputeBackendKind::parse`] so the CLI and the
+/// `LARQL_BACKEND` env override share one vocabulary. Case-insensitive,
+/// whitespace-trimmed; accepts `auto|cpu|metal|cuda|vulkan`.
 pub fn parse_backend_kind(raw: &str) -> Result<ComputeBackendKind, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(ComputeBackendKind::Auto),
-        "cpu" => Ok(ComputeBackendKind::Cpu),
-        "metal" => Ok(ComputeBackendKind::Metal),
-        "cuda" => Ok(ComputeBackendKind::Cuda),
-        "vulkan" => Ok(ComputeBackendKind::Vulkan),
-        other => Err(format!(
-            "unknown backend `{other}` (expected one of: auto, cpu, metal, cuda, vulkan)"
-        )),
-    }
+    ComputeBackendKind::parse(raw)
 }
 
 pub fn parse_backend_list(raw: &str) -> Result<Vec<ComputeBackendKind>, String> {

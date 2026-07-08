@@ -88,6 +88,18 @@ pub use larql_compute::cpu::ops::moe::{run_single_expert, run_single_expert_with
 pub use larql_compute::QuantFormat;
 pub use larql_compute::{cpu_backend, default_backend, ComputeBackend};
 
+/// Process-wide override for the `Auto` backend factories. When set to an
+/// explicit backend name (`cpu|metal|cuda|vulkan`), the `Auto` arms of
+/// [`try_compute_backend`] / [`try_engine_backend`] /
+/// [`try_async_engine_backend`] resolve to exactly that backend and fail
+/// loudly if it is unavailable — instead of walking the platform Auto
+/// order. Unset or `auto` preserves the platform default order. Same
+/// vocabulary as the CLI `--backend` flag ([`ComputeBackendKind::parse`]).
+///
+/// Read through `larql_compute`'s env helper so the same thread-local
+/// test override applies (no `std::env::set_var` races in tests).
+pub const ENV_LARQL_BACKEND: &str = "LARQL_BACKEND";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComputeBackendKind {
     Auto,
@@ -107,6 +119,25 @@ impl ComputeBackendKind {
             Self::Vulkan => "vulkan",
         }
     }
+
+    /// Parse a backend name from a raw string (case-insensitive, whitespace
+    /// trimmed). The single source of truth for the backend vocabulary —
+    /// shared by the CLI `--backend` parser and the [`ENV_LARQL_BACKEND`]
+    /// env override so the two can't drift.
+    ///
+    /// Accepts: `auto`, `cpu`, `metal`, `cuda`, `vulkan`.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            "cuda" => Ok(Self::Cuda),
+            "vulkan" => Ok(Self::Vulkan),
+            other => Err(format!(
+                "unknown backend `{other}` (expected one of: auto, cpu, metal, cuda, vulkan)"
+            )),
+        }
+    }
 }
 
 impl std::fmt::Display for ComputeBackendKind {
@@ -117,10 +148,17 @@ impl std::fmt::Display for ComputeBackendKind {
 
 #[derive(Debug)]
 pub enum BackendSelectionError {
+    /// The requested backend exists in the vocabulary but isn't available
+    /// in this build / on this host (e.g. `--backend cuda` without the
+    /// `cuda` feature, or Metal off-macOS).
     Unavailable {
         kind: ComputeBackendKind,
         reason: String,
     },
+    /// A backend name couldn't be parsed — currently only raised by the
+    /// [`ENV_LARQL_BACKEND`] override when it holds a value outside the
+    /// [`ComputeBackendKind::parse`] vocabulary.
+    InvalidEnv { raw: String, reason: String },
 }
 
 impl std::fmt::Display for BackendSelectionError {
@@ -128,6 +166,9 @@ impl std::fmt::Display for BackendSelectionError {
         match self {
             Self::Unavailable { kind, reason } => {
                 write!(f, "backend `{kind}` unavailable: {reason}")
+            }
+            Self::InvalidEnv { raw, reason } => {
+                write!(f, "invalid {ENV_LARQL_BACKEND}=`{raw}`: {reason}")
             }
         }
     }
@@ -173,11 +214,40 @@ fn auto_backend_order() -> &'static [ComputeBackendKind] {
     }
 }
 
+/// What `Auto` should resolve to, honouring the [`ENV_LARQL_BACKEND`]
+/// override.
+///
+/// Returns:
+/// - `Ok(None)` — no override (unset or `auto`); the caller walks the
+///   platform Auto order with its normal CPU fallback.
+/// - `Ok(Some(kind))` — explicit override; the caller MUST try exactly
+///   that backend and NOT fall back, so an unavailable request fails
+///   loudly (matching the CLI `--backend` contract).
+/// - `Err(InvalidEnv)` — override present but unparseable.
+///
+/// Read through `larql_compute`'s env helper so the thread-local test
+/// override applies (no `std::env::set_var` races under parallel tests).
+fn auto_override_kind() -> Result<Option<ComputeBackendKind>, BackendSelectionError> {
+    match larql_compute::options::env_value(ENV_LARQL_BACKEND) {
+        None => Ok(None),
+        Some(raw) => match ComputeBackendKind::parse(&raw) {
+            Ok(ComputeBackendKind::Auto) => Ok(None),
+            Ok(kind) => Ok(Some(kind)),
+            Err(reason) => Err(BackendSelectionError::InvalidEnv { raw, reason }),
+        },
+    }
+}
+
 fn try_compute_backend(
     kind: ComputeBackendKind,
 ) -> Result<Box<dyn larql_compute::ComputeBackend>, BackendSelectionError> {
     match kind {
         ComputeBackendKind::Auto => {
+            // Explicit LARQL_BACKEND override wins and must NOT fall back,
+            // so an unavailable request fails loudly (matches `--backend`).
+            if let Some(kind) = auto_override_kind()? {
+                return try_compute_backend(kind);
+            }
             for candidate in auto_backend_order() {
                 if let Ok(backend) = try_compute_backend(*candidate) {
                     return Ok(backend);
@@ -256,6 +326,9 @@ fn try_engine_backend(
 ) -> Result<Box<dyn EngineBackend>, BackendSelectionError> {
     match kind {
         ComputeBackendKind::Auto => {
+            if let Some(kind) = auto_override_kind()? {
+                return try_engine_backend(kind);
+            }
             for candidate in auto_backend_order() {
                 if let Ok(backend) = try_engine_backend(*candidate) {
                     return Ok(backend);
@@ -334,6 +407,9 @@ fn try_async_engine_backend(
 ) -> Result<Box<dyn AsyncComputeBackend>, BackendSelectionError> {
     match kind {
         ComputeBackendKind::Auto => {
+            if let Some(kind) = auto_override_kind()? {
+                return try_async_engine_backend(kind);
+            }
             for candidate in auto_backend_order() {
                 if let Ok(backend) = try_async_engine_backend(*candidate) {
                     return Ok(backend);
@@ -427,20 +503,46 @@ pub fn async_engine_backend(
 
 /// Default backend as `Box<dyn EngineBackend>`, following
 /// [`ComputeBackendKind::Auto`].
+///
+/// Honours the [`ENV_LARQL_BACKEND`] override. Normal Auto resolution
+/// (override unset/`auto`) stays non-panicking and falls back to CPU when
+/// no GPU backend is available. An explicit-but-invalid or unavailable
+/// override fails loudly here — silently degrading an explicit request to
+/// CPU would violate the CLI contract. Callers that prefer a `Result`
+/// should use [`engine_backend`] directly.
 pub fn default_engine_backend() -> Box<dyn EngineBackend> {
-    engine_backend(ComputeBackendKind::Auto).unwrap_or_else(|_| cpu_engine_backend())
+    match engine_backend(ComputeBackendKind::Auto) {
+        Ok(backend) => backend,
+        Err(err) => panic!(
+            "{ENV_LARQL_BACKEND} override rejected (use `auto` or unset to fall back): {err}"
+        ),
+    }
 }
 
 /// Default async backend as `Box<dyn AsyncComputeBackend>`, following
 /// [`ComputeBackendKind::Auto`].
+///
+/// See [`default_engine_backend`] for the override/failure contract.
 pub fn default_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
-    async_engine_backend(ComputeBackendKind::Auto).unwrap_or_else(|_| cpu_async_engine_backend())
+    match async_engine_backend(ComputeBackendKind::Auto) {
+        Ok(backend) => backend,
+        Err(err) => panic!(
+            "{ENV_LARQL_BACKEND} override rejected (use `auto` or unset to fall back): {err}"
+        ),
+    }
 }
 
 /// Default compute backend as `Box<dyn ComputeBackend>`, following
 /// [`ComputeBackendKind::Auto`].
+///
+/// See [`default_engine_backend`] for the override/failure contract.
 pub fn default_compute_backend() -> Box<dyn larql_compute::ComputeBackend> {
-    compute_backend(ComputeBackendKind::Auto).unwrap_or_else(|_| larql_compute::cpu_backend())
+    match compute_backend(ComputeBackendKind::Auto) {
+        Ok(backend) => backend,
+        Err(err) => panic!(
+            "{ENV_LARQL_BACKEND} override rejected (use `auto` or unset to fall back): {err}"
+        ),
+    }
 }
 
 /// Map a model's activation function to the compute-layer `Activation` enum.
@@ -717,5 +819,206 @@ mod factory_tests {
             activation_from_arch(&*gemma.arch),
             larql_compute::Activation::GeluTanh
         ));
+    }
+}
+
+#[cfg(test)]
+mod backend_env_tests {
+    //! Coverage for [`ENV_LARQL_BACKEND`] parsing and override behavior.
+    //!
+    //! All tests mutate the thread-local env override exposed by
+    //! `larql_compute::options` (NOT `std::env::set_var`, which races the
+    //! concurrent `getenv` that other parallel tests do on the decode path
+    //! and can SIGSEGV libc). The `OverrideGuard` clears the override on
+    //! drop so no cross-test leakage.
+
+    use super::*;
+
+    /// RAII guard that applies a `LARQL_BACKEND` override on the current
+    /// thread and clears it (and any other overrides) on drop.
+    struct OverrideGuard;
+
+    impl OverrideGuard {
+        fn set(value: Option<&str>) -> Self {
+            larql_compute::options::set_env_override(ENV_LARQL_BACKEND, value);
+            OverrideGuard
+        }
+    }
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            larql_compute::options::clear_fast_path_overrides();
+        }
+    }
+
+    // ── ComputeBackendKind::parse ──────────────────────────────────────
+
+    #[test]
+    fn parse_accepts_known_vocab_case_and_whitespace_insensitive() {
+        for (raw, expected) in [
+            ("auto", ComputeBackendKind::Auto),
+            ("cpu", ComputeBackendKind::Cpu),
+            ("metal", ComputeBackendKind::Metal),
+            ("cuda", ComputeBackendKind::Cuda),
+            ("vulkan", ComputeBackendKind::Vulkan),
+        ] {
+            assert_eq!(ComputeBackendKind::parse(raw).unwrap(), expected);
+        }
+        // Mixed case + surrounding whitespace are normalized.
+        assert_eq!(
+            ComputeBackendKind::parse("  CUDA ").unwrap(),
+            ComputeBackendKind::Cuda
+        );
+        assert_eq!(
+            ComputeBackendKind::parse("Metal").unwrap(),
+            ComputeBackendKind::Metal
+        );
+        assert_eq!(
+            ComputeBackendKind::parse("\tVuLkAn\n").unwrap(),
+            ComputeBackendKind::Vulkan
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_vocab_with_clear_message() {
+        let err = ComputeBackendKind::parse("tpu").unwrap_err();
+        assert!(err.contains("unknown backend `tpu`"), "got: {err}");
+        // Message lists the accepted vocabulary so the fix is obvious.
+        for expected in ["auto", "cpu", "metal", "cuda", "vulkan"] {
+            assert!(
+                err.contains(expected),
+                "message should list `{expected}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_empty_string() {
+        let err = ComputeBackendKind::parse("").unwrap_err();
+        assert!(err.contains("unknown backend"), "got: {err}");
+    }
+
+    // ── auto_override_kind ─────────────────────────────────────────────
+
+    #[test]
+    fn auto_override_unset_returns_none() {
+        let _g = OverrideGuard::set(None);
+        assert_eq!(auto_override_kind().unwrap(), None);
+    }
+
+    #[test]
+    fn auto_override_auto_returns_none() {
+        // Both literal and mixed-case `auto` mean "no override".
+        for raw in ["auto", "AUTO", "  Auto  "] {
+            let _g = OverrideGuard::set(Some(raw));
+            assert_eq!(auto_override_kind().unwrap(), None, "raw=`{raw}`");
+        }
+    }
+
+    #[test]
+    fn auto_override_cpu_returns_some_cpu() {
+        let _g = OverrideGuard::set(Some("cpu"));
+        assert_eq!(auto_override_kind().unwrap(), Some(ComputeBackendKind::Cpu));
+    }
+
+    #[test]
+    fn auto_override_metal_returns_some_metal() {
+        let _g = OverrideGuard::set(Some("metal"));
+        assert_eq!(
+            auto_override_kind().unwrap(),
+            Some(ComputeBackendKind::Metal)
+        );
+    }
+
+    #[test]
+    fn auto_override_invalid_returns_invalid_env_error() {
+        let _g = OverrideGuard::set(Some("quantum"));
+        match auto_override_kind() {
+            Err(BackendSelectionError::InvalidEnv { raw, reason }) => {
+                assert_eq!(raw, "quantum");
+                assert!(reason.contains("unknown backend"), "got: {reason}");
+            }
+            other => panic!("expected InvalidEnv, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_env_error_message_names_the_var() {
+        let _g = OverrideGuard::set(Some("nope"));
+        let err = auto_override_kind().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("LARQL_BACKEND"), "got: {msg}");
+        assert!(msg.contains("nope"), "got: {msg}");
+    }
+
+    // ── try_compute_backend(Auto) honors the override ──────────────────
+
+    #[test]
+    fn auto_with_cpu_override_selects_cpu() {
+        let _g = OverrideGuard::set(Some("cpu"));
+        let backend = try_compute_backend(ComputeBackendKind::Auto).expect("cpu via override");
+        assert!(backend.name().starts_with("cpu"));
+    }
+
+    #[test]
+    fn auto_with_invalid_override_errors_instead_of_falling_back() {
+        let _g = OverrideGuard::set(Some("bogus"));
+        match try_compute_backend(ComputeBackendKind::Auto) {
+            Err(BackendSelectionError::InvalidEnv { .. }) => {}
+            Ok(backend) => panic!(
+                "invalid override silently produced backend `{}`",
+                backend.name()
+            ),
+            Err(other) => panic!("expected InvalidEnv, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_with_unavailable_override_does_not_silently_pick_cpu() {
+        // CUDA is gated behind the `cuda` feature. An explicit override to
+        // it must NOT silently degrade to CPU — it must surface Unavailable.
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _g = OverrideGuard::set(Some("cuda"));
+            match try_compute_backend(ComputeBackendKind::Auto) {
+                Err(BackendSelectionError::Unavailable { kind, .. }) => {
+                    assert_eq!(kind, ComputeBackendKind::Cuda);
+                }
+                Ok(backend) => panic!(
+                    "explicit `cuda` override silently fell back to `{}`",
+                    backend.name()
+                ),
+                Err(other) => panic!("expected Unavailable, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn auto_with_no_override_falls_back_to_cpu_safely() {
+        // No override: the platform Auto order must remain non-panicking and
+        // always yield a usable backend (CPU on a GPU-less / no-feature host).
+        let _g = OverrideGuard::set(None);
+        let backend = try_compute_backend(ComputeBackendKind::Auto).expect("auto fallback");
+        assert!(!backend.name().is_empty());
+    }
+
+    // ── default_* panic on bad override, stay quiet otherwise ──────────
+
+    #[test]
+    fn default_compute_backend_quiet_without_override() {
+        let _g = OverrideGuard::set(None);
+        let backend = default_compute_backend();
+        assert!(!backend.name().is_empty());
+    }
+
+    #[test]
+    fn default_compute_backend_panics_on_invalid_override() {
+        let _g = OverrideGuard::set(Some("garbage"));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(default_compute_backend));
+        assert!(
+            result.is_err(),
+            "invalid LARQL_BACKEND override should panic, not silently degrade"
+        );
     }
 }

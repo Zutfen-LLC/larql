@@ -1074,12 +1074,14 @@ fn generate_stream(
     let max_tokens = args.max_tokens;
 
     // Auto-detected compute backend. On macOS with the `gpu` feature
-    // this is Metal; otherwise CPU BLAS. Note the Metal backend has a
-    // FLOP threshold (~500M) below which it stays on CPU — single-token
-    // decode-step matmuls (m=1 × k×n) are ~5-7M FLOP and fall under
-    // that limit, so projections run on CPU BLAS even when Metal is
+    // this is Metal; on other platforms the Auto order tries CUDA → Vulkan
+    // → CPU (see `ComputeBackendKind::Auto`). Note GPU backends typically
+    // have a FLOP threshold (~500M) below which they stay on CPU — single-
+    // token decode-step matmuls (m=1 × k×n) are ~5-7M FLOP and fall under
+    // that limit, so projections run on CPU BLAS even when a GPU backend is
     // available. Real GPU wins require either the Q4K `full_pipeline`
-    // (already wired via `--metal` on Q4K vindexes) or batched decode.
+    // (already wired via a Q4K-capable backend on Q4K vindexes) or batched
+    // decode.
     let backend = larql_inference::default_engine_backend();
     // Captured for the verbose label after `backend` is consumed by the
     // engine builder.

@@ -71,8 +71,9 @@ pub struct BenchArgs {
     pub engine: Option<String>,
 
     /// Route FFN to a remote larql-server for the bench run.
-    /// Attention runs locally on Metal; each layer's FFN is a round trip to
-    /// the URL. Use this to bench the grid path for large models like 31B.
+    /// Attention runs locally on the selected backend; each layer's FFN is a
+    /// round trip to the URL. Use this to bench the grid path for large
+    /// models like 31B.
     /// Example: `--ffn http://127.0.0.1:8080`
     #[arg(long, value_name = "URL")]
     pub ffn: Option<String>,
@@ -124,7 +125,7 @@ pub struct BenchArgs {
     pub moe_dispatch: String,
 
     /// Refinement iterations for `--moe-dispatch batch`.
-    /// 1 = one dispatch + two Metal passes (fast, approximate).
+    /// 1 = one dispatch + two backend passes (fast, approximate).
     /// 2 = two dispatches + three passes (correct answer, ~half the speed).
     #[arg(long, default_value = "2")]
     pub moe_predispatch_iters: usize,
