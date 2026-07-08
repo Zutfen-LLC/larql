@@ -147,6 +147,9 @@ pub fn vindex_to_q4k(
             crate::DownProjFormat::Q6K
         },
         feature_major_down: config.feature_major_down,
+        // `larql convert quantize q4k` is out of scope for IMPORT-002
+        // (CLI `extract --jobs`); stays on the serial path.
+        jobs: 0,
     };
     let mut build_cb = SilentCallbacks;
     write_model_weights_kquant_with_opts(

@@ -22,8 +22,8 @@
 //! fine-grained per-operation breakdown (`fetch`, `pad`, `quantize`,
 //! `write`, `quantize_moe`) with rows / cols / bytes where cheap.
 
-use std::cell::RefCell;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -104,17 +104,22 @@ struct ProfilerInner {
     stages: std::collections::HashMap<String, StageTotal>,
     /// Every timed operation (the raw timeline; aggregated in the report).
     ops: Vec<OpRecord>,
+    /// Resolved `--jobs`/`LARQL_EXTRACT_JOBS` value, if the caller reported
+    /// one via [`ExtractProfiler::set_jobs`]. `None` when extraction never
+    /// set it (e.g. a profiler built directly by a test).
+    jobs: Option<usize>,
 }
 
 /// The profiler. Construct one, thread `Option<&Self>` through writer
 /// functions, then call [`ExtractProfiler::write_json_report`] /
 /// [`ExtractProfiler::print_summary`].
 ///
-/// Uses interior mutability (`RefCell`) so callers pass a shared `&`
-/// reference — single-threaded serial extraction only (thread-safety is
-/// explicitly deferred to the follow-up parallel-extraction slice).
+/// Uses interior mutability (`Mutex`) so callers pass a shared `&`
+/// reference from multiple worker threads during parallel layer
+/// transforms (IMPORT-002); contention is low since each op only holds
+/// the lock long enough to push one small record.
 pub struct ExtractProfiler {
-    inner: RefCell<ProfilerInner>,
+    inner: Mutex<ProfilerInner>,
 }
 
 impl Default for ExtractProfiler {
@@ -132,19 +137,20 @@ impl ExtractProfiler {
             ..Default::default()
         };
         Self {
-            inner: RefCell::new(inner),
+            inner: Mutex::new(inner),
         }
     }
 
     /// (Re)arm the overall extraction timer.
     pub fn mark_start(&self) {
-        self.inner.borrow_mut().start = Some(Instant::now());
+        self.inner.lock().unwrap().start = Some(Instant::now());
     }
 
     /// Total elapsed since [`mark_start`] / [`new`].
     pub fn elapsed(&self) -> Duration {
         self.inner
-            .borrow()
+            .lock()
+            .unwrap()
             .start
             .map(|t| t.elapsed())
             .unwrap_or_default()
@@ -154,15 +160,22 @@ impl ExtractProfiler {
     /// boundaries). Accumulates across calls so a stage split across
     /// sub-phases sums correctly.
     pub fn record_stage(&self, stage: &str, dur: Duration) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap();
         let e = inner.stages.entry(stage.to_string()).or_default();
         e.dur_us += dur.as_secs_f64() * 1e6;
         e.count += 1;
     }
 
-    /// Record one fine-grained operation.
+    /// Record one fine-grained operation. Safe to call concurrently from
+    /// multiple worker threads during parallel layer transforms.
     pub fn record_op(&self, rec: OpRecord) {
-        self.inner.borrow_mut().ops.push(rec);
+        self.inner.lock().unwrap().ops.push(rec);
+    }
+
+    /// Record the resolved `--jobs`/`LARQL_EXTRACT_JOBS` worker count so
+    /// it shows up in the JSON report and stderr summary.
+    pub fn set_jobs(&self, jobs: usize) {
+        self.inner.lock().unwrap().jobs = Some(jobs);
     }
 
     // ── internal: aggregate ──
@@ -192,7 +205,7 @@ impl ExtractProfiler {
 
     /// Write the machine-readable JSON report to `path`.
     pub fn write_json_report(&self, path: &Path) -> Result<(), VindexError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().unwrap();
         let by_op = Self::aggregate_by_op(&inner.ops);
         let top = Self::top_ops(&inner.ops, 20);
 
@@ -263,8 +276,14 @@ impl ExtractProfiler {
             .map(|r| r.rows.saturating_mul(r.cols))
             .sum();
 
+        let elapsed_ms = inner
+            .start
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
         let report = serde_json::json!({
-            "total_extract_ms": self.elapsed().as_secs_f64() * 1000.0,
+            "total_extract_ms": elapsed_ms,
+            "jobs": inner.jobs,
+            "parallel": inner.jobs.is_some_and(|j| j > 1),
             "stages": stages,
             "by_operation": by_operation,
             "top_ops": top_ops,
@@ -285,10 +304,19 @@ impl ExtractProfiler {
     /// Emit a short human-readable summary to stderr — concise enough to
     /// paste into an issue or PR comment.
     pub fn print_summary(&self) {
-        let inner = self.inner.borrow();
-        let total_ms = self.elapsed().as_secs_f64() * 1000.0;
+        let inner = self.inner.lock().unwrap();
+        let total_ms = inner
+            .start
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
         eprintln!("\n── Extract profile ──");
         eprintln!("  Total: {:.1}s", total_ms / 1000.0);
+        if let Some(jobs) = inner.jobs {
+            eprintln!(
+                "  Jobs: {jobs} ({})",
+                if jobs > 1 { "parallel" } else { "serial" }
+            );
+        }
 
         // Stage totals (sorted desc).
         let mut stages: Vec<(&String, &StageTotal)> = inner.stages.iter().collect();
@@ -530,7 +558,7 @@ mod tests {
         let rec = Recorder::from(Some(&prof));
         let t = rec.now();
         rec.quantize_moe(t, "moe_kquant", "quantize_moe_entries", Some(1), 2048, 768);
-        let inner = prof.inner.borrow();
+        let inner = prof.inner.lock().unwrap();
         assert_eq!(inner.ops.len(), 1);
         assert_eq!(inner.ops[0].op, "quantize_moe");
         assert_eq!(inner.ops[0].rows, 2048);
@@ -544,7 +572,7 @@ mod tests {
         let rec = Recorder::from(Some(&prof));
         let t = rec.now();
         rec.pad(t, "attn_kquant", "Q", Some(0), 200, 256);
-        let inner = prof.inner.borrow();
+        let inner = prof.inner.lock().unwrap();
         assert_eq!(inner.ops.len(), 1);
         assert_eq!(inner.ops[0].op, "pad");
         assert_eq!(inner.ops[0].padded_cols, 256);
@@ -604,7 +632,7 @@ mod tests {
         let t = rec.now();
         rec.quantize(t, "attn_kquant", "Q", Some(0), "Q4_K", 8, 144);
 
-        let inner = prof.inner.borrow();
+        let inner = prof.inner.lock().unwrap();
         assert_eq!(inner.ops.len(), 2);
         assert_eq!(inner.ops[0].op, "fetch");
         assert_eq!(inner.ops[0].stage, "attn_kquant");
@@ -625,7 +653,7 @@ mod tests {
         prof.record_stage("attn_kquant", Duration::from_micros(200));
         prof.record_stage("ffn_kquant", Duration::from_micros(500));
 
-        let inner = prof.inner.borrow();
+        let inner = prof.inner.lock().unwrap();
         assert!((inner.stages["attn_kquant"].dur_us - 300.0).abs() < 0.1);
         assert_eq!(inner.stages["attn_kquant"].count, 2);
         assert!((inner.stages["ffn_kquant"].dur_us - 500.0).abs() < 0.1);
@@ -668,7 +696,7 @@ mod tests {
                 Duration::from_micros(dur),
             ));
         }
-        let inner = prof.inner.borrow();
+        let inner = prof.inner.lock().unwrap();
         let top = ExtractProfiler::top_ops(&inner.ops, 2);
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].component, "b"); // longest first

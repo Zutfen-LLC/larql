@@ -67,7 +67,14 @@ pub struct WeightEntry {
 ///
 /// Implemented by `ModelWeights` (build path — everything in RAM)
 /// and `StreamingWeights` (streaming path — mmap'd safetensors on demand).
-pub trait WeightSource {
+///
+/// `Sync` supertrait (IMPORT-002): both implementors hold only shared,
+/// read-only state (`HashMap`/`Vec`/`Mmap`/`&dyn ModelArchitecture`, and
+/// `ModelArchitecture: Send + Sync` already) — no `RefCell`, `Rc`, or raw
+/// pointers — so `&dyn WeightSource` can be shared across worker threads
+/// for parallel per-layer transforms without unsafe code. `dyn WeightSource`
+/// automatically inherits `Sync` from this supertrait bound.
+pub trait WeightSource: Sync {
     /// Get a 2D weight tensor by normalized key. Returns (data, rows, cols).
     fn get_tensor(&self, key: &str) -> Option<(Vec<f32>, usize, usize)>;
 
