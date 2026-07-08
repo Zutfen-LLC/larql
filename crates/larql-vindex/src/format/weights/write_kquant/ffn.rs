@@ -12,6 +12,7 @@ use crate::extract::stage_labels::*;
 use crate::format::filenames::*;
 
 use super::super::manifest::Q4kManifestEntry;
+use super::super::profile::Recorder;
 use super::super::write_f32::WeightSource;
 use super::feature_major_down::FeatureMajorDownState;
 use super::{pad_rows_to_block, KquantWriteOptions, QuantBlockFormat};
@@ -28,6 +29,7 @@ pub(super) fn write_interleaved_ffn_kquant(
     num_layers: usize,
     opts: KquantWriteOptions,
     callbacks: &mut dyn IndexBuildCallbacks,
+    rec: &Recorder<'_>,
 ) -> Result<(), VindexError> {
     let arch = source.arch();
     let ff_path = dir.join(INTERLEAVED_KQUANT_BIN);
@@ -61,44 +63,91 @@ pub(super) fn write_interleaved_ffn_kquant(
         .iter()
         .enumerate()
         {
-            if let Some((data, rows, cols)) = source.get_tensor(key) {
-                // Row-pad to 256 so each row aligns to a super-block boundary.
-                // Without this, matrices with `cols % 256 != 0` (e.g. Gemma 4
-                // 26B A4B's down_proj with inner dim 2112) store contiguous
-                // quantisation that every row past row 0 reads wrong. See
-                // `pad_rows_to_block` docs.
-                let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
-                // Gate (i=0) and up (i=1) always Q4_K. Down (i=2) format
-                // is controlled by `opts.down_proj` (Q6_K by default for
-                // llama.cpp compatibility, Q4_K when the caller opts in).
-                let is_down = i == 2;
-                let use_q6 = is_down && opts.down_proj == super::DownProjFormat::Q6K;
-                let q_bytes = if use_q6 {
-                    quantize_q6_k(&padded)
-                } else {
-                    quantize_q4_k(&padded)
-                };
-                let format = if use_q6 {
-                    QuantBlockFormat::Q6K
-                } else {
-                    QuantBlockFormat::Q4K
-                };
-                ff_file.write_all(&q_bytes)?;
-                let length = q_bytes.len() as u64;
-                ff_manifest.push(Q4kManifestEntry {
-                    key: key.clone(),
-                    shape: vec![rows, padded_cols],
-                    format: format.clone(),
-                    offset: ff_offset,
-                    length,
-                });
-                ff_offset += length;
-
-                if is_down {
-                    if let Some(state) = fm_state.as_mut() {
-                        state.append_layer(key.clone(), &padded, rows, padded_cols, format)?;
-                    }
+            let component = ["gate", "up", "down"][i];
+            let t = rec.now();
+            let fetched = source.get_tensor(key);
+            let (data, rows, cols) = match fetched {
+                Some(t) => t,
+                None => {
+                    rec.fetch(t, COMP_FFN_KQUANT, component, Some(layer), 0, 0);
+                    continue;
                 }
+            };
+            rec.fetch(
+                t,
+                COMP_FFN_KQUANT,
+                component,
+                Some(layer),
+                rows as u64,
+                cols as u64,
+            );
+
+            // Row-pad to 256 so each row aligns to a super-block boundary.
+            // Without this, matrices with `cols % 256 != 0` (e.g. Gemma 4
+            // 26B A4B's down_proj with inner dim 2112) store contiguous
+            // quantisation that every row past row 0 reads wrong. See
+            // `pad_rows_to_block` docs.
+            let t = rec.now();
+            let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
+            rec.pad(
+                t,
+                COMP_FFN_KQUANT,
+                component,
+                Some(layer),
+                cols as u64,
+                padded_cols as u64,
+            );
+            let in_elems = (rows * padded_cols) as u64;
+            // Gate (i=0) and up (i=1) always Q4_K. Down (i=2) format
+            // is controlled by `opts.down_proj` (Q6_K by default for
+            // llama.cpp compatibility, Q4_K when the caller opts in).
+            let is_down = i == 2;
+            let use_q6 = is_down && opts.down_proj == super::DownProjFormat::Q6K;
+            let t = rec.now();
+            let q_bytes = if use_q6 {
+                quantize_q6_k(&padded)
+            } else {
+                quantize_q4_k(&padded)
+            };
+            let format = if use_q6 {
+                QuantBlockFormat::Q6K
+            } else {
+                QuantBlockFormat::Q4K
+            };
+            rec.quantize(
+                t,
+                COMP_FFN_KQUANT,
+                component,
+                Some(layer),
+                format.tag(),
+                in_elems,
+                q_bytes.len() as u64,
+            );
+            let t = rec.now();
+            ff_file.write_all(&q_bytes)?;
+            rec.write(
+                t,
+                COMP_FFN_KQUANT,
+                component,
+                Some(layer),
+                q_bytes.len() as u64,
+            );
+            let length = q_bytes.len() as u64;
+            ff_manifest.push(Q4kManifestEntry {
+                key: key.clone(),
+                shape: vec![rows, padded_cols],
+                format: format.clone(),
+                offset: ff_offset,
+                length,
+            });
+            ff_offset += length;
+
+            if is_down {
+                let t = rec.now();
+                if let Some(state) = fm_state.as_mut() {
+                    state.append_layer(key.clone(), &padded, rows, padded_cols, format)?;
+                }
+                rec.write(t, COMP_FFN_KQUANT, "down_fm", Some(layer), 0);
             }
         }
         callbacks.on_layer_done(COMP_FFN_KQUANT, layer, 0.0);
@@ -106,12 +155,16 @@ pub(super) fn write_interleaved_ffn_kquant(
     ff_file.flush()?;
     drop(ff_file);
 
+    let t = rec.now();
     let ff_manifest_json = serde_json::to_string_pretty(&ff_manifest)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(INTERLEAVED_KQUANT_MANIFEST_JSON), ff_manifest_json)?;
+    rec.manifest(t, COMP_FFN_KQUANT, "ffn_manifest");
 
     if let Some(state) = fm_state.take() {
+        let t = rec.now();
         state.finalize(&dir.join(DOWN_FEATURES_KQUANT_MANIFEST_JSON))?;
+        rec.manifest(t, COMP_FFN_KQUANT, "down_fm_finalize");
     }
     Ok(())
 }

@@ -26,6 +26,7 @@ use crate::format::load::load_vindex_config;
 
 use super::capabilities::{ensure_standard_attention_supported, SURFACE_F32_WEIGHT_WRITER};
 use super::mla_absorb::{self, MlaGeometry};
+use super::profile::{ExtractProfiler, Recorder};
 use larql_models::ModelWeights;
 
 /// Manifest `kind` discriminators — wire-format strings written into
@@ -282,18 +283,26 @@ pub fn write_model_weights(
     dir: &Path,
     callbacks: &mut dyn IndexBuildCallbacks,
 ) -> Result<(), VindexError> {
-    write_model_weights_with_opts(source, dir, callbacks, WriteWeightsOptions::default())
+    write_model_weights_with_opts(source, dir, callbacks, WriteWeightsOptions::default(), None)
 }
 
-/// Explicit-options variant of [`write_model_weights`].
+/// Write model weights to split component files.
+///
+/// Works with any `WeightSource`: ModelWeights (build path) or
+/// StreamingWeights (streaming path from mmap'd safetensors).
+///
+/// Pass `profiler = Some(...)` to collect a hotspot profile; `None` is a
+/// no-op (see [`ExtractProfiler`]).
 pub fn write_model_weights_with_opts(
     source: &dyn WeightSource,
     dir: &Path,
     callbacks: &mut dyn IndexBuildCallbacks,
     opts: WriteWeightsOptions,
+    profiler: Option<&ExtractProfiler>,
 ) -> Result<(), VindexError> {
     callbacks.on_stage(STAGE_MODEL_WEIGHTS);
     let start = std::time::Instant::now();
+    let rec = Recorder::from(profiler);
 
     let dtype = load_vindex_config(dir)
         .map(|c| c.dtype)
@@ -441,8 +450,16 @@ pub fn write_model_weights_with_opts(
                     arch.attn_v_key(layer),
                     arch.attn_o_key(layer),
                 ] {
-                    if let Some((data, rows, cols)) = source.get_tensor(key) {
+                    let t = rec.now();
+                    let fetched = source.get_tensor(key);
+                    let (r, c) = fetched
+                        .as_ref()
+                        .map(|(_, r, c)| (*r as u64, *c as u64))
+                        .unwrap_or((0, 0));
+                    rec.fetch(t, COMP_ATTN_WEIGHTS, key, Some(layer), r, c);
+                    if let Some((data, rows, cols)) = fetched {
                         let len = write_floats(&mut attn_file, &data, dtype)?;
+                        rec.write(rec.now(), COMP_ATTN_WEIGHTS, key, Some(layer), len);
                         entries.push(WeightEntry {
                             key: key.clone(),
                             kind: kind::TENSOR.into(),
@@ -558,8 +575,16 @@ pub fn write_model_weights_with_opts(
                 }
             } else {
                 let up_key = arch.ffn_up_key(layer);
-                if let Some((data, rows, cols)) = source.get_tensor(&up_key) {
+                let t = rec.now();
+                let up_fetched = source.get_tensor(&up_key);
+                let (ur, uc) = up_fetched
+                    .as_ref()
+                    .map(|(_, r, c)| (*r as u64, *c as u64))
+                    .unwrap_or((0, 0));
+                rec.fetch(t, COMP_UP_DOWN_WEIGHTS, &up_key, Some(layer), ur, uc);
+                if let Some((data, rows, cols)) = up_fetched {
                     let len = write_floats(&mut up_file, &data, dtype)?;
+                    rec.write(rec.now(), COMP_UP_DOWN_WEIGHTS, &up_key, Some(layer), len);
                     entries.push(WeightEntry {
                         key: up_key,
                         kind: kind::TENSOR.into(),
@@ -572,8 +597,16 @@ pub fn write_model_weights_with_opts(
                 }
 
                 let down_key = arch.ffn_down_key(layer);
-                if let Some((data, rows, cols)) = source.get_tensor(&down_key) {
+                let t = rec.now();
+                let down_fetched = source.get_tensor(&down_key);
+                let (dr, dc) = down_fetched
+                    .as_ref()
+                    .map(|(_, r, c)| (*r as u64, *c as u64))
+                    .unwrap_or((0, 0));
+                rec.fetch(t, COMP_UP_DOWN_WEIGHTS, &down_key, Some(layer), dr, dc);
+                if let Some((data, rows, cols)) = down_fetched {
                     let len = write_floats(&mut down_file, &data, dtype)?;
+                    rec.write(rec.now(), COMP_UP_DOWN_WEIGHTS, &down_key, Some(layer), len);
                     entries.push(WeightEntry {
                         key: down_key,
                         kind: kind::TENSOR.into(),
@@ -716,7 +749,7 @@ pub fn write_model_weights_with_opts(
     // tensors the inference path expects in weights.tensors. Before
     // this, `larql extract --quant none` against E4B silently produced
     // a vindex with zero PLE entries → garbage INFER output (#49).
-    super::ple_sidecar::write_ple_weights(source, dir, num_layers, &mut entries)?;
+    super::ple_sidecar::write_ple_weights(source, dir, num_layers, &mut entries, &rec)?;
 
     // ── LM Head ── (skipped when level < Inference)
     if write_lm_head {
@@ -735,6 +768,7 @@ pub fn write_model_weights_with_opts(
     }
 
     // ── Manifest ──
+    let mani_start = rec.now();
     let manifest_json =
         serde_json::to_string_pretty(&entries).map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(WEIGHT_MANIFEST_JSON), manifest_json)?;
@@ -752,7 +786,9 @@ pub fn write_model_weights_with_opts(
     let config_json =
         serde_json::to_string_pretty(&config).map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(&config_path, config_json)?;
+    rec.manifest(mani_start, STAGE_MODEL_WEIGHTS, "manifest_index");
 
+    rec.stage(STAGE_MODEL_WEIGHTS, Some(start));
     callbacks.on_stage_done(STAGE_MODEL_WEIGHTS, start.elapsed().as_secs_f64() * 1000.0);
     Ok(())
 }

@@ -24,6 +24,7 @@ use std::path::Path;
 use crate::error::VindexError;
 use crate::format::filenames::*;
 
+use super::profile::Recorder;
 use super::write_f32::{kind, WeightEntry, WeightSource};
 
 /// Write `ple_weights.bin` and append `tensor_f16` manifest entries
@@ -38,6 +39,7 @@ pub(super) fn write_ple_weights(
     dir: &Path,
     num_layers: usize,
     manifest_entries: &mut Vec<WeightEntry>,
+    rec: &Recorder<'_>,
 ) -> Result<(), VindexError> {
     let arch = source.arch();
     if !arch.has_per_layer_embeddings() {
@@ -52,12 +54,14 @@ pub(super) fn write_ple_weights(
     let write_tensor = |file: &mut BufWriter<std::fs::File>,
                         manifest: &mut Vec<WeightEntry>,
                         offset: &mut u64,
+                        rec: &Recorder<'_>,
                         key: String,
                         data: Option<(Vec<f32>, usize, usize)>|
      -> Result<(), VindexError> {
         if let Some((floats, rows, cols)) = data {
             let bytes = crate::config::dtype::encode_floats(&floats, ple_dtype);
             file.write_all(&bytes)?;
+            rec.write(rec.now(), "ple_sidecar", &key, None, bytes.len() as u64);
             manifest.push(WeightEntry {
                 key,
                 kind: kind::TENSOR_F16.into(),
@@ -72,43 +76,75 @@ pub(super) fn write_ple_weights(
     };
 
     // Global: model projection [ple_dim·num_layers, hidden]
+    let t = rec.now();
+    let proj = source.get_tensor("per_layer_model_projection.weight");
+    let (r, c) = proj
+        .as_ref()
+        .map(|(_, r, c)| (*r as u64, *c as u64))
+        .unwrap_or((0, 0));
+    rec.fetch(t, "ple_sidecar", "per_layer_model_projection", None, r, c);
     write_tensor(
         &mut ple_file,
         manifest_entries,
         &mut ple_offset,
+        rec,
         "per_layer_model_projection.weight".into(),
-        source.get_tensor("per_layer_model_projection.weight"),
+        proj,
     )?;
 
     // Global: big embedding table [vocab, ple_dim·num_layers]
     if let Some(key) = arch.per_layer_embed_key() {
+        let t = rec.now();
+        let data = source.get_tensor(&key);
+        let (r, c) = data
+            .as_ref()
+            .map(|(_, r, c)| (*r as u64, *c as u64))
+            .unwrap_or((0, 0));
+        rec.fetch(t, "ple_sidecar", &key, None, r, c);
         write_tensor(
             &mut ple_file,
             manifest_entries,
             &mut ple_offset,
+            rec,
             key.clone(),
-            source.get_tensor(&key),
+            data,
         )?;
     }
 
     // Per-layer: input_gate + projection
     for layer in 0..num_layers {
         if let Some(k) = arch.per_layer_input_gate_key(layer) {
+            let t = rec.now();
+            let data = source.get_tensor(&k);
+            let (r, c) = data
+                .as_ref()
+                .map(|(_, r, c)| (*r as u64, *c as u64))
+                .unwrap_or((0, 0));
+            rec.fetch(t, "ple_sidecar", &k, Some(layer), r, c);
             write_tensor(
                 &mut ple_file,
                 manifest_entries,
                 &mut ple_offset,
+                rec,
                 k.clone(),
-                source.get_tensor(&k),
+                data,
             )?;
         }
         if let Some(k) = arch.per_layer_projection_key(layer) {
+            let t = rec.now();
+            let data = source.get_tensor(&k);
+            let (r, c) = data
+                .as_ref()
+                .map(|(_, r, c)| (*r as u64, *c as u64))
+                .unwrap_or((0, 0));
+            rec.fetch(t, "ple_sidecar", &k, Some(layer), r, c);
             write_tensor(
                 &mut ple_file,
                 manifest_entries,
                 &mut ple_offset,
+                rec,
                 k.clone(),
-                source.get_tensor(&k),
+                data,
             )?;
         }
     }

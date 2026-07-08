@@ -11,6 +11,7 @@ use crate::extract::stage_labels::*;
 use crate::format::filenames::*;
 
 use super::super::manifest::Q4kManifestEntry;
+use super::super::profile::Recorder;
 use super::super::write_f32::WeightSource;
 use super::{pad_rows_to_block, resolve_v_tensor, QuantBlockFormat};
 
@@ -25,6 +26,7 @@ pub(super) fn write_attn_weights_kquant(
     dir: &Path,
     num_layers: usize,
     callbacks: &mut dyn IndexBuildCallbacks,
+    rec: &Recorder<'_>,
 ) -> Result<(), VindexError> {
     let arch = source.arch();
     let attn_path = dir.join(ATTN_WEIGHTS_KQUANT_BIN);
@@ -42,10 +44,44 @@ pub(super) fn write_attn_weights_kquant(
         let v_key = arch.attn_v_key(layer);
         let o_key = arch.attn_o_key(layer);
 
+        let t = rec.now();
         let q = source.get_tensor(&q_key);
+        rec.fetch(
+            t,
+            COMP_ATTN_KQUANT,
+            "Q",
+            Some(layer),
+            rows_of(&q),
+            cols_of(&q),
+        );
+
+        let t = rec.now();
         let k = source.get_tensor(&k_key);
-        let v = resolve_v_tensor(source.get_tensor(&v_key), &k, arch.v_shares_k(layer));
+        rec.fetch(
+            t,
+            COMP_ATTN_KQUANT,
+            "K",
+            Some(layer),
+            rows_of(&k),
+            cols_of(&k),
+        );
+
+        let t = rec.now();
+        let v_raw = source.get_tensor(&v_key);
+        let (v_rows, v_cols) = (rows_of(&v_raw), cols_of(&v_raw));
+        rec.fetch(t, COMP_ATTN_KQUANT, "V", Some(layer), v_rows, v_cols);
+        let v = resolve_v_tensor(v_raw, &k, arch.v_shares_k(layer));
+
+        let t = rec.now();
         let o = source.get_tensor(&o_key);
+        rec.fetch(
+            t,
+            COMP_ATTN_KQUANT,
+            "O",
+            Some(layer),
+            rows_of(&o),
+            cols_of(&o),
+        );
 
         // Q, K, V, O in that order — use the same key string for V even when
         // the data is K's, so loaders that look up by position still work.
@@ -65,12 +101,24 @@ pub(super) fn write_attn_weights_kquant(
 
             // V (index 2) gets Q6_K, others get Q4_K.
             let is_v = i == 2;
+            let component = ["Q", "K", "V", "O"][i];
             // Row-pad to 256 so each row aligns to a super-block boundary.
             // Critical for models with non-256 inner dims (e.g. Gemma 4 26B A4B
             // where the dense intermediate is 2112). `padded_cols` is what the
             // matvec shader must use as `K`; callers also need to zero-pad the
             // input vector to the same width.
+            let t = rec.now();
             let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
+            rec.pad(
+                t,
+                COMP_ATTN_KQUANT,
+                component,
+                Some(layer),
+                cols as u64,
+                padded_cols as u64,
+            );
+            let in_elems = (rows * padded_cols) as u64;
+            let t = rec.now();
             let q_bytes = if is_v {
                 quantize_q6_k(&padded)
             } else {
@@ -81,8 +129,25 @@ pub(super) fn write_attn_weights_kquant(
             } else {
                 QuantBlockFormat::Q4K
             };
+            rec.quantize(
+                t,
+                COMP_ATTN_KQUANT,
+                component,
+                Some(layer),
+                format.tag(),
+                in_elems,
+                q_bytes.len() as u64,
+            );
 
+            let t = rec.now();
             attn_file.write_all(&q_bytes)?;
+            rec.write(
+                t,
+                COMP_ATTN_KQUANT,
+                component,
+                Some(layer),
+                q_bytes.len() as u64,
+            );
             let length = q_bytes.len() as u64;
             attn_manifest.push(Q4kManifestEntry {
                 key: key.to_string(),
@@ -99,8 +164,18 @@ pub(super) fn write_attn_weights_kquant(
     attn_file.flush()?;
     drop(attn_file);
 
+    let t = rec.now();
     let manifest_json = serde_json::to_string_pretty(&attn_manifest)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(ATTN_WEIGHTS_KQUANT_MANIFEST_JSON), manifest_json)?;
+    rec.manifest(t, COMP_ATTN_KQUANT, "attn_manifest");
     Ok(())
+}
+
+fn rows_of(t: &Option<(Vec<f32>, usize, usize)>) -> u64 {
+    t.as_ref().map(|(_, r, _)| *r as u64).unwrap_or(0)
+}
+
+fn cols_of(t: &Option<(Vec<f32>, usize, usize)>) -> u64 {
+    t.as_ref().map(|(_, _, c)| *c as u64).unwrap_or(0)
 }

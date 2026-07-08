@@ -20,6 +20,7 @@ use crate::error::VindexError;
 use crate::extract::callbacks::IndexBuildCallbacks;
 use crate::extract::stage_labels::*;
 use crate::format::filenames::*;
+use crate::format::weights::ExtractProfiler;
 
 use super::tensor_io::{normalize_key, GgufTensorSource, MmapShard, TensorSource};
 
@@ -44,6 +45,10 @@ pub(super) struct StreamingContext<'a> {
     /// explode. `0` = full per-expert features. Threaded from
     /// `--summary-features-per-expert` (was an env side-channel).
     pub(super) summary_features_per_expert: usize,
+
+    /// Optional extraction profiler — `None` when profiling is disabled.
+    /// Threaded into the model-weight writers; never changes emitted bytes.
+    pub(super) profiler: Option<&'a ExtractProfiler>,
 
     // Architecture (owned, set in `new`)
     pub(super) arch: Box<dyn larql_models::ModelArchitecture>,
@@ -92,6 +97,7 @@ impl<'a> StreamingContext<'a> {
         q4k_opts: crate::format::weights::KquantWriteOptions,
         drop_gate_vectors: bool,
         callbacks: &'a mut dyn IndexBuildCallbacks,
+        profiler: Option<&'a ExtractProfiler>,
     ) -> Result<Self, VindexError> {
         let cfg = arch.config();
         let num_layers = cfg.num_layers;
@@ -209,6 +215,7 @@ impl<'a> StreamingContext<'a> {
             extract_level,
             down_top_k,
             summary_features_per_expert,
+            profiler,
             arch,
             prefixes,
             num_layers,

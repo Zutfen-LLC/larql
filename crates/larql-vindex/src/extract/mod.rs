@@ -18,4 +18,4 @@ pub use build_from_vectors::build_vindex_from_vectors;
 pub use callbacks::{IndexBuildCallbacks, SilentBuildCallbacks};
 pub use checkpoint::{Checkpoint, ExtractPhase, CHECKPOINT_FILE};
 pub use metadata::{snapshot_hf_metadata, SNAPSHOT_FILES};
-pub use streaming::build_vindex_streaming;
+pub use streaming::{build_vindex_streaming, build_vindex_streaming_profiled};

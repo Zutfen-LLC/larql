@@ -109,6 +109,13 @@ pub struct ExtractIndexArgs {
     /// Skip stages that already have output files (resume interrupted builds).
     #[arg(long)]
     resume: bool,
+
+    /// Profile extraction wall-clock and write `extract_profile.json` +
+    /// a concise stderr hotspot summary. Opt-in; disabled by default (no
+    /// output change, no profile file). Also enabled by
+    /// `LARQL_EXTRACT_PROFILE=1`.
+    #[arg(long)]
+    profile_extract: bool,
 }
 
 fn parse_quant(s: &str) -> Result<larql_vindex::QuantFormat, String> {
@@ -202,6 +209,15 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut callbacks = CliBuildCallbacks::new();
     let build_start = Instant::now();
 
+    // Profiling is enabled by `--profile-extract` OR `LARQL_EXTRACT_PROFILE=1`.
+    let profile_enabled =
+        args.profile_extract || std::env::var("LARQL_EXTRACT_PROFILE").as_deref() == Ok("1");
+    let profiler = if profile_enabled {
+        Some(larql_vindex::ExtractProfiler::new())
+    } else {
+        None
+    };
+
     // Resolve extract level: --include-weights upgrades to All (backwards compat)
     let level = if args.include_weights {
         larql_vindex::ExtractLevel::All
@@ -252,6 +268,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &args.output,
                 &mut callbacks,
                 weight_opts,
+                profiler.as_ref(),
             )?;
         }
     } else {
@@ -425,6 +442,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                             output,
                             &mut callbacks,
                             q4k_opts,
+                            profiler.as_ref(),
                         )?;
                     }
                     larql_vindex::QuantFormat::None => {
@@ -433,6 +451,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                             output,
                             &mut callbacks,
                             weight_opts,
+                            profiler.as_ref(),
                         )?;
                     }
                 }
@@ -447,7 +466,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 model_path.clone()
             };
-            larql_vindex::build_vindex_streaming(
+            larql_vindex::build_vindex_streaming_profiled(
                 &streaming_entry,
                 &tokenizer,
                 model_name,
@@ -461,6 +480,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 q4k_opts,
                 args.drop_gate_vectors,
                 &mut callbacks,
+                profiler.as_ref(),
             )?;
         }
 
@@ -533,6 +553,15 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
         "  Total: {:.2} GB",
         total_size as f64 / (1024.0 * 1024.0 * 1024.0)
     );
+
+    // ── Profile report (only when profiling is enabled) ──
+    if let Some(prof) = &profiler {
+        let report_path = args.output.join("extract_profile.json");
+        if let Err(e) = prof.write_json_report(&report_path) {
+            eprintln!("  warning: failed to write extract_profile.json: {e}");
+        }
+        prof.print_summary();
+    }
 
     eprintln!("\nUsage:");
     eprintln!(
