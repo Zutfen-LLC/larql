@@ -35,10 +35,18 @@
 //! the KV cache, so a single backend reused across two vindex loads for browse
 //! could read the prior model's cached weights at a recycled address. Reusing a
 //! backend across vindex weight sets is therefore the caller's responsibility:
-//! call `CudaBackend::flush_weight_cache()` at the vindex-rebind boundary. The
-//! per-`reset_kv_cache` flush still captures the dominant reuse win (weights
-//! uploaded during prefill's projections are reused across every decode token
-//! of that generation).
+//! call `ComputeBackend::flush_weight_cache()` (or `CudaBackend::flush_weight_cache()`)
+//! at the vindex-rebind boundary. The per-`reset_kv_cache` flush still captures
+//! the dominant reuse win (weights uploaded during prefill's projections are
+//! reused across every decode token of that generation).
+//!
+//! The hook is a default no-op on `ComputeBackend`, so CPU/Metal/Vulkan scaffold
+//! backends and the CUDA no-runtime scaffold are behaviour-preserving — a long-
+//! lived browse path can call it unconditionally. As of this writing no code path
+//! reuses a backend across vindex loads (every backend is single-vindex-scoped,
+//! dropped before a second vindex can recycle an mmap address), so no caller
+//! needs the flush today; the trait hook exists so a future long-lived backend
+//! pool can rebind without downcasting.
 //!
 //! ## What this is NOT
 //!

@@ -279,20 +279,13 @@ impl DecodeBackend for CudaBackend {
         for (k_cache, v_cache) in kv.iter_mut() {
             let prev = k_cache.shape()[0];
             if len < prev {
-                // Rebuild the prefix slice (Array2 has no in-place row
-                // truncate; the per-step decode rebuild already pays this
-                // shape, and truncate is rare — only iterative predispatch).
-                let kv_dim = k_cache.shape()[1];
-                let mut k_new = Array2::zeros((len, kv_dim));
-                let mut v_new = Array2::zeros((len, kv_dim));
-                k_new
-                    .slice_mut(ndarray::s![..len, ..])
-                    .assign(&k_cache.slice(ndarray::s![..len, ..]));
-                v_new
-                    .slice_mut(ndarray::s![..len, ..])
-                    .assign(&v_cache.slice(ndarray::s![..len, ..]));
-                *k_cache = k_new;
-                *v_cache = v_new;
+                // Take ownership of the prefix slice in one allocation. Array2
+                // has no in-place row truncate; the per-step decode rebuild
+                // already pays this shape, and truncate is rare (only iterative
+                // predispatch). `to_owned()` does one copy instead of the old
+                // zero-init + slice-assign double write.
+                *k_cache = k_cache.slice(ndarray::s![..len, ..]).to_owned();
+                *v_cache = v_cache.slice(ndarray::s![..len, ..]).to_owned();
             }
         }
     }
@@ -490,5 +483,15 @@ impl ComputeBackend for CudaBackend {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Reachable through `&dyn ComputeBackend` / `Box<dyn ComputeBackend>` so a
+    /// long-lived browse path can clear the address-keyed weight cache at a
+    /// vindex-rebind boundary without downcasting to `CudaBackend`. Delegates to
+    /// the inherent `CudaBackend::flush_weight_cache` (fully-qualified so there
+    /// is no ambiguity with this trait method). Safe on the no-runtime scaffold
+    /// path, where it is a no-op (`runtime` is `None`).
+    fn flush_weight_cache(&self) {
+        CudaBackend::flush_weight_cache(self);
     }
 }

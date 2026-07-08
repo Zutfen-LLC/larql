@@ -654,6 +654,12 @@ impl CudaBackend {
     /// `larql-vindex` DESCRIBE/WALK/SELECT) never resets the KV cache, so a
     /// backend handed a second vindex for browse must flush at the rebind
     /// boundary.
+    ///
+    /// Reachable through `ComputeBackend::flush_weight_cache` (the trait's
+    /// default no-op dispatches here for CUDA; CPU/Metal/Vulkan scaffold are
+    /// no-op), so a long-lived browse path can flush via `&dyn ComputeBackend`
+    /// without downcasting. As of this writing no code path reuses a backend
+    /// across vindex loads, so this is a forward-looking escape hatch.
     pub fn flush_weight_cache(&self) {
         if let Some(runtime) = self.runtime.as_ref() {
             runtime.flush_weight_cache();
