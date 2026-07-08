@@ -94,7 +94,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
+          # `rust:1-bookworm` maps to Debian 12 in GitHub's Python toolcache.
+          # Python 3.12 isn't currently published there, but the repo only
+          # requires >=3.11 for the HF scoring scripts and Python bindings.
+          python-version: '3.11'
 
       - name: Install HF reference scorer deps
         run: |
