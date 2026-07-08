@@ -2204,6 +2204,7 @@ dependencies = [
  "larql-compute",
  "larql-models",
  "ndarray",
+ "sha2",
 ]
 
 [[package]]

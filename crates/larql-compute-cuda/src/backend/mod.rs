@@ -216,14 +216,44 @@ impl CudaBackend {
         self.runtime.as_ref()
     }
 
-    /// Snapshot the persistent weight-cache hit/miss counters. `None` on the
-    /// scaffold path (no runtime / no device); the counts are always zero
-    /// there since no weights are ever uploaded.
-    #[cfg(test)]
+    /// Snapshot the persistent weight-cache hit/miss counters and resident-byte
+    /// footprint. `None` on the scaffold path (no runtime / no device); the
+    /// counts are always zero there since no weights are ever uploaded.
+    /// Release-visible so the `LARQL_GPU_DIAG` diagnostic surface can read it
+    /// from a release build.
     pub(crate) fn weight_cache_stats(&self) -> Option<crate::weight_cache::CacheStats> {
         self.runtime
             .as_ref()
             .map(|runtime| runtime.weight_cache_stats())
+    }
+
+    /// A one-line diagnostic string for the current weight-cache state (hit /
+    /// miss counters + resident byte footprint), or `None` on the scaffold
+    /// path (no runtime). Surfaced through `device_info()` when
+    /// `LARQL_GPU_DIAG` is set; otherwise this method is still callable but
+    /// produces no default output.
+    pub fn weight_cache_diag(&self) -> Option<String> {
+        let s = self.weight_cache_stats()?;
+        // Hit rate over the union of byte + float lookups (cumulative, so a
+        // fresh backend reads 0/0 → reported as "n/a" rather than 100%).
+        let total = s.bytes_hits + s.bytes_misses + s.float_hits + s.float_misses;
+        let hit_rate = if total == 0 {
+            "n/a".to_string()
+        } else {
+            let hits = s.bytes_hits + s.float_hits;
+            format!("{:.1}%", (hits as f64 / total as f64) * 100.0)
+        };
+        Some(format!(
+            "cuda weight cache: bytes hit/miss={}/{}, float hit/miss={}/{}, hit_rate={}, resident={} bytes ({} u8 + {} f32 buffers)",
+            s.bytes_hits,
+            s.bytes_misses,
+            s.float_hits,
+            s.float_misses,
+            hit_rate,
+            s.cached_bytes,
+            s.cached_u8_buffers,
+            s.cached_f32_buffers,
+        ))
     }
 
     /// Native RMSNorm (body norm) — the device twin of

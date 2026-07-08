@@ -42,20 +42,34 @@ hole for long-lived server processes.
 
 ## 2. CUDA-specific (all cheap, all pay off the moment hardware validation starts)
 
-### 2.1 On-disk PTX cache — **S**
+> **Status (2026-07-08): 2.1–2.4 implemented (slice GPU-001).** No-hardware-
+> safe; verified by `cargo test -p larql-compute-cuda` (138 tests, all green
+> without CUDA). The seven env-tunable gates and the `LARQL_GPU_DIAG` diag
+> surface are documented in `crates/larql-compute-cuda/src/options.rs`.
+
+### 2.1 On-disk PTX cache — **S** — *done*
 `CudaRuntime` NVRTC-compiles the combined 20-kernel module on every process
 start. Cache the PTX in `$XDG_CACHE_HOME/larql/` keyed on a hash of the source
 string + cudarc version; NVRTC compile of a module this size is typically
 hundreds of ms — pure startup latency win for every `larql run`/`bench`.
 
-### 2.2 Compile for the actual device arch — **XS**
+Implemented in `crates/larql-compute-cuda/src/ptx_cache.rs`: key = SHA-256 of
+cache-format version + arch + `fmad` policy + combined source; stored as
+`cuda-<hex>.ptx`; temp-file + rename atomic write; any I/O failure silently
+falls back to a fresh compile.
+
+### 2.2 Compile for the actual device arch — **XS** — *done*
 `CompileOptions { fmad: Some(false), ..default }` doesn't set an arch, so NVRTC
 targets its default compute capability and the driver JITs the PTX. Query the
 device's compute capability from cudarc and pass `arch` — better SASS, and it
 surfaces "kernel uses features your GPU lacks" at compile time instead of
 launch time.
 
-### 2.3 Env-tunable native-path gates — **XS**
+Implemented in `backend/runtime.rs::compile_or_load_module`: arch =
+`compute_{major}{minor}` from the device's `compute_capability()`; the
+selected target is surfaced in the runtime summary (`NVRTC target compute_XX`).
+
+### 2.3 Env-tunable native-path gates — **XS** — *done*
 Six hardcoded `8192` thresholds (`NORM/ACTIVATION/RESIDUAL/ROPE_NATIVE_MIN_ELEMS`,
 `DECODE/PREFILL_ATTN_NATIVE_MIN_WORK` in `pipeline.rs`) and
 `GEMV_FLOP_THRESHOLD = 500M` were chosen without hardware. Make them
@@ -63,12 +77,29 @@ env-overridable (same `options.rs` resolver pattern, constants stay as
 defaults) so Phase A hardware tuning is measurement, not recompile cycles.
 Metal solved the same problem with runtime calibration — see 4.2.
 
-### 2.4 Release-visible weight-cache/hit-rate stats — **XS**
+Implemented in `options.rs::native_thresholds` (resolved once via `OnceLock`).
+Env vars (defaults in parens): `LARQL_CUDA_NORM_NATIVE_MIN_ELEMS` (8192),
+`LARQL_CUDA_ACTIVATION_NATIVE_MIN_ELEMS` (8192),
+`LARQL_CUDA_RESIDUAL_NATIVE_MIN_ELEMS` (8192),
+`LARQL_CUDA_ROPE_NATIVE_MIN_ELEMS` (8192),
+`LARQL_CUDA_DECODE_ATTN_NATIVE_MIN_WORK` (8192),
+`LARQL_CUDA_PREFILL_ATTN_NATIVE_MIN_WORK` (8192),
+`LARQL_CUDA_GEMV_FLOP_THRESHOLD` (500_000_000). Invalid/empty/zero values
+fall back to the default.
+
+### 2.4 Release-visible weight-cache/hit-rate stats — **XS** — *done*
 The weight cache's atomic hit/miss counters are `#[cfg(test)]`-only. Expose
 them (plus cached-bytes total) behind a `LARQL_GPU_DIAG=1` print or the
 existing diag surface. First thing you'll want on real hardware is "is the
 cache actually hitting, and how much VRAM is it holding" — the counters
 already exist, this is just plumbing.
+
+Implemented: `CacheStats` + `WeightCache::stats` are release-visible and now
+report `cached_bytes` (`Σ u8.len() + Σ f32.len()*4`), `cached_u8_buffers`, and
+`cached_f32_buffers` alongside the hit/miss counters. Surfaced through
+`CudaBackend::device_info()` when `LARQL_GPU_DIAG` is set (presence-as-truth);
+default stays quiet. `CudaBackend::weight_cache_diag()` returns the same string
+programmatically for any caller.
 
 ### 2.5 `truncate_kv_cache` host-mirror copy without zero-init — **XS**
 `trait_impl.rs:273-298` builds `Array2::zeros((len, kv_dim))` then assigns the

@@ -20,6 +20,7 @@ pub mod kv_dispatch_impl;
 pub mod ops;
 pub mod options;
 pub mod pipeline;
+pub mod ptx_cache;
 pub mod trait_impl;
 pub mod weight_cache;
 
