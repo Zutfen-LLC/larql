@@ -50,6 +50,7 @@ use larql_compute::{
 use larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
 use ndarray::Array2;
 
+use crate::options::native_thresholds;
 use crate::CudaBackend;
 
 /// Per-layer host-side KV mirror. `(K_cache, V_cache)` each `[len, kv_dim]`.
@@ -1533,7 +1534,7 @@ impl CudaBackend {
     ///
     /// Returns `None` (caller falls back to the host-only path) when: no
     /// runtime; the work is below the activation gate (`inter <
-    /// ACTIVATION_NATIVE_MIN_ELEMS`); the gate/up/down formats aren't
+    /// LARQL_CUDA_ACTIVATION_NATIVE_MIN_ELEMS`); the gate/up/down formats aren't
     /// Q4_K/Q6_K; the down matrix's stored width is padded beyond `inter; the
     /// input isn't a contiguous `[1, hidden]` row; or the activation/ffn-type
     /// combination isn't one of the native kernels. `Err` from any chained
@@ -1985,13 +1986,15 @@ impl CudaBackend {
     /// enough to amortise it. Tuned conservatively for correctness-first
     /// (the host-orchestrated path is the parity oracle); the fully-fused
     /// single-command-buffer pipeline lifts this gate.
-    const NORM_NATIVE_MIN_ELEMS: usize = 8192;
-
+    ///
+    /// Env-tunable via `LARQL_CUDA_NORM_NATIVE_MIN_ELEMS` (default `8192`,
+    /// resolved once — see [`crate::options::native_thresholds`]).
+    ///
     /// True when a norm of `elems` elements is large enough that the native
     /// CUDA kernel is likely to beat the host reference after the per-call
     /// device round-trip.
     fn native_norm_worthwhile(elems: usize) -> bool {
-        elems >= Self::NORM_NATIVE_MIN_ELEMS
+        elems >= native_thresholds().norm_native_min_elems
     }
 
     /// Minimum element count for a native activation dispatch to be worth the
@@ -1999,14 +2002,16 @@ impl CudaBackend {
     /// round-trip. Below this, the host `apply_activation_*` reference is
     /// faster (the activation output is read straight back to host and
     /// re-uploaded by the down projection, so there's no fusion benefit —
-    /// only transfer+sync overhead). Mirrors `NORM_NATIVE_MIN_ELEMS`.
-    const ACTIVATION_NATIVE_MIN_ELEMS: usize = 8192;
-
+    /// only transfer+sync overhead). Mirrors the norm gate.
+    ///
+    /// Env-tunable via `LARQL_CUDA_ACTIVATION_NATIVE_MIN_ELEMS` (default
+    /// `8192`).
+    ///
     /// True when an activation of `elems` elements is large enough that the
     /// native CUDA kernel is likely to beat the host reference after the
     /// per-call device round-trip.
     fn native_activation_worthwhile(elems: usize) -> bool {
-        elems >= Self::ACTIVATION_NATIVE_MIN_ELEMS
+        elems >= native_thresholds().activation_native_min_elems
     }
 
     /// Minimum element count for a native residual add to be worth the
@@ -2014,19 +2019,21 @@ impl CudaBackend {
     /// round-trip. Below this, the host `h + b_scale * x` reference is faster
     /// (the residual output is read straight back to host and re-uploaded by
     /// the next op, so there's no fusion benefit — only transfer+sync
-    /// overhead). Mirrors `NORM_NATIVE_MIN_ELEMS` / `ACTIVATION_NATIVE_MIN_ELEMS`.
-    /// Tuned conservatively for correctness-first (the host-orchestrated path
-    /// is the parity oracle); the fully-fused single-command-buffer pipeline
-    /// lifts this gate. The decode residual (`[1, hidden]`, ~3-9k elements)
-    /// typically stays below this gate and keeps the host path; the prefill
-    /// residual (`[seq, hidden]`) clears it once `seq * hidden >= 8192`.
-    const RESIDUAL_NATIVE_MIN_ELEMS: usize = 8192;
-
+    /// overhead). Mirrors the norm / activation gates. Tuned conservatively
+    /// for correctness-first (the host-orchestrated path is the parity
+    /// oracle); the fully-fused single-command-buffer pipeline lifts this
+    /// gate. The decode residual (`[1, hidden]`, ~3-9k elements) typically
+    /// stays below this gate and keeps the host path; the prefill residual
+    /// (`[seq, hidden]`) clears it once `seq * hidden >= 8192`.
+    ///
+    /// Env-tunable via `LARQL_CUDA_RESIDUAL_NATIVE_MIN_ELEMS` (default
+    /// `8192`).
+    ///
     /// True when a residual add of `elems` elements is large enough that the
     /// native CUDA kernel is likely to beat the host reference after the
     /// per-call device round-trip.
     fn native_residual_worthwhile(elems: usize) -> bool {
-        elems >= Self::RESIDUAL_NATIVE_MIN_ELEMS
+        elems >= native_thresholds().residual_native_min_elems
     }
 
     /// Minimum element count for a native RoPE dispatch to be worth the
@@ -2034,21 +2041,21 @@ impl CudaBackend {
     /// round-trip. Below this, the host `apply_rope_partial_at_full`
     /// reference is faster (the RoPE output is read straight back to host and
     /// re-uploaded by the attention dispatch, so there's no fusion benefit —
-    /// only transfer+sync overhead). Mirrors `NORM_NATIVE_MIN_ELEMS` /
-    /// `ACTIVATION_NATIVE_MIN_ELEMS` / `RESIDUAL_NATIVE_MIN_ELEMS`. Tuned
-    /// conservatively for correctness-first (the host-orchestrated path is
-    /// the parity oracle); the fully-fused single-command-buffer pipeline
+    /// only transfer+sync overhead). Mirrors the other native-path gates.
+    /// Tuned conservatively for correctness-first (the host-orchestrated path
+    /// is the parity oracle); the fully-fused single-command-buffer pipeline
     /// lifts this gate. The decode Q/K tensor (`[1, q_dim]`, typically a few
     /// thousand elements) often stays below this gate and keeps the host path;
     /// the prefill Q/K tensor (`[seq, q_dim]`) clears it once
     /// `seq * q_dim >= 8192`.
-    const ROPE_NATIVE_MIN_ELEMS: usize = 8192;
-
+    ///
+    /// Env-tunable via `LARQL_CUDA_ROPE_NATIVE_MIN_ELEMS` (default `8192`).
+    ///
     /// True when a RoPE over `elems` elements is large enough that the native
     /// CUDA kernel is likely to beat the host reference after the per-call
     /// device round-trip.
     fn native_rope_worthwhile(elems: usize) -> bool {
-        elems >= Self::ROPE_NATIVE_MIN_ELEMS
+        elems >= native_thresholds().rope_native_min_elems
     }
 
     /// Minimum attention work (num_q × total_len × head_dim) for a native
@@ -2056,24 +2063,26 @@ impl CudaBackend {
     /// launch + sync + device→host readback round-trip. Below this the host
     /// `gqa_attention_decode_step` reference (rayon/spin-pool parallel over
     /// heads) is faster — there's no fusion benefit, only transfer+sync
-    /// overhead, when the context is short. Mirrors the other
-    /// `*_NATIVE_MIN_ELEMS` gates; tuned conservatively for correctness-first
-    /// (the host-orchestrated path is the parity oracle); the fully-fused
-    /// single-command-buffer pipeline lifts this gate.
-    const DECODE_ATTN_NATIVE_MIN_WORK: usize = 8192;
-
+    /// overhead, when the context is short. Mirrors the other native-path
+    /// gates; tuned conservatively for correctness-first (the host-orchestrated
+    /// path is the parity oracle); the fully-fused single-command-buffer
+    /// pipeline lifts this gate.
+    ///
+    /// Env-tunable via `LARQL_CUDA_DECODE_ATTN_NATIVE_MIN_WORK` (default
+    /// `8192`).
+    ///
     /// True when a decode-attention over `work = num_q × total_len × head_dim`
     /// is large enough that the native CUDA kernel is likely to beat the host
     /// reference after the per-call device round-trip.
     fn native_decode_attention_worthwhile(work: usize) -> bool {
-        work >= Self::DECODE_ATTN_NATIVE_MIN_WORK
+        work >= native_thresholds().decode_attn_native_min_work
     }
 
     /// RoPE with split-half pairing — the device twin of
     /// `larql_compute::attention::rope::apply_rope_partial_at_full`. Routes
     /// through the native CUDA `rope` kernel when a runtime is present AND
     /// the tensor is large enough to amortise the device round-trip (see
-    /// `ROPE_NATIVE_MIN_ELEMS`); falls back to the host reference on
+    /// `LARQL_CUDA_ROPE_NATIVE_MIN_ELEMS`); falls back to the host reference on
     /// `Ok(false)`/`Err`, non-contiguous views, or small inputs.
     ///
     /// The `inv_freq[half_rotary]` frequency array is built via the shared
@@ -2141,7 +2150,7 @@ impl CudaBackend {
     /// `gqa_attention_decode_step`. Routes through the native CUDA
     /// `decode_attention` kernel when a runtime is present AND the attention
     /// work (`num_q × total_len × head_dim`) is large enough to amortise the
-    /// device round-trip (see `DECODE_ATTN_NATIVE_MIN_WORK`); falls back to the
+    /// device round-trip (see `LARQL_CUDA_DECODE_ATTN_NATIVE_MIN_WORK`); falls back to the
     /// host reference on `Ok(false)`/`Err`, non-contiguous Q/K/V views, or
     /// short contexts. `q` is `[1, num_q * head_dim]`; `k_cache`/`v_cache` are
     /// `[total_len, kv_dim]`. Returns `[1, num_q * head_dim]`.
@@ -2200,22 +2209,24 @@ impl CudaBackend {
     /// conservatively for correctness-first (the host-orchestrated path is
     /// the parity oracle); the fully-fused single-command-buffer pipeline
     /// lifts this gate.
-    const PREFILL_ATTN_NATIVE_MIN_WORK: usize = 8192;
-
+    ///
+    /// Env-tunable via `LARQL_CUDA_PREFILL_ATTN_NATIVE_MIN_WORK` (default
+    /// `8192`).
+    ///
     /// True when a prefill attention over
     /// `work = seq_len × num_q × seq_len × head_dim` (causal, so ~half the
     /// QKᵀ + all the weighted-V) is large enough that the native CUDA kernel
     /// is likely to beat the host reference after the per-call device
     /// round-trip.
     fn native_prefill_attention_worthwhile(work: usize) -> bool {
-        work >= Self::PREFILL_ATTN_NATIVE_MIN_WORK
+        work >= native_thresholds().prefill_attn_native_min_work
     }
 
     /// Fused prefill (seq×seq) causal GQA attention — the device twin of
     /// `gqa_attention_with_weights` (the symmetric `gqa_attention_capture`
     /// path). Routes through the native CUDA `prefill_attention` kernel when a
     /// runtime is present AND the attention work is large enough to amortise
-    /// the device round-trip (see `PREFILL_ATTN_NATIVE_MIN_WORK`); falls back
+    /// the device round-trip (see `LARQL_CUDA_PREFILL_ATTN_NATIVE_MIN_WORK`); falls back
     /// to the host reference on `Ok(false)`/`Err`, non-contiguous Q/K/V views,
     /// or short prompts. `q` is `[seq, num_q * head_dim]`; `k`/`v` are
     /// `[seq, kv_dim]`. Returns `[seq, num_q * head_dim]`.
@@ -2353,7 +2364,7 @@ impl CudaBackend {
     /// RMSNorm or LayerNorm for a `[rows, cols]` array using a `&[f32]`
     /// weight. Routes the RmsNorm arm through the native CUDA `rms_norm`
     /// kernel when a runtime is present AND the norm is large enough to
-    /// amortise the device round-trip (see `NORM_NATIVE_MIN_ELEMS`); falls
+    /// amortise the device round-trip (see `LARQL_CUDA_NORM_NATIVE_MIN_ELEMS`); falls
     /// back to the host reference on `Ok(false)`/`Err`, non-contiguous views,
     /// or small norms. `weight` must be `Some` (the `None`-weight pre-ffn
     /// path uses `norm_2d_no_weight`).

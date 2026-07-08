@@ -85,8 +85,8 @@ impl WeightKey {
     }
 
     /// Element count used for the key (bytes for the byte map, f32s for the
-    /// float map). Exposed for tests.
-    #[cfg(test)]
+    /// float map). Exposed so the cache-size accounting in [`WeightCache::stats`]
+    /// can sum the resident byte footprint.
     pub(crate) fn len(self) -> usize {
         self.len
     }
@@ -97,18 +97,29 @@ impl WeightKey {
     }
 }
 
-/// Cumulative hit/miss counters, surfaced via [`WeightCache::stats`] for tests
-/// and debugging (a runtime-gated test asserts a second launch with the same
-/// weight slice registers a hit and skips the upload). Test-only snapshot —
-/// the live counters are the `AtomicU64`s on [`WeightCache`]; this struct only
-/// exists to return a coherent snapshot from `stats()`.
-#[cfg(test)]
+/// Cumulative hit/miss counters plus the resident-buffer byte footprint,
+/// surfaced via [`WeightCache::stats`] for tests and the `LARQL_GPU_DIAG`
+/// diagnostic surface (see `CudaBackend::weight_cache_diag`).
+///
+/// The hit/miss counters are cumulative across the backend's lifetime (not
+/// reset by a cache flush — see [`WeightCache::flush`]); the byte/buffer
+/// counts are a point-in-time snapshot of what is resident right now. u8
+/// weights count their length directly (bytes); f32 weights count
+/// `len * size_of::<f32>()`. The live counters are the `AtomicU64`s on
+/// [`WeightCache`]; this struct only exists to return a coherent snapshot.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct CacheStats {
     pub(crate) bytes_hits: u64,
     pub(crate) bytes_misses: u64,
     pub(crate) float_hits: u64,
     pub(crate) float_misses: u64,
+    /// Total bytes resident on the device across both typed maps:
+    /// `Σ u8_weight.len() + Σ f32_weight.len() * size_of::<f32>()`.
+    pub(crate) cached_bytes: u64,
+    /// Number of resident u8 (quant / f16) weight buffers.
+    pub(crate) cached_u8_buffers: u64,
+    /// Number of resident f32 (dense) weight buffers.
+    pub(crate) cached_f32_buffers: u64,
 }
 
 /// Persistent device-resident weight cache. Two typed maps (`u8` for quant/f16
@@ -187,15 +198,26 @@ impl WeightCache {
         Ok(dev)
     }
 
-    /// Snapshot the cumulative hit/miss counters (test/diagnostic). Relaxed
-    /// loads are fine — these are observability counters, not synchronisation.
-    #[cfg(test)]
+    /// Snapshot the cumulative hit/miss counters plus the resident-buffer
+    /// byte footprint (test/diagnostic). Relaxed loads + a brief hold of both
+    /// map locks are fine — these are observability counters / a point-in-time
+    /// size read, not a hot path.
     pub(crate) fn stats(&self) -> CacheStats {
+        let (cached_bytes, u8_bufs, f32_bufs) = {
+            let bytes_guard = lock_or_recover(&self.bytes);
+            let floats_guard = lock_or_recover(&self.floats);
+            let byte_lens: Vec<usize> = bytes_guard.keys().map(|k| k.len()).collect();
+            let float_lens: Vec<usize> = floats_guard.keys().map(|k| k.len()).collect();
+            byte_totals(&byte_lens, &float_lens)
+        };
         CacheStats {
             bytes_hits: self.bytes_hits.load(Ordering::Relaxed),
             bytes_misses: self.bytes_misses.load(Ordering::Relaxed),
             float_hits: self.float_hits.load(Ordering::Relaxed),
             float_misses: self.float_misses.load(Ordering::Relaxed),
+            cached_bytes,
+            cached_u8_buffers: u8_bufs,
+            cached_f32_buffers: f32_bufs,
         }
     }
 
@@ -206,18 +228,27 @@ impl WeightCache {
         lock_or_recover(&self.bytes).clear();
         lock_or_recover(&self.floats).clear();
     }
+}
 
-    /// Number of cached byte-weight buffers (test/diagnostic).
-    #[cfg(test)]
-    pub(crate) fn cached_byte_count(&self) -> usize {
-        lock_or_recover(&self.bytes).len()
-    }
-
-    /// Number of cached f32-weight buffers (test/diagnostic).
-    #[cfg(test)]
-    pub(crate) fn cached_float_count(&self) -> usize {
-        lock_or_recover(&self.floats).len()
-    }
+/// Compute the resident byte footprint from per-buffer element counts: u8
+/// weights count their length directly; f32 weights count `len *
+/// size_of::<f32>()`. Pure (no device, no lock) so the accounting formula is
+/// unit-testable without CUDA hardware — the maps are only populated by real
+/// uploads.
+///
+/// Returns `(total_bytes, u8_buffer_count, f32_buffer_count)`.
+fn byte_totals(byte_lens: &[usize], float_lens: &[usize]) -> (u64, u64, u64) {
+    let f32_bytes_each = std::mem::size_of::<f32>() as u64;
+    let u8_bytes: u64 = byte_lens.iter().map(|&l| l as u64).sum();
+    let f32_bytes: u64 = float_lens
+        .iter()
+        .map(|&l| (l as u64) * f32_bytes_each)
+        .sum();
+    (
+        u8_bytes + f32_bytes,
+        byte_lens.len() as u64,
+        float_lens.len() as u64,
+    )
 }
 
 /// Take a mutex guard, recovering from poisoning the same way the KV cache
@@ -283,13 +314,46 @@ mod tests {
         // one cache operation reachable on a no-CUDA host. The full
         // upload/hit path is covered by the runtime-gated tests in lib.rs.
         let cache = WeightCache::default();
-        assert_eq!(cache.cached_byte_count(), 0);
-        assert_eq!(cache.cached_float_count(), 0);
+        let before = cache.stats();
+        assert_eq!(before.cached_u8_buffers, 0);
+        assert_eq!(before.cached_f32_buffers, 0);
+        assert_eq!(before.cached_bytes, 0);
         cache.flush();
-        assert_eq!(cache.cached_byte_count(), 0);
-        assert_eq!(cache.cached_float_count(), 0);
         let stats = cache.stats();
         assert_eq!(stats.bytes_hits, 0);
         assert_eq!(stats.float_hits, 0);
+        assert_eq!(stats.cached_u8_buffers, 0);
+        assert_eq!(stats.cached_f32_buffers, 0);
+        assert_eq!(stats.cached_bytes, 0);
+    }
+
+    #[test]
+    fn byte_totals_counts_u8_as_len_and_f32_times_four() {
+        // u8 weights (quant / f16 byte slices) count their length directly;
+        // f32 weights (dense matrices) count `len * size_of::<f32>()` (4).
+        // Pure accounting — runs without CUDA hardware (the maps are only
+        // populated by real uploads).
+        let (bytes, u8_n, f32_n) = byte_totals(&[100, 256], &[8, 16]);
+        assert_eq!(u8_n, 2, "two u8 buffers");
+        assert_eq!(f32_n, 2, "two f32 buffers");
+        // 100 + 256 + (8 * 4) + (16 * 4) = 356 + 32 + 64 = 452
+        assert_eq!(bytes, 452);
+    }
+
+    #[test]
+    fn byte_totals_handles_empty_and_single_buffers() {
+        assert_eq!(byte_totals(&[], &[]), (0, 0, 0));
+        assert_eq!(
+            byte_totals(&[0], &[]),
+            (0, 1, 0),
+            "zero-length u8 counts as a buffer"
+        );
+        assert_eq!(
+            byte_totals(&[], &[0]),
+            (0, 0, 1),
+            "zero-length f32 counts as a buffer"
+        );
+        assert_eq!(byte_totals(&[4096], &[]), (4096, 1, 0));
+        assert_eq!(byte_totals(&[], &[1024]), (4096, 0, 1));
     }
 }

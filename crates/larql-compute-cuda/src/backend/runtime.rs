@@ -4,7 +4,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
     PushKernelArg,
 };
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions, Ptx};
 
 use crate::ops::{
     ACTIVATION_GELU_TANH_CUDA_SRC, ACTIVATION_GELU_TANH_KERNEL, ACTIVATION_SILU_CUDA_SRC,
@@ -19,9 +19,8 @@ use crate::ops::{
     RMS_NORM_CUDA_SRC, RMS_NORM_HEADS_CUDA_SRC, RMS_NORM_HEADS_KERNEL, RMS_NORM_KERNEL,
     ROPE_CUDA_SRC, ROPE_KERNEL,
 };
-#[cfg(test)]
-use crate::weight_cache::CacheStats;
-use crate::weight_cache::WeightCache;
+use crate::ptx_cache;
+use crate::weight_cache::{CacheStats, WeightCache};
 
 #[derive(Debug)]
 pub(crate) struct CudaRuntime {
@@ -86,17 +85,17 @@ impl CudaRuntime {
         let combined_src = format!(
             "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}\n{RESIDUAL_ADD_CUDA_SRC}\n{ROPE_CUDA_SRC}\n{DECODE_ATTENTION_CUDA_SRC}\n{PREFILL_ATTENTION_CUDA_SRC}"
         );
-        let ptx = compile_ptx_with_opts(
-            &combined_src,
-            CompileOptions {
-                fmad: Some(false),
-                ..Default::default()
-            },
-        )
-        .map_err(|err| RuntimeError::compile("compiling CUDA k-quant NVRTC module", err))?;
-        let module = context
-            .load_module(ptx)
-            .map_err(|err| RuntimeError::context("loading CUDA k-quant module", err))?;
+        // Target the device's real compute capability (e.g. `compute_89`)
+        // instead of NVRTC's default virtual arch — better SASS once the
+        // driver JITs, and "kernel uses features your GPU lacks" surfaces at
+        // compile time rather than launch time. `CompileOptions::arch` is
+        // `Option<&'static str>`; the device arch is only known at runtime, so
+        // leak the small string once at backend init (a backend is constructed
+        // rarely and the string is a handful of bytes).
+        let fmad = false;
+        let arch: &'static str =
+            Box::leak(format!("compute_{cc_major}{cc_minor}").into_boxed_str());
+        let module = compile_or_load_module(&context, &combined_src, arch, fmad)?;
         let q4k_matvec = module
             .load_function(Q4K_MATVEC_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading q4k_matvec CUDA function", err))?;
@@ -187,7 +186,7 @@ impl CudaRuntime {
             prefill_attention,
             weight_cache: WeightCache::default(),
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention loaded, remaining ops use CPU fallback"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}, NVRTC target {arch}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention loaded, remaining ops use CPU fallback"
             ),
         })
     }
@@ -203,8 +202,9 @@ impl CudaRuntime {
         &self.stream
     }
 
-    /// Snapshot the weight-cache hit/miss counters (test diagnostic).
-    #[cfg(test)]
+    /// Snapshot the weight-cache hit/miss counters and resident-byte footprint
+    /// (diagnostic). Surfaced to the `LARQL_GPU_DIAG` surface via
+    /// `CudaBackend::weight_cache_diag`.
     pub(crate) fn weight_cache_stats(&self) -> CacheStats {
         self.weight_cache.stats()
     }
@@ -2460,6 +2460,49 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     } else {
         "non-string panic payload".to_string()
     }
+}
+
+/// Compile the combined CUDA kernel module via NVRTC, caching the resulting
+/// PTX on disk so a warm process start skips the (hundreds-of-ms) NVRTC
+/// round-trip.
+///
+/// Cache reads/writes are best-effort: a miss, corrupt entry, or I/O error
+/// transparently falls back to a fresh compile, so the cache can never make
+/// CUDA unavailable. The PTX is keyed on the source text, the target arch, the
+/// `fmad` policy, and a cache-format/cudarc version component (see
+/// [`crate::ptx_cache`]). After a successful compile the PTX text is written
+/// atomically (temp file + rename) so a crash can't leave a corrupt entry.
+fn compile_or_load_module(
+    context: &Arc<CudaContext>,
+    src: &str,
+    arch: &'static str,
+    fmad: bool,
+) -> Result<Arc<CudaModule>, RuntimeError> {
+    let key = ptx_cache::cache_key(src, arch, fmad);
+    // Cache hit: load the cached PTX text directly (the driver JITs PTX→SASS).
+    // A load failure on a cached entry (corrupt/empty `.ptx`) falls through to
+    // a fresh compile rather than failing CUDA init.
+    if let Some(cached) = ptx_cache::try_read(&key) {
+        match context.load_module(Ptx::from_src(cached)) {
+            Ok(module) => return Ok(module),
+            Err(_) => { /* fall through to recompile */ }
+        }
+    }
+    let opts = CompileOptions {
+        fmad: Some(fmad),
+        arch: Some(arch),
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(src, opts)
+        .map_err(|err| RuntimeError::compile("compiling CUDA k-quant NVRTC module", err))?;
+    // `compile_ptx_with_opts` returns a PTX image; serialise it to text for
+    // the cache and reload from that text so the on-disk format and the live
+    // load path are identical.
+    let ptx_src = ptx.to_src();
+    ptx_cache::try_write(&key, &ptx_src);
+    context
+        .load_module(Ptx::from_src(ptx_src))
+        .map_err(|err| RuntimeError::context("loading CUDA k-quant module", err))
 }
 
 #[derive(Debug, Clone)]

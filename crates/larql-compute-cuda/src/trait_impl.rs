@@ -4,19 +4,19 @@ use larql_compute::CpuBackend;
 use larql_compute::{DecodeStateDump, StateDumpMask};
 use ndarray::{Array2, ArrayView2};
 
+use crate::options::native_thresholds;
 use crate::CudaBackend;
 
 const CPU: CpuBackend = CpuBackend;
 
-/// FLOP threshold mirroring Metal's `calibration::DEFAULT_FLOP_THRESHOLD`.
-/// Below this the htod-upload + sync + dtoh-download round-trip costs more
-/// than the CPU reference loop, so the native kernel is skipped and the CPU
-/// fallback runs. This keeps the per-token dense lm_head decode path on the
-/// zero-copy mmap CPU path instead of re-uploading gigabytes every token.
-/// (The CPU fallback is reached via the `MatMul` trait's default
-/// `matmul_transb`-based path in the caller; `f32_gemv` returning `None`
-/// there is the intended fast-path-fallback signal.)
-const GEMV_FLOP_THRESHOLD: usize = 500_000_000;
+// Below the GEMV flop threshold the htod-upload + sync + dtoh-download
+// round-trip costs more than the CPU reference loop, so the native kernel is
+// skipped and the CPU fallback runs. This keeps the per-token dense lm_head
+// decode path on the zero-copy mmap CPU path instead of re-uploading
+// gigabytes every token. The threshold lives in `options::native_thresholds()`
+// (env `LARQL_CUDA_GEMV_FLOP_THRESHOLD`, default `500_000_000`, mirroring
+// Metal's `DEFAULT_FLOP_THRESHOLD`); `f32_gemv` returning `None` below it is
+// the intended fast-path-fallback signal.
 
 impl MatMul for CudaBackend {
     fn matmul(&self, a: ArrayView2<f32>, b: ArrayView2<f32>) -> Array2<f32> {
@@ -33,7 +33,7 @@ impl MatMul for CudaBackend {
         // Below the flop threshold the htod + sync + dtoh round-trip costs
         // more than the CPU loop, so skip the native kernel and let the
         // caller fall back to the `matmul_transb` CPU path.
-        if 2 * n * k < GEMV_FLOP_THRESHOLD {
+        if 2 * n * k < native_thresholds().gemv_flop_threshold {
             return None;
         }
         // Try the native path only when the view is row-major contiguous —
@@ -63,7 +63,7 @@ impl MatMul for CudaBackend {
     fn f16_gemv(&self, w_f16: &[u8], x: &[f32], n: usize, k: usize) -> Option<Vec<f32>> {
         // Below the flop threshold the htod + sync + dtoh round-trip costs
         // more than the CPU loop; skip the native kernel (see `f32_gemv`).
-        if 2 * n * k < GEMV_FLOP_THRESHOLD {
+        if 2 * n * k < native_thresholds().gemv_flop_threshold {
             return None;
         }
         if let Ok(Some(native)) = self.native_f16_gemv(w_f16, x, n, k) {
@@ -460,7 +460,16 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn device_info(&self) -> String {
-        self.runtime_summary().to_string()
+        let mut info = self.runtime_summary().to_string();
+        // Surface the weight-cache hit rate + resident footprint when the
+        // diagnostics opt-in is set (presence-as-truth). Default stays quiet.
+        if crate::options::gpu_diag_enabled() {
+            if let Some(diag) = self.weight_cache_diag() {
+                info.push('\n');
+                info.push_str(&diag);
+            }
+        }
+        info
     }
 
     fn supports(&self, cap: Capability) -> bool {
