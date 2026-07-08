@@ -30,6 +30,7 @@ use crate::extract::stage_labels::*;
 use crate::format::filenames::*;
 
 use super::capabilities::{ensure_standard_attention_supported, SURFACE_Q4K_WEIGHT_WRITER};
+use super::profile::{ExtractProfiler, Recorder};
 use super::write_f32::WeightSource;
 
 mod attn;
@@ -227,20 +228,31 @@ pub fn write_model_weights_kquant(
     dir: &Path,
     callbacks: &mut dyn IndexBuildCallbacks,
 ) -> Result<(), VindexError> {
-    write_model_weights_kquant_with_opts(source, dir, callbacks, KquantWriteOptions::default())
+    write_model_weights_kquant_with_opts(
+        source,
+        dir,
+        callbacks,
+        KquantWriteOptions::default(),
+        None,
+    )
 }
 
 /// Like [`write_model_weights_kquant`] but accepts a [`KquantWriteOptions`]
 /// knob to toggle the FFN down-proj quantisation format and the
 /// feature-major-down emit.
+///
+/// Pass `profiler = Some(...)` to collect a hotspot profile (see
+/// [`ExtractProfiler`]); `None` is a no-op.
 pub fn write_model_weights_kquant_with_opts(
     source: &dyn WeightSource,
     dir: &Path,
     callbacks: &mut dyn IndexBuildCallbacks,
     opts: KquantWriteOptions,
+    profiler: Option<&ExtractProfiler>,
 ) -> Result<(), VindexError> {
     callbacks.on_stage(STAGE_MODEL_WEIGHTS_KQUANT);
     let start = std::time::Instant::now();
+    let rec = Recorder::from(profiler);
 
     let arch = source.arch();
     if arch.uses_mla() {
@@ -253,18 +265,28 @@ pub fn write_model_weights_kquant_with_opts(
     ensure_standard_attention_supported(arch, SURFACE_Q4K_WEIGHT_WRITER)?;
     let num_layers = source.num_layers();
 
-    attn::write_attn_weights_kquant(source, dir, num_layers, callbacks)?;
-    ffn::write_interleaved_ffn_kquant(source, dir, num_layers, opts, callbacks)?;
-    moe_layers::write_per_layer_moe_kquant(source, dir, num_layers)?;
-    let mut entries = norms::write_norms_and_router(source, dir, num_layers)?;
-    super::ple_sidecar::write_ple_weights(source, dir, num_layers, &mut entries)?;
-    lm_head::write_lm_head_kquant(source, dir, &mut entries)?;
+    attn::write_attn_weights_kquant(source, dir, num_layers, callbacks, &rec)?;
+    ffn::write_interleaved_ffn_kquant(source, dir, num_layers, opts, callbacks, &rec)?;
+    moe_layers::write_per_layer_moe_kquant(source, dir, num_layers, &rec)?;
 
+    let norms_start = rec.now();
+    let mut entries = norms::write_norms_and_router(source, dir, num_layers, &rec)?;
+    rec.manifest(norms_start, "norms_router", "norms_router");
+    super::ple_sidecar::write_ple_weights(source, dir, num_layers, &mut entries, &rec)?;
+
+    let lm_start = rec.now();
+    lm_head::write_lm_head_kquant(source, dir, &mut entries, &rec)?;
+    rec.manifest(lm_start, "lm_head", "lm_head");
+
+    let mani_start = rec.now();
     let manifest_json =
         serde_json::to_string_pretty(&entries).map_err(|e| VindexError::Parse(e.to_string()))?;
     std::fs::write(dir.join(WEIGHT_MANIFEST_JSON), manifest_json)?;
 
     update_index_json(dir, source.arch())?;
+    rec.manifest(mani_start, "manifest_index", "manifest_index");
+
+    rec.stage(STAGE_MODEL_WEIGHTS_KQUANT, Some(start));
 
     callbacks.on_stage_done(
         STAGE_MODEL_WEIGHTS_KQUANT,

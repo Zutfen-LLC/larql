@@ -20,6 +20,7 @@ pub mod load;
 pub mod manifest;
 pub mod mla_absorb;
 mod ple_sidecar;
+pub mod profile;
 pub mod write_f32;
 pub mod write_kquant;
 pub mod write_layers;
@@ -39,3 +40,5 @@ pub use write_kquant::{
     write_model_weights_kquant, write_model_weights_kquant_with_opts, DownProjFormat,
     KquantWriteOptions, QuantBlockFormat,
 };
+
+pub use profile::ExtractProfiler;

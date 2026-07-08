@@ -104,6 +104,7 @@ impl<'a> BuildContext<'a> {
                 self.output_dir,
                 self.callbacks,
                 opts,
+                None,
             )?;
             config.has_model_weights = true;
         }

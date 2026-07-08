@@ -29,14 +29,55 @@ use crate::config::dtype::StorageDtype;
 use crate::config::types::QuantFormat;
 use crate::error::VindexError;
 use crate::extract::callbacks::IndexBuildCallbacks;
+use crate::format::weights::ExtractProfiler;
 
 use self::context::StreamingContext;
 
 /// Build a vindex by streaming from safetensors files (no full model load).
 ///
 /// Peak memory: embeddings + 1 layer of gate/down weights at a time.
+///
+/// Profiling is disabled. Use [`build_vindex_streaming_profiled`] to
+/// pass an [`ExtractProfiler`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_vindex_streaming(
+    model_dir: &Path,
+    tokenizer: &tokenizers::Tokenizer,
+    model_name: &str,
+    output_dir: &Path,
+    down_top_k: usize,
+    summary_features_per_expert: usize,
+    extract_level: crate::ExtractLevel,
+    dtype: StorageDtype,
+    quant: QuantFormat,
+    weight_opts: crate::format::weights::WriteWeightsOptions,
+    q4k_opts: crate::format::weights::KquantWriteOptions,
+    drop_gate_vectors: bool,
+    callbacks: &mut dyn IndexBuildCallbacks,
+) -> Result<(), VindexError> {
+    build_vindex_streaming_profiled(
+        model_dir,
+        tokenizer,
+        model_name,
+        output_dir,
+        down_top_k,
+        summary_features_per_expert,
+        extract_level,
+        dtype,
+        quant,
+        weight_opts,
+        q4k_opts,
+        drop_gate_vectors,
+        callbacks,
+        None,
+    )
+}
+
+/// Like [`build_vindex_streaming`] but threads an optional extraction
+/// profiler through to the model-weight writers. `None` is equivalent to
+/// [`build_vindex_streaming`] (profiling off, no overhead, identical output).
+#[allow(clippy::too_many_arguments)]
+pub fn build_vindex_streaming_profiled(
     model_dir: &Path,
     tokenizer: &tokenizers::Tokenizer,
     model_name: &str,
@@ -57,6 +98,7 @@ pub fn build_vindex_streaming(
     // the gate would be unrecoverable.
     drop_gate_vectors: bool,
     callbacks: &mut dyn IndexBuildCallbacks,
+    profiler: Option<&ExtractProfiler>,
 ) -> Result<(), VindexError> {
     if drop_gate_vectors && quant != QuantFormat::Q4K {
         return Err(VindexError::Parse(
@@ -99,6 +141,7 @@ pub fn build_vindex_streaming(
         q4k_opts,
         drop_gate_vectors,
         callbacks,
+        profiler,
     )?;
 
     ctx.write_gate_vectors()?;

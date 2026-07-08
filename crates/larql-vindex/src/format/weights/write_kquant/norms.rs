@@ -13,12 +13,14 @@ use std::path::Path;
 use crate::error::VindexError;
 use crate::format::filenames::*;
 
+use super::super::profile::Recorder;
 use super::super::write_f32::{kind, WeightEntry, WeightSource};
 
 pub(super) fn write_norms_and_router(
     source: &dyn WeightSource,
     dir: &Path,
     num_layers: usize,
+    rec: &Recorder<'_>,
 ) -> Result<Vec<WeightEntry>, VindexError> {
     let arch = source.arch();
     let norms_path = dir.join(NORMS_BIN);
@@ -28,6 +30,7 @@ pub(super) fn write_norms_and_router(
     let mut norm_entries: Vec<WeightEntry> = Vec::new();
 
     for layer in 0..num_layers {
+        let mut layer_bytes: u64 = 0;
         let keys: Vec<String> = [
             Some(arch.input_layernorm_key(layer)),
             Some(arch.post_attention_layernorm_key(layer)),
@@ -51,10 +54,14 @@ pub(super) fn write_norms_and_router(
         .flatten()
         .collect();
 
+        let t_fetch = rec.now();
+        let mut fetched = 0u64;
         for key in keys {
             if let Some(data) = source.get_vector(&key) {
+                fetched += 1;
                 let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
                 norms_file.write_all(&bytes)?;
+                layer_bytes += bytes.len() as u64;
                 norm_entries.push(WeightEntry {
                     key: key.clone(),
                     kind: kind::VECTOR.into(),
@@ -105,8 +112,10 @@ pub(super) fn write_norms_and_router(
             .collect();
             for key in moe_vec_keys {
                 if let Some(data) = source.get_vector(&key) {
+                    fetched += 1;
                     let bytes = crate::config::dtype::encode_floats(&data, norms_dtype);
                     norms_file.write_all(&bytes)?;
+                    layer_bytes += bytes.len() as u64;
                     norm_entries.push(WeightEntry {
                         key: key.clone(),
                         kind: kind::VECTOR.into(),
@@ -119,6 +128,9 @@ pub(super) fn write_norms_and_router(
                 }
             }
         }
+
+        rec.fetch(t_fetch, "norms_router", "norms", Some(layer), fetched, 0);
+        rec.write(rec.now(), "norms_router", "norms", Some(layer), layer_bytes);
     }
 
     // Final model norm (after last layer)

@@ -56,6 +56,7 @@ impl<'a> StreamingContext<'a> {
                     self.output_dir,
                     self.callbacks,
                     level_opts,
+                    self.profiler,
                 )?;
             }
             QuantFormat::Q4K => {
@@ -69,6 +70,7 @@ impl<'a> StreamingContext<'a> {
                     self.output_dir,
                     self.callbacks,
                     self.q4k_opts,
+                    self.profiler,
                 )?;
             }
         }

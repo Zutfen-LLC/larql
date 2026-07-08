@@ -154,6 +154,7 @@ pub fn vindex_to_q4k(
         &dst_tmp,
         &mut build_cb as &mut dyn crate::IndexBuildCallbacks,
         opts,
+        None,
     )?;
 
     // Hard-link auxiliary files: gate_vectors (KNN still needs the

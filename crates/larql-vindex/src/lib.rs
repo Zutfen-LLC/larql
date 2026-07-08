@@ -78,7 +78,8 @@ pub use describe::{DescribeEdge, LabelSource};
 // Extract
 pub use extract::{
     build_vindex, build_vindex_dense_only, build_vindex_from_vectors, build_vindex_streaming,
-    snapshot_hf_metadata, IndexBuildCallbacks, SilentBuildCallbacks, SNAPSHOT_FILES,
+    build_vindex_streaming_profiled, snapshot_hf_metadata, IndexBuildCallbacks,
+    SilentBuildCallbacks, SNAPSHOT_FILES,
 };
 
 // Format
@@ -98,7 +99,8 @@ pub use format::weights::{
     load_model_weights, load_model_weights_kquant, load_model_weights_kquant_shard,
     load_model_weights_with_opts, write_model_weights, write_model_weights_kquant,
     write_model_weights_kquant_with_opts, write_model_weights_with_opts, DownProjFormat,
-    KquantWriteOptions, LoadWeightsOptions, StreamingWeights, WeightSource, WriteWeightsOptions,
+    ExtractProfiler, KquantWriteOptions, LoadWeightsOptions, StreamingWeights, WeightSource,
+    WriteWeightsOptions,
 };
 
 // Patch
