@@ -82,8 +82,8 @@ pub struct RunArgs {
     /// Uses a CPU KV cache (prefill captures K/V per layer, decode
     /// step attends new Q against cached K/V + new K/V). On
     /// Gemma 3 4B f32 that's ~0.5-0.6 s/token — ollama-shaped.
-    /// Q4K CPU path still uses the no-cache loop (slow); prefer
-    /// `--metal` for Q4K speed.
+    /// Q4K CPU path still uses the no-cache loop (slow); prefer a
+    /// Q4K-capable backend (e.g. `--backend metal` on macOS) for Q4K speed.
     #[arg(short = 'n', long = "max-tokens", default_value = "64")]
     pub max_tokens: usize,
 
@@ -156,7 +156,7 @@ pub struct RunArgs {
     ///              correct h_post_attn from the previous layer.
     ///
     ///   batch      — parallel predispatch: all 60 layers fired in parallel
-    ///              threads, then injected in a second Metal pass.
+    ///              threads, then injected in a second backend pass.
     ///              Approximate but much faster: wall time ≈ one HTTP round
     ///              trip instead of 60.  Combine with
     ///              `--ffn-predispatch-iters 2` for better accuracy.
@@ -164,12 +164,13 @@ pub struct RunArgs {
     pub ffn_dispatch: String,
 
     /// Number of predispatch iterations per token when `--ffn-dispatch batch`
-    /// is set.  1 (default) = one parallel dispatch + two Metal passes;
+    /// is set.  1 (default) = one parallel dispatch + two backend passes;
     /// 2 = two dispatches + three passes, more accurate.
     #[arg(long, default_value = "1", value_name = "N")]
     pub ffn_predispatch_iters: usize,
 
-    /// Use Metal GPU backend for Q4K inference (macOS only).
+    /// Compatibility alias for `--backend metal` (macOS only). Prefer
+    /// `--backend` for new scripts.
     #[arg(long)]
     pub metal: bool,
 
@@ -181,8 +182,10 @@ pub struct RunArgs {
     /// op-call (`{"op":"...","args":{...}}`); the parser extracts it and the
     /// matching expert (gcd, base64, sql, …) computes the answer.
     ///
-    /// Requires Metal (`--metal`) on macOS. Use `--experts-dir` to point at a
-    /// custom WASM build directory; otherwise the default lookup is used.
+    /// For Q4K vindexes, prefers a backend that advertises the fused Q4K
+    /// decode pipeline (e.g. `--backend metal` on macOS). Use `--experts-dir`
+    /// to point at a custom WASM build directory; otherwise the default
+    /// lookup is used.
     #[arg(long)]
     pub experts: bool,
 
@@ -292,7 +295,12 @@ pub struct RunArgs {
 }
 
 pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = crate::commands::backend::backend_kind_from_args(&args.backend, args.metal)
+    // Resolve the effective backend ONCE here and thread it through every
+    // special branch (remote-FFN / remote-MoE / --experts) so they all use
+    // the shared backend factories instead of Metal-specific construction.
+    // The main dense path (run_once/run_chat → walk_cmd) re-resolves from
+    // the same args, but is already backend-neutral via backend_kind_from_args.
+    let backend_kind = crate::commands::backend::backend_kind_from_args(&args.backend, args.metal)
         .map_err(|e| format!("--backend: {e}"))?;
 
     let vindex_path = cache::resolve_model(&args.model)?;
@@ -305,7 +313,7 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.experts {
-        return experts::run(&vindex_path, &args);
+        return experts::run(&vindex_path, &args, backend_kind);
     }
 
     // BitNet b1.58 native-ternary vindex: served by the ternary forward
@@ -331,7 +339,7 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.max_tokens,
             &args.ffn_dispatch,
             args.ffn_predispatch_iters,
-            wants_metal(&args),
+            backend_kind,
         );
     }
 
@@ -356,7 +364,7 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.max_tokens,
             &args.moe_dispatch,
             args.moe_predispatch_iters,
-            wants_metal(&args),
+            backend_kind,
             args.engine.as_deref(),
         );
     }
@@ -386,9 +394,9 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(prompt) = args.prompt.as_deref() {
-        run_once(&vindex_path, prompt, &args)
+        run_once(&vindex_path, prompt, &args, backend_kind)
     } else {
-        run_chat(&vindex_path, &args)
+        run_chat(&vindex_path, &args, backend_kind)
     }
 }
 
@@ -397,8 +405,9 @@ fn run_once(
     vindex_path: &std::path::Path,
     prompt: &str,
     args: &RunArgs,
+    backend_kind: larql_inference::ComputeBackendKind,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let walk_args = build_walk_args(vindex_path, prompt, args);
+    let walk_args = build_walk_args(vindex_path, prompt, args, backend_kind);
     walk_cmd::run(walk_args)
 }
 
@@ -407,6 +416,7 @@ fn run_once(
 fn run_chat(
     vindex_path: &std::path::Path,
     args: &RunArgs,
+    backend_kind: larql_inference::ComputeBackendKind,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "larql chat — {} (Ctrl-D to exit)",
@@ -435,7 +445,7 @@ fn run_chat(
             continue;
         }
 
-        let walk_args = build_walk_args(vindex_path, prompt, args);
+        let walk_args = build_walk_args(vindex_path, prompt, args, backend_kind);
         if let Err(e) = walk_cmd::run(walk_args) {
             eprintln!("Error: {e}");
         }
@@ -533,6 +543,7 @@ fn build_walk_args(
     vindex_path: &std::path::Path,
     prompt: &str,
     args: &RunArgs,
+    backend_kind: larql_inference::ComputeBackendKind,
 ) -> walk_cmd::WalkArgs {
     walk_cmd::WalkArgs {
         prompt: prompt.to_string(),
@@ -551,8 +562,11 @@ fn build_walk_args(
         compare: false,
         down_top_k: 5,
         verbose: args.verbose,
-        backend: args.backend.clone(),
-        metal: wants_metal(args),
+        // walk_cmd re-resolves the kind from these two fields; pass through
+        // the already-resolved selection so the dense path stays consistent
+        // with the special branches.
+        backend: backend_kind.as_str().to_string(),
+        metal: matches!(backend_kind, larql_inference::ComputeBackendKind::Metal),
         ffn_remote: args.ffn.clone(),
         ffn_remote_timeout_secs: args.ffn_timeout_secs,
         ffn_dispatch: args.ffn_dispatch.clone(),
@@ -560,19 +574,12 @@ fn build_walk_args(
     }
 }
 
-fn wants_metal(args: &RunArgs) -> bool {
-    args.metal
-        || matches!(
-            crate::commands::backend::parse_backend_kind(&args.backend),
-            Ok(larql_inference::ComputeBackendKind::Metal)
-        )
-}
-
 /// `--moe-shards` dispatch path.
 ///
-/// Metal runs attention + dense FFN on GPU (same as normal `larql run --metal`).
-/// MoE expert blocks are dispatched to remote mini-processes via binary
-/// `POST /v1/expert/batch` instead of running locally.
+/// The selected backend runs attention + dense FFN locally (same as normal
+/// `larql run --backend …`). MoE expert blocks are dispatched to remote
+/// mini-processes via binary `POST /v1/expert/batch` instead of running
+/// locally.
 fn run_with_moe_shards(
     vindex_path: &std::path::Path,
     prompt: &str,
@@ -581,7 +588,7 @@ fn run_with_moe_shards(
     max_tokens: usize,
     dispatch: &str,
     predispatch_iters: usize,
-    metal: bool,
+    kind: larql_inference::ComputeBackendKind,
     engine_spec: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Remote MoE needs an engine that dispatches FFN per-layer through the
@@ -663,23 +670,12 @@ fn run_with_moe_shards(
     };
 
     let num_shards = configs.len();
-    // Initialise compute backend early so we can report it in the topology banner.
-    // Mirrors the `--metal` wiring in `run_with_remote_ffn` (PR #122): explicit
-    // opt-in via the CLI flag, with Metal-init failure falling back to CPU.
-    let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        {
-            larql_compute_metal::metal_backend()
-                .map(|m| Box::new(m) as Box<dyn larql_compute::ComputeBackend>)
-                .unwrap_or_else(larql_compute::cpu_backend)
-        }
-        #[cfg(not(all(feature = "gpu", target_os = "macos")))]
-        {
-            return Err("`--metal` requires the `gpu` feature on macOS".into());
-        }
-    } else {
-        larql_compute::cpu_backend()
-    };
+    // Initialise the compute backend through the shared factory so any
+    // backend (Metal/CUDA/Vulkan/CPU) works and an explicit-but-unavailable
+    // request fails loudly instead of silently degrading to CPU. `Auto`
+    // still follows the platform default order (honoring LARQL_BACKEND).
+    let backend: Box<dyn larql_compute::ComputeBackend> =
+        crate::commands::backend::compute_backend_or_err(kind)?;
     eprintln!("Connecting to {} MoE shard(s)…", num_shards);
     let remote = RemoteMoeBackend::connect(configs)
         .map_err(|e| format!("failed to connect to MoE shards: {e}"))?;
@@ -731,16 +727,18 @@ fn run_with_moe_shards(
         .map_err(|e| format!("failed to tokenise prompt: {e}"))?;
     eprintln!("[chat] tokenised to {} ids", prompt_ids.len());
 
-    // Backend-aware dispatch. The Metal backend implements the fused
-    // `DecodeBackend::decode_token_with_moe` trait method; the CPU backend
-    // does not (it is a GPU-only trait method that returns `None`), which
-    // previously surfaced as "decode_token_with_moe returned None during
-    // prefill" whenever `--metal` was omitted (#146). On CPU we route through
-    // the CPU remote-MoE forward instead: per-token
-    // `predict_kquant_hidden(Some(remote))` → `run_moe_layer_cpu` →
-    // `forward_moe_seq`, which dispatches each MoE layer's experts to the
-    // shards over HTTP.
-    let (tokens, decode_ms): (Vec<String>, Vec<f64>) = if metal {
+    // Capability-aware dispatch. The native remote-MoE path
+    // (`generate_with_remote_moe[_batch]`) drives
+    // `DecodeBackend::decode_token_with_moe`, which only backends that
+    // advertise [`Capability::DecodeMoe`] implement (Metal today; CUDA/Vulkan
+    // as their MoE kernels land). A backend that lacks it returns `None`
+    // from that method, which previously surfaced as
+    // "decode_token_with_moe returned None during prefill" whenever a
+    // capable backend wasn't selected (#146). Probe the capability (NOT the
+    // backend kind) so the choice emerges from what the backend advertises
+    // rather than a hardcoded Metal check.
+    let native_moe = backend.supports(larql_compute::Capability::DecodeMoe);
+    let (tokens, decode_ms): (Vec<String>, Vec<f64>) = if native_moe {
         let eos =
             larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
         let result = if dispatch == "batch" {
@@ -765,7 +763,9 @@ fn run_with_moe_shards(
     } else {
         if dispatch == "batch" {
             eprintln!(
-                "  note: --moe-dispatch batch is GPU-only; using sequential CPU expert dispatch"
+                "  note: --moe-dispatch batch requires a backend advertising \
+                 DecodeMoe (e.g. `--backend metal` on macOS); using sequential \
+                 CPU expert dispatch"
             );
         }
         // CPU remote-MoE. Default: the KV-cached engine path — dequantize the
@@ -918,9 +918,10 @@ fn run_with_moe_shards(
 
 /// `--ffn URL` dispatch path for dense models.
 ///
-/// Metal runs attention on the local GPU. Every layer's FFN is a round trip
-/// to the remote server at `ffn_url` via `LayerShardedBackend`. The local
-/// vindex supplies attention weights; the remote server supplies FFN outputs.
+/// The selected backend runs attention on the local device. Every layer's
+/// FFN is a round trip to the remote server at `ffn_url` via
+/// `LayerShardedBackend`. The local vindex supplies attention weights; the
+/// remote server supplies FFN outputs.
 ///
 /// This is analogous to `run_with_moe_shards` for hybrid-MoE models, but
 /// simpler: there is no local FFN and no router — every layer unconditionally
@@ -933,7 +934,7 @@ fn run_with_remote_ffn(
     max_tokens: usize,
     dispatch: &str,
     predispatch_iters: usize,
-    metal: bool,
+    kind: larql_inference::ComputeBackendKind,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use larql_inference::{
         generate_with_remote_ffn, generate_with_remote_ffn_batch, LayerShardedBackend,
@@ -941,20 +942,12 @@ fn run_with_remote_ffn(
     use std::time::Duration;
 
     let timeout = Duration::from_secs(ffn_timeout_secs);
-    let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
-        #[cfg(all(feature = "gpu", target_os = "macos"))]
-        {
-            larql_compute_metal::metal_backend()
-                .map(|m| Box::new(m) as Box<dyn larql_compute::ComputeBackend>)
-                .unwrap_or_else(larql_compute::cpu_backend)
-        }
-        #[cfg(not(all(feature = "gpu", target_os = "macos")))]
-        {
-            return Err("`--metal` requires the `gpu` feature on macOS".into());
-        }
-    } else {
-        larql_compute::cpu_backend()
-    };
+    // Construct the local attention backend through the shared factory so
+    // any backend works and an explicit-but-unavailable request fails loudly
+    // instead of silently degrading to CPU. `Auto` follows the platform
+    // default order (honoring LARQL_BACKEND).
+    let backend: Box<dyn larql_compute::ComputeBackend> =
+        crate::commands::backend::compute_backend_or_err(kind)?;
     eprintln!("Connecting to remote FFN at {ffn_url}…");
     let remote = LayerShardedBackend::connect(ffn_url, timeout)
         .map_err(|e| format!("failed to connect to remote FFN server: {e}"))?;
@@ -1046,13 +1039,18 @@ fn run_with_remote_ffn(
 /// Self-contained — does not call into `walk_cmd` because we need the raw
 /// generated text for op-call extraction (walk_cmd streams to stdout).
 ///
-/// Backend matrix:
+/// Backend matrix (selected from the resolved backend's advertised
+/// capabilities, NOT from the backend kind):
 ///
-/// | vindex quant | `--metal` | strategy                                    |
-/// |--------------|-----------|---------------------------------------------|
-/// | Q4_K         | yes       | `layer_graph::generate` (KV-cached, fast)   |
-/// | Q4_K         | no        | `vindex::generate_kquant_cpu` (per-step, slow) |
-/// | f32          | any       | `forward::generate_cached` (CPU, F32)       |
+/// | vindex quant | native Q4K decode? | strategy                                    |
+/// |--------------|--------------------|---------------------------------------------|
+/// | Q4_K         | yes                | `layer_graph::generate` (KV-cached, fast)   |
+/// | Q4_K         | no                 | `vindex::generate_kquant_cpu` (per-step, slow) |
+/// | f32          | any                | `forward::generate_cached` (CPU, F32)       |
+///
+/// "Native Q4K decode" means the backend advertises both `PrefillQ4` and
+/// `DecodeToken` (the fused Q4 pipeline `layer_graph::generate` needs).
+/// Today that's Metal on macOS; CUDA/Vulkan join as their pipelines land.
 ///
 /// Chat mode (no prompt): drops into a stdin REPL over the same loaded model.
 mod experts {
@@ -1069,9 +1067,10 @@ mod experts {
 
     /// Which decode strategy to use for this `--experts` invocation.
     enum Strategy {
-        /// Q4_K vindex + Metal backend. KV-cached decode via `layer_graph::generate`.
-        MetalQ4K,
-        /// Q4_K vindex, no Metal. Loops `predict_kquant` per token (O(N²)).
+        /// Q4_K vindex + a backend advertising the fused Q4 decode pipeline.
+        /// KV-cached decode via `layer_graph::generate`.
+        NativeQ4K,
+        /// Q4_K vindex, no fused-Q4 backend. Loops `predict_kquant` per token (O(N²)).
         CpuQ4K,
         /// Non-quantised vindex. CPU `generate_cached` with full f32 weights.
         CpuF32,
@@ -1080,20 +1079,23 @@ mod experts {
     impl Strategy {
         fn name(&self) -> &'static str {
             match self {
-                Self::MetalQ4K => "metal-q4k",
+                Self::NativeQ4K => "native-q4k",
                 Self::CpuQ4K => "cpu-q4k",
                 Self::CpuF32 => "cpu-f32",
             }
         }
     }
 
-    /// Resolved runtime — model + index + chosen strategy. Lives across
-    /// REPL turns so loads only happen once.
+    /// Resolved runtime — model + index + selected backend + chosen strategy.
+    /// Lives across REPL turns so loads only happen once.
     struct Runtime {
         weights: larql_inference::ModelWeights,
         tokenizer: tokenizers::Tokenizer,
         index: Option<VectorIndex>,
         strategy: Strategy,
+        /// Constructed once from the resolved backend kind; the `NativeQ4K`
+        /// strategy drives `layer_graph::generate` through it.
+        backend: Box<dyn larql_compute::ComputeBackend>,
     }
 
     /// Teacher-forced prefix that drops the model into the op-name field
@@ -1131,9 +1133,11 @@ mod experts {
             .map_err(|e| format!("tokenize: {e}"))?;
 
             let text = match self.strategy {
-                Strategy::MetalQ4K => {
-                    let index = self.index.as_ref().expect("metal-q4k needs index");
-                    let backend = larql_compute::default_backend();
+                Strategy::NativeQ4K => {
+                    let index = self.index.as_ref().expect("native-q4k needs index");
+                    // Use the backend selected in `load_runtime` (constructed
+                    // from the resolved backend kind) instead of re-running
+                    // the Auto factory each turn.
                     let cached_layers =
                         larql_inference::layer_graph::CachedLayerGraph::from_residuals(Vec::new());
                     let num_layers = self.weights.num_layers;
@@ -1146,7 +1150,7 @@ mod experts {
                             &token_ids,
                             max_tokens,
                             index,
-                            &*backend,
+                            &*self.backend,
                             &cached_layers,
                             0..num_layers,
                             |ids, logits| mask.apply(ids, logits),
@@ -1158,7 +1162,7 @@ mod experts {
                             &token_ids,
                             max_tokens,
                             index,
-                            &*backend,
+                            &*self.backend,
                             &cached_layers,
                             0..num_layers,
                         )
@@ -1304,42 +1308,81 @@ mod experts {
         }
     }
 
-    /// Whether the active compute backend can serve Q4 work-sets via Metal.
-    /// Wraps the impure `default_backend()` call so [`pick_strategy`] stays pure.
-    fn metal_ready_for_q4(want_metal: bool) -> bool {
-        want_metal
-            && larql_inference::compute_backend(larql_inference::ComputeBackendKind::Metal)
-                .map(|backend| backend.supports_quant(::larql_compute::QuantFormat::Q4_K))
-                .unwrap_or(false)
+    /// Whether the resolved backend can run the native fused Q4K decode
+    /// pipeline that `layer_graph::generate` needs. This mirrors
+    /// `backend_supports_fused_q4_pipeline` in larql-inference: a backend
+    /// advertises it via `Capability::PrefillQ4` + `Capability::DecodeToken`.
+    /// Probes the actual backend (not the backend kind) so the choice
+    /// emerges from what the backend advertises rather than a hardcoded
+    /// Metal check — CUDA/Vulkan join as their pipelines land.
+    fn native_q4k_decode_ready(kind: larql_inference::ComputeBackendKind) -> bool {
+        larql_inference::compute_backend(kind)
+            .map(|backend| {
+                use larql_compute::Capability;
+                backend.supports(Capability::PrefillQ4) && backend.supports(Capability::DecodeToken)
+            })
+            .unwrap_or(false)
     }
 
-    /// Pure strategy selector: given the vindex quant format and whether
-    /// Metal is available + requested, pick a decode strategy.
-    fn pick_strategy(quant: larql_vindex::QuantFormat, metal_ready: bool) -> Strategy {
-        match (quant, metal_ready) {
-            (larql_vindex::QuantFormat::Q4K, true) => Strategy::MetalQ4K,
+    /// Pure strategy selector: given the vindex quant format and whether a
+    /// native fused-Q4K backend is available, pick a decode strategy.
+    fn pick_strategy(quant: larql_vindex::QuantFormat, native_q4k_ready: bool) -> Strategy {
+        match (quant, native_q4k_ready) {
+            (larql_vindex::QuantFormat::Q4K, true) => Strategy::NativeQ4K,
             (larql_vindex::QuantFormat::Q4K, false) => Strategy::CpuQ4K,
             _ => Strategy::CpuF32,
         }
     }
 
-    /// Load the runtime: weights + tokenizer + q4 index (when needed).
-    fn load_runtime(vindex_path: &Path, args: &RunArgs) -> Result<Runtime, BoxErr> {
+    /// Load the runtime: weights + tokenizer + q4 index (when needed) +
+    /// the selected backend (constructed once from the resolved kind).
+    fn load_runtime(
+        vindex_path: &Path,
+        args: &RunArgs,
+        kind: larql_inference::ComputeBackendKind,
+    ) -> Result<Runtime, BoxErr> {
         let mut cb = SilentLoadCallbacks;
         let cfg = larql_vindex::load_vindex_config(vindex_path)?;
-        let strategy = pick_strategy(cfg.quant, metal_ready_for_q4(wants_metal(args)));
+        // Construct the backend once through the shared factory — an
+        // explicit-but-unavailable request fails loudly here, and `Auto`
+        // follows the platform default order (honoring LARQL_BACKEND).
+        let backend: Box<dyn larql_compute::ComputeBackend> =
+            crate::commands::backend::compute_backend_or_err(kind)?;
+        let native_q4k = native_q4k_decode_ready(kind);
+        let strategy = pick_strategy(cfg.quant, native_q4k);
 
         if args.verbose {
             eprintln!(
-                "strategy: {} (quant={:?}, metal_requested={})",
+                "strategy: {} (quant={:?}, backend={})",
                 strategy.name(),
                 cfg.quant,
-                wants_metal(args)
+                backend.name(),
+            );
+        }
+        // When the user explicitly asked for a non-CPU backend that is
+        // available but can't run the fused Q4K decode pipeline, the Q4K
+        // vindex falls back to the per-step CPU path. Surface that (don't
+        // silently pretend the requested backend is doing the work). Auto
+        // and explicit CPU land on the CPU path by design, so no note.
+        if !native_q4k
+            && cfg.quant == larql_vindex::QuantFormat::Q4K
+            && matches!(
+                kind,
+                larql_inference::ComputeBackendKind::Metal
+                    | larql_inference::ComputeBackendKind::Cuda
+                    | larql_inference::ComputeBackendKind::Vulkan
+            )
+        {
+            eprintln!(
+                "  note: backend `{}` does not advertise the fused Q4K decode \
+                 pipeline; using the CPU Q4K path (pass `--backend metal` on \
+                 macOS for the KV-cached native path)",
+                backend.name(),
             );
         }
 
         let (weights, index) = match strategy {
-            Strategy::MetalQ4K | Strategy::CpuQ4K => {
+            Strategy::NativeQ4K | Strategy::CpuQ4K => {
                 let weights = larql_vindex::load_model_weights_kquant(vindex_path, &mut cb)?;
                 let mut idx = VectorIndex::load_vindex(vindex_path, &mut cb)?;
                 idx.load_attn_kquant(vindex_path)?;
@@ -1362,6 +1405,7 @@ mod experts {
             tokenizer,
             index,
             strategy,
+            backend,
         })
     }
 
@@ -1398,7 +1442,11 @@ mod experts {
         }
     }
 
-    pub fn run(vindex_path: &Path, args: &RunArgs) -> Result<(), BoxErr> {
+    pub fn run(
+        vindex_path: &Path,
+        args: &RunArgs,
+        backend_kind: larql_inference::ComputeBackendKind,
+    ) -> Result<(), BoxErr> {
         // ── Load experts ──
         let experts_dir = resolve_experts_dir(args)?;
         if args.verbose {
@@ -1430,7 +1478,7 @@ mod experts {
         if args.verbose {
             eprintln!("template: {}", template.name());
         }
-        let mut runtime = load_runtime(vindex_path, args)?;
+        let mut runtime = load_runtime(vindex_path, args, backend_kind)?;
 
         if let Some(prompt) = args.prompt.as_deref() {
             run_one(&mut session, &mut runtime, prompt, template, args)
@@ -1508,15 +1556,15 @@ mod experts {
         // ── pick_strategy ──────────────────────────────────────────────────
 
         #[test]
-        fn pick_strategy_q4k_with_metal_picks_metal() {
+        fn pick_strategy_q4k_with_native_backend_picks_native() {
             assert!(matches!(
                 pick_strategy(QuantFormat::Q4K, true),
-                Strategy::MetalQ4K
+                Strategy::NativeQ4K
             ));
         }
 
         #[test]
-        fn pick_strategy_q4k_without_metal_picks_cpu_q4k() {
+        fn pick_strategy_q4k_without_native_backend_picks_cpu_q4k() {
             assert!(matches!(
                 pick_strategy(QuantFormat::Q4K, false),
                 Strategy::CpuQ4K
@@ -1524,8 +1572,9 @@ mod experts {
         }
 
         #[test]
-        fn pick_strategy_non_q4k_with_metal_falls_back_to_f32() {
-            // Metal can't help with non-Q4K weights — backend has no f32 path.
+        fn pick_strategy_non_q4k_with_native_backend_falls_back_to_f32() {
+            // The native path is Q4K-only — non-Q4K weights have no fused
+            // backend path, so f32 CPU is used regardless of the backend.
             assert!(matches!(
                 pick_strategy(QuantFormat::None, true),
                 Strategy::CpuF32
@@ -1533,7 +1582,7 @@ mod experts {
         }
 
         #[test]
-        fn pick_strategy_non_q4k_without_metal_picks_cpu_f32() {
+        fn pick_strategy_non_q4k_without_native_backend_picks_cpu_f32() {
             assert!(matches!(
                 pick_strategy(QuantFormat::None, false),
                 Strategy::CpuF32

@@ -69,11 +69,12 @@ pub(super) fn run_remote_ffn_bench(
 
     let timeout = Duration::from_secs(args.ffn_timeout_secs);
     // The dense remote-FFN walk dispatches through the GPU-only
-    // `decode_token_with_moe`; the CPU `default_backend()` ignores the
-    // remote hook and returns `None` during prefill. Mirror the
-    // `--metal` opt-in in `run_with_remote_ffn` (run_cmd.rs:553): explicit
-    // CLI flag, Metal-init failure falls back to CPU. Each concurrent
-    // worker builds its own backend (this fn runs per spawned thread).
+    // `decode_token_with_moe`; a CPU backend ignores the remote hook and
+    // returns `None` during prefill. Routed through the shared backend
+    // factory (same path as `run_with_remote_ffn` in run_cmd.rs), so an
+    // explicit-but-unavailable backend fails loudly and `Auto` follows the
+    // platform default order. Each concurrent worker builds its own backend
+    // (this fn runs per spawned thread).
     let requested =
         crate::commands::backend::backend_kinds_from_args(&args.backends, args.cpu, args.metal)
             .map_err(|e| format!("--backends: {e}"))?;
