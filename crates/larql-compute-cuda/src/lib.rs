@@ -3908,4 +3908,92 @@ mod tests {
             "explicit flush should drop the cache so the next launch re-uploads (miss)"
         );
     }
+
+    /// The browse-path ABA escape hatch is reachable through
+    /// `&dyn ComputeBackend` (no downcast) and is a safe no-op on the
+    /// no-runtime scaffold path. The runtime-gated
+    /// `weight_cache_reuses_*_across_launches` tests cover the real clear
+    /// when CUDA is present; this covers the trait dispatch + scaffold
+    /// safety that every host (including CI without a GPU) exercises.
+    #[test]
+    fn flush_weight_cache_trait_dispatch_is_noop_on_scaffold() {
+        let backend = backend();
+        // Inherent call + trait-object dispatch both reach the CUDA impl.
+        CudaBackend::flush_weight_cache(&backend);
+        let dyn_b: &dyn ComputeBackend = &backend;
+        dyn_b.flush_weight_cache();
+        // Scaffold path has no runtime → no cached buffers; stats stay None.
+        assert!(backend.weight_cache_stats().is_none());
+    }
+
+    /// `truncate_kv_cache` retains the `[..len, kv_dim]` prefix of each host KV
+    /// layer in one copy (no zero-init) and is a no-op when `len >= prev`.
+    /// Covers the host-mirror rebuild that runs on every host — the device-cache
+    /// truncation (`truncate_kv_cache_native`) needs a runtime, so the host path
+    /// is the no-hardware seam. Mirrors Metal's `truncate_kv_cache` contract.
+    #[test]
+    fn truncate_kv_cache_host_mirror_retains_prefix() {
+        let kv_dim = 4usize;
+        let make = |rows: usize, seed: f32| {
+            Array2::from_shape_vec(
+                (rows, kv_dim),
+                (0..rows * kv_dim).map(|i| seed + i as f32).collect(),
+            )
+            .unwrap()
+        };
+
+        let backend = backend();
+        // Two layers, each [3, kv_dim] with distinct seeds so the prefix is
+        // observable after truncation.
+        {
+            let mut kv = backend.lock_host_kv();
+            kv.clear();
+            kv.push((make(3, 0.0), make(3, 100.0)));
+            kv.push((make(3, 200.0), make(3, 300.0)));
+        }
+
+        // len < prev (3 → 2): prefix [0..2] retained, row 2 dropped.
+        backend.truncate_kv_cache(2);
+        {
+            let kv = backend.lock_host_kv();
+            assert_eq!(kv.len(), 2, "both layers present");
+            for (k, v) in kv.iter() {
+                assert_eq!(k.shape(), &[2, kv_dim], "K truncated to [2, kv_dim]");
+                assert_eq!(v.shape(), &[2, kv_dim], "V truncated to [2, kv_dim]");
+            }
+            // Prefix values preserved (layer 0 K seeded at 0.0, V at 100.0).
+            assert_eq!(kv[0].0[[0, 0]], 0.0);
+            assert_eq!(kv[0].0[[1, 0]], kv_dim as f32, "row 1 = seed + kv_dim");
+            assert_eq!(kv[0].1[[1, 0]], 100.0 + kv_dim as f32);
+        }
+
+        // len == prev: no-op, data unchanged.
+        backend.truncate_kv_cache(2);
+        {
+            let kv = backend.lock_host_kv();
+            assert_eq!(kv[0].0.shape(), &[2, kv_dim]);
+            assert_eq!(kv[0].0[[1, 0]], kv_dim as f32);
+        }
+
+        // len > prev: no-op (guard `len < prev` is false → the `[..len, ..]`
+        // slice would exceed the array bound, but it is never reached).
+        backend.truncate_kv_cache(5);
+        {
+            let kv = backend.lock_host_kv();
+            assert_eq!(kv[0].0.shape(), &[2, kv_dim], "len > prev is a no-op");
+        }
+
+        // Zero-length truncation: prefix is empty, shape [0, kv_dim].
+        backend.truncate_kv_cache(0);
+        {
+            let kv = backend.lock_host_kv();
+            assert_eq!(kv[0].0.shape(), &[0, kv_dim], "K truncated to empty rows");
+            assert_eq!(kv[0].1.shape(), &[0, kv_dim], "V truncated to empty rows");
+        }
+
+        // Empty host mirror (zero layers): loop body never runs — safe no-op.
+        backend.reset_host_kv(0);
+        backend.truncate_kv_cache(4);
+        assert_eq!(backend.host_kv_len(), 0);
+    }
 }

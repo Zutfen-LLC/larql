@@ -66,6 +66,30 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
         false
     }
 
+    /// Drop any cached, address-keyed device weight buffers and rebind to the
+    /// next vindex safely.
+    ///
+    /// The only hazard today is CUDA's persistent weight cache (`larql-compute-
+    /// cuda`), which keys cached device buffers on the host slice's
+    /// `(pointer, len)`. LARQL weights are zero-copy `mmap`'d, so within one
+    /// vindex lifetime the key is exact. But a backend **reused across vindex
+    /// loads** could see a recycled mmap address serve a stale cached weight
+    /// (an ABA case). Calling this at the vindex-rebind boundary drops the
+    /// cached buffers so the new vindex's weights are re-uploaded.
+    ///
+    /// This is for the long-lived **browse** path (`f16_gemv`/`f32_gemv` gate /
+    /// lm-head KNN via DESCRIBE/WALK/SELECT), which never resets the KV cache
+    /// (the decode/prefill path already self-flushes per generation via
+    /// `reset_kv_cache`). One-shot paths that build a fresh backend per vindex
+    /// don't need it.
+    ///
+    /// Default is a no-op — CPU, Metal, and the CUDA no-runtime scaffold keep
+    /// no address-keyed weight cache, so the call is behaviour-preserving there.
+    /// `CudaBackend` overrides to clear its runtime weight cache. This is
+    /// normal-code-path callable (not diagnostic-only); it does not reset the
+    /// runtime, modules, PTX cache, KV cache, or hit/miss counters.
+    fn flush_weight_cache(&self) {}
+
     /// Expose the concrete type for safe downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
 
@@ -201,6 +225,20 @@ mod tests {
     fn default_take_split_timings_returns_none() {
         let b = StubBackend;
         assert!(b.take_split_timings().is_none());
+    }
+
+    /// The default `flush_weight_cache` is a safe no-op for backends that keep
+    /// no address-keyed device weight cache (CPU, Metal, Vulkan scaffold). It
+    /// must be callable through `&dyn ComputeBackend` without panicking so
+    /// long-lived browse paths can flush at a vindex-rebind boundary without
+    /// downcasting.
+    #[test]
+    fn default_flush_weight_cache_is_a_no_op() {
+        let b = StubBackend;
+        // Inherent-style call and trait-object dispatch both reach the default.
+        b.flush_weight_cache();
+        let dyn_b: &dyn ComputeBackend = &b;
+        dyn_b.flush_weight_cache();
     }
 
     #[test]

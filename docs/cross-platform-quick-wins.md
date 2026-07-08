@@ -33,12 +33,25 @@ already uses `backend_kind_from_args`. Route the last three branches through
 `commands/backend.rs` factories. On Linux today those branches silently ignore
 a CUDA request.
 
-### 1.4 Wire `flush_weight_cache()` at the vindex-rebind boundary — **XS**
+### 1.4 Wire `flush_weight_cache()` at the vindex-rebind boundary — **XS** — *done*
 Session 19b added the public escape hatch for the browse-path ABA case
 (backend reused across vindex loads can serve a stale cached weight at a
-recycled mmap address) but nothing calls it. One call where the CLI/server
-rebinds a vindex to an existing backend closes a real (if rare) correctness
-hole for long-lived server processes.
+recycled mmap address) but nothing called it. The hatch is now a default
+no-op on the shared `ComputeBackend` trait (`flush_weight_cache()`),
+overridden by `CudaBackend` to clear its runtime weight cache; CPU/Metal/
+Vulkan scaffold are behaviour-preserving no-ops, so a long-lived browse
+path can flush via `&dyn ComputeBackend` without downcasting.
+
+A full audit (server, router, CLI `run`/`walk`/`bench`, LQL executor) found
+**no code path today reuses a backend across vindex loads** — every GPU
+backend is single-vindex-scoped (constructed fresh per request/process or
+held as a per-vindex `OnceLock` that dies with the vindex), and the LQL
+`Backend` enum + server browse routes hold no `ComputeBackend` at all
+(CPU-only via `PatchedVindex::gate_knn`). So no call site is wired; the trait
+hook exists so a future long-lived backend pool can rebind without
+downcasting. The runtime-gated `weight_cache_reuses_*` tests cover the real
+clear on CUDA hardware; the trait dispatch + scaffold safety is covered
+no-hardware.
 
 ## 2. CUDA-specific (all cheap, all pay off the moment hardware validation starts)
 
@@ -101,11 +114,14 @@ report `cached_bytes` (`Σ u8.len() + Σ f32.len()*4`), `cached_u8_buffers`, and
 default stays quiet. `CudaBackend::weight_cache_diag()` returns the same string
 programmatically for any caller.
 
-### 2.5 `truncate_kv_cache` host-mirror copy without zero-init — **XS**
-`trait_impl.rs:273-298` builds `Array2::zeros((len, kv_dim))` then assigns the
-prefix — a double write. `k_cache.slice(s![..len, ..]).to_owned()` does one.
-Rarely hot (truncate is rare) but it's a two-line cleanup in a file people
-will keep reading.
+### 2.5 `truncate_kv_cache` host-mirror copy without zero-init — **XS** — *done*
+`trait_impl.rs` previously built `Array2::zeros((len, kv_dim))` then assigned
+the prefix — a double write. Now `k_cache.slice(s![..len, ..]).to_owned()`
+takes ownership of the prefix in one allocation. Rarely hot (truncate is
+rare, only iterative predispatch) but it's a two-line readability cleanup.
+Behavior preserved for `len < prev`, `len == prev`, `len > prev`, empty
+mirrors, and zero-length truncation; covered by a no-hardware test in
+`larql-compute-cuda`.
 
 ## 3. Vulkan (pre-work that makes Phase 5 cheaper)
 
