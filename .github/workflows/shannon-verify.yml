@@ -138,3 +138,6 @@ jobs:
             --python .venv/bin/python \
             --hf-script scripts/shannon_score_hf.py \
             --hf-device cpu
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true

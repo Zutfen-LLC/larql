@@ -87,3 +87,6 @@ jobs:
         # facade (optional dep + `larql-vindex/vulkan`) still compiles
         # end-to-end.
         run: cargo check -p larql-inference --features vulkan
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true

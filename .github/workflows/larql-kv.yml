@@ -101,6 +101,9 @@ jobs:
       - name: Benchmark compile/tests
         run: cargo test -p larql-kv --benches
 
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true
   coverage:
     name: coverage - self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
@@ -130,3 +133,6 @@ jobs:
           mkdir -p coverage/larql-kv
           cargo llvm-cov report --package larql-kv --json --summary-only --output-path coverage/larql-kv/summary.json
           python3 scripts/check_coverage_policy.py coverage/larql-kv/summary.json crates/larql-kv/coverage-policy.json
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true

@@ -86,6 +86,9 @@ jobs:
       - name: Tests
         run: cargo test -p larql-inference
 
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true
   coverage:
     name: coverage - self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
@@ -109,3 +112,6 @@ jobs:
 
       - name: Coverage summary
         run: cargo llvm-cov --package larql-inference --summary-only
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true
