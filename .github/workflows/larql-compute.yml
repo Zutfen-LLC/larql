@@ -83,6 +83,9 @@ jobs:
       - name: Backend contract tests
         run: cargo test -p larql-compute --test test_backend_matmul_quant
 
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true
   coverage:
     name: coverage · self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
@@ -110,3 +113,6 @@ jobs:
         # `scripts/check_coverage_policy.py`, so any regression on
         # per-file floors or the total floor fails CI here.
         run: make larql-compute-coverage-summary
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true

@@ -98,3 +98,6 @@ jobs:
         # "macos")]`-gated), so this exercises the cuda + vulkan
         # activation together without requiring any GPU.
         run: cargo check -p larql-inference --features gpu-all
+      - name: Reclaim root-owned Git workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX .git target || true
