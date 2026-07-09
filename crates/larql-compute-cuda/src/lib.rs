@@ -51,7 +51,6 @@ mod tests {
         cuda_backend().expect("cuda scaffold backend")
     }
 
-
     /// Compare two f32 vectors element-wise within a tolerance.
     /// Used for CUDA-vs-CPU parity where floating-point divergence from
     /// different accumulation orders is expected and acceptable.
