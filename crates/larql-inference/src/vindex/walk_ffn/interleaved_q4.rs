@@ -49,13 +49,9 @@ impl<'a> WalkFfn<'a> {
         let mut out = Array2::<f32>::zeros((seq_len, hidden));
         let mut full_activation = Array2::<f32>::zeros((seq_len, intermediate));
 
-        let metal_q4 = self.backend.and_then(|be| {
-            if be.supports_quant(::larql_compute::QuantFormat::Q4_K) {
-                Some(be)
-            } else {
-                None
-            }
-        });
+        let metal_q4 = self
+            .backend
+            .filter(|be| be.supports_quant(::larql_compute::QuantFormat::Q4_K));
 
         if let Some(be) = metal_q4 {
             // Metal: ONE GPU submission for all gate+up across ALL seq positions
