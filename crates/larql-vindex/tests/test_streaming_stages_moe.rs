@@ -386,21 +386,43 @@ fn write_synthetic_gemma4_hybrid_moe(
         );
     }
 
+    // The packed expert tensors (`experts.gate_up_proj` /
+    // `experts.down_proj`) are emitted as BF16: the Q4K writer's
+    // `get_packed_bf16` fetch rejects anything that isn't
+    // `Dtype::BF16`, so a PackedBF16 fixture must round-trip its experts
+    // as BF16 for `write_per_layer_moe_kquant` to see them. Everything
+    // else stays f32 — the streaming pipeline's f32 readers expect that.
+    let is_expert_tensor =
+        |name: &str| name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj");
+    let f32_to_bf16 = |f: f32| -> [u8; 2] {
+        let bits = f.to_bits();
+        // round-to-nearest-even, then take the top 16 bits.
+        let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) >> 16;
+        (rounded as u16).to_le_bytes()
+    };
     let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
         .iter()
         .map(|(name, shape)| {
             let data = &tensors[name];
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let bytes: Vec<u8> = if is_expert_tensor(name) {
+                data.iter().flat_map(|f| f32_to_bf16(*f)).collect()
+            } else {
+                data.iter().flat_map(|f| f.to_le_bytes()).collect()
+            };
             (name.clone(), bytes, shape.clone())
         })
         .collect();
     let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
         .iter()
         .map(|(name, bytes, shape)| {
+            let dtype = if is_expert_tensor(name) {
+                safetensors::Dtype::BF16
+            } else {
+                safetensors::Dtype::F32
+            };
             (
                 name.clone(),
-                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
-                    .unwrap(),
+                safetensors::tensor::TensorView::new(dtype, shape.clone(), bytes).unwrap(),
             )
         })
         .collect();
@@ -1405,4 +1427,76 @@ fn streaming_extract_resumes_and_skips_down_meta_when_checkpoint_marks_it() {
         down_meta_before, down_meta_after,
         "resumed down_meta.bin must be reused unchanged, not recomputed"
     );
+}
+
+/// The PackedBF16 hybrid-MoE arm of `write_kquant::moe_layers` (§5.12)
+/// is only reached when `QuantFormat::Q4K` is selected — its sibling test
+/// `streaming_extract_gemma4_hybrid_moe_exercises_packed_bf16_arms`
+/// builds an f32 / `QuantFormat::None` vindex, which dispatches through
+/// the f32 writer and never reaches the per-layer kquant path. This test
+/// drives the same fixture through `QuantFormat::Q4K` so
+/// `write_per_layer_moe_kquant` actually quantises the packed expert
+/// tensors and writes one `layers/layer_{L:02}.weights` per layer.
+#[test]
+#[serial_test::serial]
+fn streaming_extract_gemma4_hybrid_moe_q4k_writes_per_layer_weights() {
+    let hidden = 8usize;
+    let intermediate = 4usize;
+    // Each expert's gate_up is `2 * moe_intermediate * hidden` f32s and
+    // is fed straight into quantize_q4_k, which asserts `len % 256 == 0`
+    // (one Q4_K super-block). 2 * 16 * 8 = 256 — the smallest valid
+    // width. (The down path is padded by pad_cols_to_256, so its raw
+    // hidden * moe_intermediate = 128 is fine.)
+    let moe_intermediate = 16usize;
+    let num_layers = 2usize;
+    let num_experts = 2usize;
+    let num_experts_per_tok = 1usize;
+    let vocab = 16usize;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("model");
+    let output_dir = tmp.path().join("vindex");
+
+    let tokenizer = write_synthetic_gemma4_hybrid_moe(
+        &model_dir,
+        hidden,
+        intermediate,
+        moe_intermediate,
+        num_layers,
+        num_experts,
+        num_experts_per_tok,
+        vocab,
+    );
+
+    let mut cb = SilentBuildCallbacks;
+    build_vindex_streaming(
+        &model_dir,
+        &tokenizer,
+        "test/gemma4-hybrid-moe-q4k",
+        &output_dir,
+        5,
+        0, // summary_features_per_expert (off)
+        ExtractLevel::Inference,
+        StorageDtype::F16,
+        QuantFormat::Q4K,
+        WriteWeightsOptions::default(),
+        KquantWriteOptions::default(),
+        false,
+        &mut cb,
+    )
+    .expect("streaming Q4K extract on gemma4 hybrid MoE fixture");
+
+    // `write_per_layer_moe_kquant` must write one quantised per-layer
+    // file per expert layer. Non-empty bytes prove the quantize +
+    // write path ran rather than no-op'ing at the PackedBF16 guard.
+    let layers_dir = output_dir.join("layers");
+    for layer in 0..num_layers {
+        let file = layers_dir.join(format!("layer_{layer:02}.weights"));
+        let bytes =
+            std::fs::read(&file).unwrap_or_else(|_| panic!("missing per-layer file: {file:?}"));
+        assert!(
+            !bytes.is_empty(),
+            "layer_{layer:02}.weights is empty — expert quantisation didn't write"
+        );
+    }
 }
