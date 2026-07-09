@@ -94,6 +94,39 @@ for the full report.
 - **Deferred:** decode attention parity bug (max_abs=0.13), vindex vocab_size
   padding, extraction pipeline serial bottlenecks (down_meta, clustering).
 
+### Phase A-stabilization — CUDA decode parity fix — ⏳ FIX APPLIED, PENDING HARDWARE VALIDATION (ASTAB-001)
+
+**Fix applied 2026-07-09 (ASTAB-001).** See
+`bench/baselines/cuda-decode-parity-fix-2026-07-09.md` for the full report.
+
+- **Root cause:** NOT a kernel bug. The two failing decode parity tests
+  compared CUDA's f32-activation decode pipeline (`host_decode_token` →
+  `q4k_matvec` dequant-then-f32-dot, the same numerics CUDA's prefill
+  pipeline and `predict_kquant_prefill` use) against the production CPU
+  decode reference `predict_kquant_decode_step_direct`, which uses int8
+  Q8_K SDOT matvec (`q4k_q8k_matvec_into`). CUDA has no SDOT instruction, so
+  its decode intentionally uses f32-activation numerics (documented in
+  `pipeline.rs` `moe_expert_contribution_q4k`). The int8-vs-f32 mismatch is
+  ~2% scale-relative by design (pinned by
+  `q8k_direct_proj_matches_f32_activation_within_quant_tolerance`), far
+  above the 1e-3 parity tolerance — producing the deterministic 0.1314532
+  divergence. The prefill parity test passed because both sides used
+  f32-activation; the decode parity tests failed because the CPU reference
+  used int8.
+- **Fix:** The two decode parity tests now compare against
+  `predict_kquant_decode_step` (f32-activation decode reference, the decode
+  twin of `predict_kquant_prefill`) instead of
+  `predict_kquant_decode_step_direct` (int8 production path). No tolerance
+  was loosened; no CUDA path was routed to CPU. The decode-attention kernel
+  itself was confirmed correct via 5 new focused native parity tests
+  (ASTAB-001C: single-head, multi-head, GQA asymmetric, softcap
+  multi-position, fixture-shape shrink).
+- **Hardware validation:** PENDING. The fix was developed on a no-CUDA host
+  (scaffold tests green: 145/145 lib tests pass, clippy clean, fmt clean).
+  The PR must be run on real CUDA hardware (`cargo test -p larql-compute-cuda
+  --features cuda`) before merge — per slice blocked_policy, do not claim
+  complete without hardware validation.
+
 ### Phase B — CUDA perf completion (4-7 sessions, after A)
 
 Ordered by expected wall-clock impact; re-rank against the A4 profile.
@@ -209,7 +242,7 @@ parallel (the scaffold already mirrors CUDA's module layout).
 | Order | Phase | Sessions | Gate |
 |---|---|---|---|
 | ~~1~~ | ~~A — hardware validation~~ | ~~2-4~~ | ~~✅ DONE (GPU-004)~~ |
-| 1 | **A-stabilization** — decode parity fix | 1-2 | blocks correct inference |
+| 1 | **A-stabilization** — decode parity fix | 1-2 | ⏳ fix applied (ASTAB-001), pending hardware validation — blocks correct inference |
 | 2 | B1 + B2 — resident KV + cross-layer | 2-4 | after A-stabilization |
 | 3 | D1 + D2 + D5 — Vulkan bootstrap + first kernel + pipeline extraction | 3-4 | can start during B |
 | 4 | C1 + C3 — coarse bridge + CLI polish | 1½-2½ | any time |
