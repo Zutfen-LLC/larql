@@ -114,7 +114,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        # cargo install puts the binary in ~/.cargo/bin (no sudo); the
+        # taiki-e/install-action tries /usr/local/bin via sudo, which the
+        # bare host runner rejects (password required).
+        run: cargo install cargo-llvm-cov --locked --quiet
 
       - name: Disable sccache for coverage instrumentation
         # sccache serves cached, uninstrumented object code, which suppresses
