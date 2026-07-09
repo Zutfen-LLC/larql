@@ -149,8 +149,11 @@ jobs:
       # route tests (routes/openai/completions.rs, chat.rs) deterministically
       # cover their streaming paths. Under cargo's default parallel runner the
       # CI box races on them and intermittently drops completions.rs coverage
-      # (~87% local/serial -> ~70% CI/parallel). Same fix the metal + inference
-      # coverage jobs use; this profdata feeds the policy check below.
+      # (~87% local/serial -> ~70% CI/parallel). (The larql-compute-metal
+      # workflow uses the same flag for its GPU/decode-flag races. Note this
+      # is distinct from larql-inference's OpenBLAS SIGSEGV fix, which uses
+      # `OPENBLAS_NUM_THREADS=1` + `RUST_TEST_THREADS=1` env vars instead.)
+      # This profdata feeds the policy check below.
       - name: Coverage summary
         run: cargo llvm-cov --package larql-server --summary-only --fail-under-lines "$LARQL_SERVER_COVERAGE_MIN" -- --test-threads=1
 

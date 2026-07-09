@@ -51,8 +51,11 @@ jobs:
       # targets (`larql-compute-metal-test{,-tests}`). Many tests read
       # process-global state cached at `MetalBackend::new()` (decode flags) and
       # share the single GPU; cargo's default parallel runner races on them and
-      # intermittently yields NaN/zero pipeline output. Serial execution is the
-      # same fix larql-inference uses for its OpenBLAS global-buffer race.
+      # intermittently yields NaN/zero pipeline output. (The larql-inference
+      # Linux workflow solves the analogous OpenBLAS global-buffer race with
+      # `OPENBLAS_NUM_THREADS=1` + `RUST_TEST_THREADS=1` in its `env:` block;
+      # here the shared GPU + decode flags make `--test-threads=1` the right
+      # lever instead.)
       - name: Unit tests
         run: cargo test -p larql-compute-metal --lib -- --test-threads=1
 
