@@ -39,6 +39,8 @@ use larql_vindex::walker::{
 // the JSONL hash). Keep the imports under the same gate so a Windows
 // build doesn't flag them as unused.
 #[cfg(not(windows))]
+use larql_models::VectorRecord;
+#[cfg(not(windows))]
 use larql_vindex::walker::vector_extractor::{
     ExtractConfig, SilentExtractCallbacks, VectorExtractor,
 };
@@ -60,6 +62,57 @@ fn sha256_hex(bytes: &[u8]) -> String {
     h.update(bytes);
     let out = h.finalize();
     out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Round an f32 to 5 decimal places. This is well below the precision
+/// at which two BLAS builds (system OpenBLAS vs a container's build)
+/// disagree — they differ only in the last ULP of some matmul entries —
+/// but high enough to preserve a real regression (a genuinely different
+/// down-projection column changes at the 1e-3 scale, not 1e-6).
+#[cfg(not(windows))]
+fn round_f32(v: f32) -> f32 {
+    (v * 1e5).round() / 1e5
+}
+
+/// Canonicalise the vector-extractor JSONL so a byte hash is stable
+/// across BLAS builds, not just within one.
+///
+/// The `vector` field is a raw down-projection column out of the BLAS
+/// matmul, and `c_score` / `top_k[].logit` are logits off the same
+/// matmul. Different OpenBLAS builds (e.g. Arch's system lib vs the CI
+/// container's) round the last ULP of a handful of entries differently,
+/// which was enough to flip the SHA between a dev box and the runner
+/// even though nothing semantic changed. We parse each record, round
+/// every f32 to 5 decimal places, re-emit it via serde (which keeps a
+/// stable field order), then sort the lines — so feature-loop ordering
+/// and sub-ULP float noise both drop out and the golden only moves on
+/// an intentional walker change.
+///
+/// The `_header` record is dropped: it carries `extraction_date`
+/// (today's date), which would otherwise drift the hash every wall-clock
+/// day.
+#[cfg(not(windows))]
+fn canonicalise_vector_jsonl(text: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.contains("\"_header\":true") {
+            continue;
+        }
+        let mut rec: VectorRecord = serde_json::from_str(line)
+            .expect("vector-extractor JSONL line deserialises into VectorRecord");
+        rec.vector = rec.vector.iter().map(|&v| round_f32(v)).collect();
+        rec.c_score = round_f32(rec.c_score);
+        for entry in &mut rec.top_k {
+            entry.logit = round_f32(entry.logit);
+        }
+        // `VectorRecord` derives Serialize with named fields, so serde
+        // emits them in declaration order (id, layer, feature, vector,
+        // dim, top_token, top_token_id, c_score, top_k) — matching what
+        // `VectorWriter::write_record` writes to disk.
+        lines.push(serde_json::to_string(&rec).unwrap());
+    }
+    lines.sort();
+    lines.join("\n")
 }
 
 /// Canonical edge form: tab-separated fields, sorted, one edge per line.
@@ -86,9 +139,14 @@ fn canonicalise_edges(graph: &Graph, layer_field: &str, feature_field: &str) -> 
 
 // ── Goldens ──────────────────────────────────────────────────────────────
 //
-// Only the vector-extractor stays byte-identical: it doesn't run a
-// top-k selection on matmul output, so it's not exposed to SIMD-level
-// reordering. Regenerate after an intentional change with:
+// The vector-extractor golden is a SHA of `canonicalise_vector_jsonl`
+// output, which rounds every f32 to 5 decimal places before hashing.
+// The `vector` field is a raw down-projection column from the BLAS
+// matmul, so without that rounding the hash flips between BLAS builds
+// (e.g. Arch's system OpenBLAS vs the CI container's) that differ only
+// in the last ULP of a few entries — the rounding absorbs that noise
+// while still catching a real regression (a genuinely different column
+// moves at ~1e-3, not 1e-6). Regenerate after an intentional change:
 //   LARQL_PRINT_GOLDEN=1 cargo test -p larql-vindex --test \
 //     test_walker_accuracy -- --nocapture
 // then paste the printed hex string below.
@@ -96,9 +154,11 @@ fn canonicalise_edges(graph: &Graph, layer_field: &str, feature_field: &str) -> 
 // Regenerated 2026-05-10: the canonicalisation strips the `_header`
 // record so the wall-clock `extraction_date` field doesn't make the
 // golden drift every day.
+// Regenerated 2026-07-08: f32 rounding added so the hash is stable
+// across BLAS builds (was flipping between dev boxes and CI).
 #[cfg(not(windows))]
 const GOLDEN_VECTOR_EXTRACTOR_FFN_DOWN_LAYER0: &str =
-    "8b5e221b150147ed40b0cfa67fdfc264e0628ab6cd6c59c2f9419e9350589b83";
+    "be2cdd1ad0873fcb069399ed802dfbfba4041304d0558bc865fdfed805d92fd1";
 
 #[cfg(not(windows))]
 fn check_or_print(label: &str, actual: &str, golden: &str) {
@@ -252,12 +312,15 @@ fn assert_structural_invariants(graph: &Graph, second_field: &str, expected_laye
     );
 }
 
-// The golden is byte-keyed on the BLAS implementation's f32 output:
-// canonicalised JSONL → sha256. Linux (OpenBLAS) and macOS (Accelerate)
-// happen to produce matching textual output; Windows OpenBLAS rounds the
-// last digit of some entries differently, so the hash drifts. The test
-// stays useful as a same-platform regression on Linux/macOS — skipping
-// it on Windows rather than weakening it to a "shape only" check.
+// The golden is a SHA over `canonicalise_vector_jsonl` output, which
+// rounds every f32 to 5 dp before hashing. Without the rounding the hash
+// is byte-keyed on the BLAS implementation's f32 output and flips between
+// OpenBLAS builds (system lib vs CI container) that differ only in the
+// last ULP of a few matmul entries. The rounding keeps it a real
+// regression gate — a genuinely different down-projection column moves at
+// ~1e-3, not 1e-6 — while making it pass on every Linux/macOS box. Still
+// skipped on Windows, where the matmul path is pure-Rust and the drift is
+// larger than 5 dp on some entries.
 #[cfg(not(windows))]
 #[test]
 fn vector_extractor_ffn_down_byte_identical() {
@@ -276,16 +339,10 @@ fn vector_extractor_ffn_down_byte_identical() {
 
     let path = out.join("ffn_down.vectors.jsonl");
     let text = std::fs::read_to_string(&path).unwrap();
-    // Sort lines so re-ordering of feature loops doesn't break the
-    // golden — content is what we care about. Skip the `_header`
-    // record: it carries `extraction_date` (today's date), which would
-    // otherwise drift the hash every wall-clock day.
-    let mut lines: Vec<&str> = text
-        .lines()
-        .filter(|l| !l.contains("\"_header\":true"))
-        .collect();
-    lines.sort();
-    let canonical = lines.join("\n");
+    // Canonicalise: round f32s, drop the `_header` record (its
+    // `extraction_date` is today's date), re-emit in stable field order,
+    // then sort lines so feature-loop ordering can't flip the hash.
+    let canonical = canonicalise_vector_jsonl(&text);
     let hex = sha256_hex(canonical.as_bytes());
     check_or_print(
         "vector_extractor_ffn_down_layer0",
