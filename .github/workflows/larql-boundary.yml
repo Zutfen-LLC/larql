@@ -25,7 +25,7 @@ on:
 env:
   RUSTC_WRAPPER: sccache
   SCCACHE_BUCKET: sccache
-  SCCACHE_ENDPOINT: http://100.109.47.61:9000
+  SCCACHE_ENDPOINT: http://10.0.0.33:9000
   SCCACHE_S3_USE_SSL: "false"
   AWS_ACCESS_KEY_ID: sccache
   AWS_SECRET_ACCESS_KEY: QurhTA4fSewUayZI7z5ovNmO
@@ -42,11 +42,16 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install sccache (if missing)
+        # If MinIO is unreachable, fall back to compiling without cache.
         run: |
           if ! command -v sccache >/dev/null 2>&1; then
             curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
             sudo mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
             sudo chmod +x /usr/local/bin/sccache
+          fi
+          if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
+            echo "::warning::MinIO cache unreachable — compiling without sccache"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           fi
 
       - name: Install stable Rust
@@ -87,11 +92,16 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install sccache (if missing)
+        # If MinIO is unreachable, fall back to compiling without cache.
         run: |
           if ! command -v sccache >/dev/null 2>&1; then
             curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
             sudo mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
             sudo chmod +x /usr/local/bin/sccache
+          fi
+          if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
+            echo "::warning::MinIO cache unreachable — compiling without sccache"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           fi
 
       - name: Install stable Rust
