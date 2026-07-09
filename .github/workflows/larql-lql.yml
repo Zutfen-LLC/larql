@@ -101,7 +101,7 @@ jobs:
 
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
-        run: chmod -R a+rwX .git target || true
+        run: chmod -R a+rwX .git target .github coverage || true
   coverage:
     name: coverage - self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
@@ -135,6 +135,11 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Disable sccache for coverage instrumentation
+        # sccache serves cached, uninstrumented object code, which suppresses
+        # llvm-cov region/line measurement. Run the coverage build uncached.
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
       - name: Coverage summary
         run: cargo llvm-cov --package larql-lql --summary-only
       - name: sccache stats
@@ -143,4 +148,4 @@ jobs:
 
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
-        run: chmod -R a+rwX .git target || true
+        run: chmod -R a+rwX .git target .github coverage || true

@@ -39,6 +39,8 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Reclaim root-owned workspace paths for host checkout
+        run: sudo chmod -R a+rwX .git target .github coverage || true
       - uses: actions/checkout@v6
 
       - name: Install sccache (if missing)
@@ -87,6 +89,8 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Reclaim root-owned workspace paths for host checkout
+        run: sudo chmod -R a+rwX .git target .github coverage || true
       - uses: actions/checkout@v6
 
       - name: Install sccache (if missing)
@@ -107,6 +111,11 @@ jobs:
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Disable sccache for coverage instrumentation
+        # sccache serves cached, uninstrumented object code, which suppresses
+        # llvm-cov region/line measurement. Run the coverage build uncached.
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
       - name: Coverage policy gate
         # `make larql-models-coverage-summary` runs `cargo llvm-cov`
