@@ -1442,7 +1442,12 @@ fn streaming_extract_resumes_and_skips_down_meta_when_checkpoint_marks_it() {
 fn streaming_extract_gemma4_hybrid_moe_q4k_writes_per_layer_weights() {
     let hidden = 8usize;
     let intermediate = 4usize;
-    let moe_intermediate = 4usize;
+    // Each expert's gate_up is `2 * moe_intermediate * hidden` f32s and
+    // is fed straight into quantize_q4_k, which asserts `len % 256 == 0`
+    // (one Q4_K super-block). 2 * 16 * 8 = 256 — the smallest valid
+    // width. (The down path is padded by pad_cols_to_256, so its raw
+    // hidden * moe_intermediate = 128 is fine.)
+    let moe_intermediate = 16usize;
     let num_layers = 2usize;
     let num_experts = 2usize;
     let num_experts_per_tok = 1usize;
