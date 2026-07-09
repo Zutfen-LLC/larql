@@ -1406,3 +1406,70 @@ fn streaming_extract_resumes_and_skips_down_meta_when_checkpoint_marks_it() {
         "resumed down_meta.bin must be reused unchanged, not recomputed"
     );
 }
+
+/// The PackedBF16 hybrid-MoE arm of `write_kquant::moe_layers` (§5.12)
+/// is only reached when `QuantFormat::Q4K` is selected — its sibling test
+/// `streaming_extract_gemma4_hybrid_moe_exercises_packed_bf16_arms`
+/// builds an f32 / `QuantFormat::None` vindex, which dispatches through
+/// the f32 writer and never reaches the per-layer kquant path. This test
+/// drives the same fixture through `QuantFormat::Q4K` so
+/// `write_per_layer_moe_kquant` actually quantises the packed expert
+/// tensors and writes one `layers/layer_{L:02}.weights` per layer.
+#[test]
+#[serial_test::serial]
+fn streaming_extract_gemma4_hybrid_moe_q4k_writes_per_layer_weights() {
+    let hidden = 8usize;
+    let intermediate = 4usize;
+    let moe_intermediate = 4usize;
+    let num_layers = 2usize;
+    let num_experts = 2usize;
+    let num_experts_per_tok = 1usize;
+    let vocab = 16usize;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("model");
+    let output_dir = tmp.path().join("vindex");
+
+    let tokenizer = write_synthetic_gemma4_hybrid_moe(
+        &model_dir,
+        hidden,
+        intermediate,
+        moe_intermediate,
+        num_layers,
+        num_experts,
+        num_experts_per_tok,
+        vocab,
+    );
+
+    let mut cb = SilentBuildCallbacks;
+    build_vindex_streaming(
+        &model_dir,
+        &tokenizer,
+        "test/gemma4-hybrid-moe-q4k",
+        &output_dir,
+        5,
+        0, // summary_features_per_expert (off)
+        ExtractLevel::Inference,
+        StorageDtype::F16,
+        QuantFormat::Q4K,
+        WriteWeightsOptions::default(),
+        KquantWriteOptions::default(),
+        false,
+        &mut cb,
+    )
+    .expect("streaming Q4K extract on gemma4 hybrid MoE fixture");
+
+    // `write_per_layer_moe_kquant` must write one quantised per-layer
+    // file per expert layer. Non-empty bytes prove the quantize +
+    // write path ran rather than no-op'ing at the PackedBF16 guard.
+    let layers_dir = output_dir.join("layers");
+    for layer in 0..num_layers {
+        let file = layers_dir.join(format!("layer_{layer:02}.weights"));
+        let bytes =
+            std::fs::read(&file).unwrap_or_else(|_| panic!("missing per-layer file: {file:?}"));
+        assert!(
+            !bytes.is_empty(),
+            "layer_{layer:02}.weights is empty — expert quantisation didn't write"
+        );
+    }
+}
