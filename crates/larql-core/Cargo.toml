@@ -13,8 +13,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
-# HTTP provider — optional so pure graph usage has zero network deps
-reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+# HTTP provider — optional so pure graph usage has zero network deps.
+# rustls-tls (not the default native-tls/openssl) so the crate builds on hosts
+# without OpenSSL dev headers (the bare self-hosted Linux CI runner).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 
 # Binary serialization via MessagePack
 rmp-serde = { version = "1", optional = true }
