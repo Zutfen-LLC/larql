@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Reclaim root-owned workspace paths for host checkout
-        run: chmod -R a+rwX .git target .github coverage || true
+        run: chmod -R a+rwX . || true
       - uses: actions/checkout@v6
 
       - name: Install sccache (if missing)
@@ -94,7 +94,7 @@ jobs:
 
     steps:
       - name: Reclaim root-owned workspace paths for host checkout
-        run: chmod -R a+rwX .git target .github coverage || true
+        run: chmod -R a+rwX . || true
       - uses: actions/checkout@v6
 
       - name: Install sccache (if missing)

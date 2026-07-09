@@ -155,4 +155,4 @@ jobs:
 
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
-        run: chmod -R a+rwX .git target .github coverage || true
+        run: chmod -R a+rwX . || true

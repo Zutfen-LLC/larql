@@ -106,7 +106,7 @@ jobs:
 
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
-        run: chmod -R a+rwX .git target .github coverage || true
+        run: chmod -R a+rwX . || true
   coverage:
     name: coverage - self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
@@ -165,4 +165,4 @@ jobs:
 
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
-        run: chmod -R a+rwX .git target .github coverage || true
+        run: chmod -R a+rwX . || true
