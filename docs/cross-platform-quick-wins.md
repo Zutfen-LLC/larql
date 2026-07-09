@@ -55,9 +55,7 @@ no-hardware.
 
 ## 2. CUDA-specific (all cheap, all pay off the moment hardware validation starts)
 
-> **Status (2026-07-08): 2.1–2.4 implemented (slice GPU-001).** No-hardware-
-> safe; verified by `cargo test -p larql-compute-cuda` (138 tests, all green
-> without CUDA). The seven env-tunable gates and the `LARQL_GPU_DIAG` diag
+> **Status (2026-07-09): 2.1–2.4 implemented (GPU-001). 2.x validated on real hardware (GPU-004, RTX 3090).** Three NVRTC compilation blockers were found and fixed during hardware validation: missing `cuda_fp16.h` include path (NVRTC has no default system include search), duplicate symbol definitions from concatenated kernel sources, and undefined `INFINITY` macro. 139/141 tests pass with native kernels; 2 failures are a decode attention parity bug (deferred). See `bench/baselines/cuda-hardware-validation-2026-07-08.md` and the `tests/hardware_probe.rs` integration test.
 > surface are documented in `crates/larql-compute-cuda/src/options.rs`.
 
 ### 2.1 On-disk PTX cache — **S** — *done*
