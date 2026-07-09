@@ -163,6 +163,8 @@ pub const PREFILL_ATTENTION_KERNEL: KernelHandle = KernelHandle::new(
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
+#ifndef LARQL_HALF_BITS_DEFINED
+#define LARQL_HALF_BITS_DEFINED
 union larql_half_bits {
     unsigned short bits;
     __half half;
@@ -173,6 +175,7 @@ __device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
     value.bits = bits;
     return __half2float(value.half);
 }
+#endif
 
 extern "C" __global__ void q4k_matvec(
     const unsigned char* w4k,
@@ -249,6 +252,8 @@ extern "C" __global__ void q4k_matvec(
 pub const Q6K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
+#ifndef LARQL_HALF_BITS_DEFINED
+#define LARQL_HALF_BITS_DEFINED
 union larql_half_bits {
     unsigned short bits;
     __half half;
@@ -259,6 +264,7 @@ __device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
     value.bits = bits;
     return __half2float(value.half);
 }
+#endif
 
 extern "C" __global__ void q6k_matvec(
     const unsigned char* w6k,
@@ -319,6 +325,8 @@ extern "C" __global__ void q6k_matvec(
 pub const Q4K_MATMUL_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
+#ifndef LARQL_HALF_BITS_DEFINED
+#define LARQL_HALF_BITS_DEFINED
 union larql_half_bits {
     unsigned short bits;
     __half half;
@@ -329,6 +337,7 @@ __device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
     value.bits = bits;
     return __half2float(value.half);
 }
+#endif
 
 extern "C" __global__ void q4k_matmul(
     const unsigned char* w4k,
@@ -411,6 +420,8 @@ extern "C" __global__ void q4k_matmul(
 pub const Q6K_MATMUL_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
+#ifndef LARQL_HALF_BITS_DEFINED
+#define LARQL_HALF_BITS_DEFINED
 union larql_half_bits {
     unsigned short bits;
     __half half;
@@ -421,6 +432,7 @@ __device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
     value.bits = bits;
     return __half2float(value.half);
 }
+#endif
 
 extern "C" __global__ void q6k_matmul(
     const unsigned char* w6k,
@@ -486,6 +498,8 @@ extern "C" __global__ void q6k_matmul(
 pub const Q4K_DUAL_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
+#ifndef LARQL_HALF_BITS_DEFINED
+#define LARQL_HALF_BITS_DEFINED
 union larql_half_bits {
     unsigned short bits;
     __half half;
@@ -496,6 +510,7 @@ __device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
     value.bits = bits;
     return __half2float(value.half);
 }
+#endif
 
 extern "C" __global__ void q4k_dual_matvec(
     const unsigned char* w_a,
@@ -655,6 +670,8 @@ extern "C" __global__ void f32_gemv(
 pub const F16_GEMV_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
+#ifndef LARQL_HALF_BITS_DEFINED
+#define LARQL_HALF_BITS_DEFINED
 union larql_half_bits {
     unsigned short bits;
     __half half;
@@ -665,6 +682,7 @@ __device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
     value.bits = bits;
     return __half2float(value.half);
 }
+#endif
 
 extern "C" __global__ void f16_gemv(
     const unsigned char* w_f16,
@@ -703,6 +721,8 @@ extern "C" __global__ void f16_gemv(
 pub const Q4_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
+#ifndef LARQL_HALF_BITS_DEFINED
+#define LARQL_HALF_BITS_DEFINED
 union larql_half_bits {
     unsigned short bits;
     __half half;
@@ -713,6 +733,7 @@ __device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
     value.bits = bits;
     return __half2float(value.half);
 }
+#endif
 
 extern "C" __global__ void q4_matvec(
     const unsigned char* q4_data,
@@ -769,6 +790,8 @@ extern "C" __global__ void q4_matvec(
 pub const Q4_VECMAT_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
+#ifndef LARQL_HALF_BITS_DEFINED
+#define LARQL_HALF_BITS_DEFINED
 union larql_half_bits {
     unsigned short bits;
     __half half;
@@ -779,6 +802,7 @@ __device__ __forceinline__ float larql_decode_f16(unsigned short bits) {
     value.bits = bits;
     return __half2float(value.half);
 }
+#endif
 
 extern "C" __global__ void q4_vecmat(
     const float* activation,
@@ -1316,7 +1340,7 @@ extern "C" __global__ void decode_attention(
     __syncthreads();
 
     // Phase 2: max reduction (f32) over this head's scores.
-    float local_max = -INFINITY;
+    float local_max = __int_as_float(0xff800000); /* negative infinity */
     for (unsigned int i = tid; i < total_len; i += DECODE_ATTN_BLOCK) {
         const float s = scores[score_base + i];
         if (s > local_max) {
@@ -1472,7 +1496,7 @@ extern "C" __global__ void prefill_attention(
     __syncthreads();
 
     // Phase 2: max reduction (f32) over this head's causal scores.
-    float local_max = -INFINITY;
+    float local_max = __int_as_float(0xff800000); /* negative infinity */
     for (unsigned int i = tid; i < causal_len; i += PREFILL_ATTN_BLOCK) {
         const float s = scores[i];
         if (s > local_max) {
