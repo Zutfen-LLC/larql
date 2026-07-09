@@ -86,13 +86,16 @@ for the full report.
   deterministic — deferred to a stabilization slice, not a regression).
 - A3. ✅ CLI integration surface verified: `--backend cuda`, `LARQL_BACKEND=cuda`,
   `--backend cpu`, invalid-backend-loud-fail. PTX cache cold/hot verified.
-  End-to-end `larql run --backend cuda` executes but produces garbage output
-  due to the decode parity bug + a vindex vocab_size padding issue.
+  End-to-end `larql run --backend cuda` executes but produced garbage output
+  due to the decode parity bug + a vindex vocab_size padding issue. The
+  vocab padding issue is now **fixed (VINDEX-001)**; rebuild the vindex
+  without hand-editing `index.json` and only the decode-parity issue remains.
 - A4. Partial — CUDA is faster than CPU (~36s vs >300s for 8 tokens on debug
   build), but absolute numbers are unreliable until the decode parity bug is
   fixed. llama.cpp comparison skipped (not CUDA-built).
-- **Deferred:** decode attention parity bug (max_abs=0.13), vindex vocab_size
-  padding, extraction pipeline serial bottlenecks (down_meta, clustering).
+- **Deferred:** decode attention parity bug (max_abs=0.13), extraction
+  pipeline serial bottlenecks (down_meta, clustering).
+  (vindex vocab_size padding — **resolved by VINDEX-001**.)
 
 ### Phase A-stabilization — CUDA decode parity fix — ⏳ FIX APPLIED, PENDING HARDWARE VALIDATION (ASTAB-001)
 

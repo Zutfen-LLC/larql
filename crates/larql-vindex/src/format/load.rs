@@ -166,6 +166,10 @@ impl VectorIndex {
         if config.vocab_size > 0 {
             index.vocab_size = config.vocab_size;
         }
+        // Forward the logical/tokenizer vocab so the lm_head sampling path
+        // can mask padding rows (`logical..physical`) and keep emitted token
+        // IDs in the valid tokenizer range. Absent ⇒ logical == physical.
+        index.logical_vocab_size = config.logical_vocab_size;
 
         if !has_binary_down_meta {
             let legacy_path = dir.join(DOWN_META_JSONL);
@@ -221,8 +225,17 @@ impl VectorIndex {
         if !has_separate_lm_head {
             if let Ok(f) = std::fs::File::open(dir.join(EMBEDDINGS_BIN)) {
                 if let Ok(mmap) = unsafe { memmap2::Mmap::map(&f) } {
+                    // Adopt `embeddings.bin` as the f16 lm_head view ONLY when
+                    // its byte length is exactly `physical_vocab * hidden * 2`.
+                    // `config.vocab_size` is the physical row count (see
+                    // VINDEX-001), so this is an exact check — a padded f16
+                    // file matches, an f32 file (2× the bytes) does not, and a
+                    // truncated/garbage file is rejected rather than silently
+                    // misdetected. Earlier code used an ambiguous
+                    // `[expected_f16, expected_f16*2)` range which let an f32
+                    // file sneak through as "f16" and produced garbage logits.
                     let expected_f16 = config.vocab_size * config.hidden_size * 2;
-                    if mmap.len() >= expected_f16 && mmap.len() < expected_f16 * 2 {
+                    if mmap.len() == expected_f16 {
                         if index.vocab_size == 0 {
                             index.vocab_size = config.vocab_size;
                         }
@@ -372,13 +385,25 @@ pub fn load_vindex_embeddings(dir: &Path) -> Result<(Array2<f32>, f32), VindexEr
 
     let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
     let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
-    // Detect actual dtype from file size (may differ from index.json global dtype
-    // if gate vectors were converted to f32 but embeddings remain f16).
+    // Detect the actual dtype from file size. `config.vocab_size` is the
+    // physical row count (VINDEX-001), so the f32/f16 byte counts are exact.
+    // An incompatible length fails loudly instead of silently misdetecting
+    // dtype and decoding garbage (the original failure mode for padded-vocab
+    // GGUF models, where an f32 file was misread as f16).
     let expected_f32 = config.vocab_size * config.hidden_size * 4;
-    let actual_dtype = if embed_mmap.len() == expected_f32 {
-        crate::config::dtype::StorageDtype::F32
-    } else {
-        crate::config::dtype::StorageDtype::F16
+    let expected_f16 = config.vocab_size * config.hidden_size * 2;
+    let actual_dtype = match embed_mmap.len() {
+        len if len == expected_f32 => crate::config::dtype::StorageDtype::F32,
+        len if len == expected_f16 => crate::config::dtype::StorageDtype::F16,
+        len => {
+            return Err(VindexError::Parse(format!(
+                "embeddings.bin length {} incompatible with vocab_size={} hidden_size={} \
+                 (expected f32={} or f16={} bytes). This usually means the vindex was \
+                 extracted with a vocab_size that disagrees with the embedding tensor's \
+                 physical row count — rebuild it with a current extractor.",
+                len, config.vocab_size, config.hidden_size, expected_f32, expected_f16,
+            )))
+        }
     };
     let embed_floats = crate::config::dtype::decode_floats(&embed_mmap, actual_dtype);
 

@@ -328,6 +328,7 @@ pub fn load_model_weights_with_opts(
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
         vocab_size: config.vocab_size,
+        logical_vocab_size: config.logical_vocab_size,
         head_dim: cfg.head_dim,
         num_q_heads: cfg.num_q_heads,
         num_kv_heads: cfg.num_kv_heads,

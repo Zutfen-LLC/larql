@@ -102,6 +102,7 @@ fn make_bench_vindex_dir(tag: &str) -> PathBuf {
         hidden_size: hidden,
         intermediate_size: num_features,
         vocab_size,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         extract_level: ExtractLevel::Browse,
         dtype: StorageDtype::F32,

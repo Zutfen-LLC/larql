@@ -168,7 +168,15 @@ pub struct ModelWeights {
     pub num_layers: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    /// Physical row count of `embed` / `lm_head` (may be padded above the
+    /// tokenizer vocab for GGUF/kquant models). This is the number actually
+    /// present in the tensors — what the lm_head matmul iterates over.
     pub vocab_size: usize,
+    /// Logical/tokenizer vocabulary size when it is smaller than `vocab_size`
+    /// (GGUF/kquant padding). `None` ⇒ logical == physical. The inference
+    /// lm_head path masks rows in `[logical..physical)` so sampled token IDs
+    /// never fall in the padding region.
+    pub logical_vocab_size: Option<usize>,
     pub head_dim: usize,
     pub num_q_heads: usize,
     pub num_kv_heads: usize,

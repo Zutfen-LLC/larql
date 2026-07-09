@@ -81,6 +81,7 @@ pub fn test_config() -> VindexConfig {
         hidden_size: 4,
         intermediate_size: 12,
         vocab_size: 8,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         extract_level: ExtractLevel::Browse,
         dtype: larql_vindex::StorageDtype::default(),

@@ -199,6 +199,7 @@ mod tests {
             hidden_size: hidden,
             intermediate_size: num_features_per_layer,
             vocab_size: 16,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             extract_level: larql_vindex::ExtractLevel::All,
             dtype,

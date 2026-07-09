@@ -176,6 +176,7 @@ fn build_synthetic_vindex(dir: &std::path::Path) {
         hidden_size: hidden,
         intermediate_size: num_features,
         vocab_size,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         extract_level: larql_vindex::ExtractLevel::Browse,
         dtype: StorageDtype::F32,

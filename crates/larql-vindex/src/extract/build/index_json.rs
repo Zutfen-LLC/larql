@@ -26,6 +26,7 @@ impl<'a> BuildContext<'a> {
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
+            logical_vocab_size: self.logical_vocab_size,
             embed_scale: self.embed_scale,
             layers: std::mem::take(&mut self.layer_infos),
             down_top_k: self.down_top_k,

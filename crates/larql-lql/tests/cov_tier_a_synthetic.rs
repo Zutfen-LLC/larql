@@ -211,6 +211,7 @@ fn make_featured_source_dir() -> tempfile::TempDir {
         hidden_size: hidden,
         intermediate_size: num_features,
         vocab_size,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         extract_level: ExtractLevel::Browse,
         dtype: StorageDtype::F32,

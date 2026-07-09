@@ -133,6 +133,7 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
             hidden_size: hidden,
             intermediate_size: 8,
             vocab_size: 4,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             extract_level: ExtractLevel::Browse,
             dtype: larql_vindex::StorageDtype::default(),

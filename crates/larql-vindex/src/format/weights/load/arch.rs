@@ -168,6 +168,7 @@ mod tests {
             hidden_size: 512,
             intermediate_size: 2048,
             vocab_size: 32_000,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             layers: Vec::new(),
             down_top_k: 5,

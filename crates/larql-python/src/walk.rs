@@ -273,6 +273,7 @@ fn load_mmap_weights(dir: &Path) -> Result<(ModelWeights, Vec<WeightMmap>), Stri
         hidden_size: config.hidden_size,
         intermediate_size: config.intermediate_size,
         vocab_size: config.vocab_size,
+        logical_vocab_size: None,
         head_dim: model_cfg.head_dim,
         num_q_heads: model_cfg.num_q_heads,
         num_kv_heads: model_cfg.num_kv_heads,

@@ -51,7 +51,14 @@ pub struct VectorIndex {
     /// Hidden dimension.
     pub hidden_size: usize,
     /// Vocab size — set by callers that load lm_head; 0 otherwise.
+    /// Physical row count of embeddings/lm_head (may exceed the
+    /// tokenizer/logical vocab when GGUF/kquant pads the embedding tensor).
     pub vocab_size: usize,
+    /// Logical/tokenizer vocab when smaller than `vocab_size` (padding).
+    /// `None` ⇒ logical == physical. When set, the lm_head sampling path
+    /// masks rows in `[logical..physical)` so emitted token IDs stay
+    /// logical/tokenizer IDs.
+    pub logical_vocab_size: Option<usize>,
     /// Layer range owned by this shard, `None` = all layers.
     pub(crate) layer_range: Option<(usize, usize)>,
 
@@ -86,6 +93,7 @@ impl Clone for VectorIndex {
             num_layers: self.num_layers,
             hidden_size: self.hidden_size,
             vocab_size: self.vocab_size,
+            logical_vocab_size: self.logical_vocab_size,
             layer_range: self.layer_range,
             gate: self.gate.clone(),
             ffn: self.ffn.clone(),
@@ -104,6 +112,7 @@ impl VectorIndex {
             num_layers,
             hidden_size,
             vocab_size: 0,
+            logical_vocab_size: None,
             layer_range: None,
             gate: GateStore::empty(num_layers),
             ffn: FfnStore::empty(num_layers),

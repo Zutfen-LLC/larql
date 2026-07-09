@@ -234,6 +234,7 @@ fn bench_save_load(c: &mut Criterion) {
         hidden_size: hidden,
         intermediate_size: features,
         vocab_size: 100,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         layers: layer_infos,
         down_top_k: 5,

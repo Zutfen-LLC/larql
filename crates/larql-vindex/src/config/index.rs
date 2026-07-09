@@ -33,8 +33,18 @@ pub struct VindexConfig {
     pub hidden_size: usize,
     /// Intermediate (FFN) size.
     pub intermediate_size: usize,
-    /// Vocabulary size.
+    /// Physical row count of `embeddings.bin` and any tied lm_head view.
+    /// May exceed the tokenizer/logical vocab when GGUF/kquant pads the
+    /// embedding tensor to a quantisation block boundary (e.g. Qwen2.5:
+    /// 151936 physical rows vs 151643 logical tokens).
     pub vocab_size: usize,
+    /// Logical/tokenizer vocabulary size when it differs from `vocab_size`.
+    /// Absent ⇒ logical == physical. Used to mask padding rows during
+    /// sampling so emitted token IDs stay logical/tokenizer IDs. Set by
+    /// the extractor when GGUF metadata (or tokenizer) reports a smaller
+    /// vocab than the embedding tensor's physical row count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_vocab_size: Option<usize>,
     /// Embedding scale factor.
     pub embed_scale: f32,
     /// What level of weights are included.
@@ -477,6 +487,7 @@ mod fp4_schema_tests {
             hidden_size: 256,
             intermediate_size: 1024,
             vocab_size: 32,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             extract_level: ExtractLevel::default(),
             dtype: Default::default(),
@@ -623,6 +634,7 @@ mod fp4_schema_tests {
             hidden_size: 256,
             intermediate_size: 1024,
             vocab_size: 32,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             extract_level: ExtractLevel::default(),
             dtype: Default::default(),
@@ -655,6 +667,7 @@ mod resident_size_tests {
             hidden_size: 2560,
             intermediate_size: 6912,
             vocab_size: 128_256,
+            logical_vocab_size: None,
             extract_level: extract,
             dtype,
             layers: (0..num_layers)

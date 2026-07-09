@@ -112,7 +112,17 @@ Backend selection works correctly. The `-v` verbose output confirms: `Backend: c
 - **Vindex built on:** buildbox (32GB RAM, 12 cores) — 3090rig has insufficient RAM for conversion
 - **Extraction time:** ~14 min (`extract-index --quant q4k --jobs 8`)
 - **Vindex size:** 8.2 GB (includes both f16 side-channels and Q4_K weight files)
-- **Known data issue:** vocab_size padding mismatch (151643 in GGUF, 151936 written by extractor). The f16 embeddings file size collides with an f32 interpretation, causing the loader to misdetect dtype. Worked around by patching `index.json` vocab_size to 151936.
+- **Known data issue (RESOLVED by VINDEX-001, 2026-07-09):** vocab_size padding
+  mismatch (151643 in GGUF metadata, 151936 physical embedding rows written by
+  the extractor). The f16 embeddings file size collides with an f32
+  interpretation, causing the loader to misdetect dtype. The prior workaround
+  was patching `index.json` vocab_size to 151936 by hand. VINDEX-001 fixes the
+  root cause: the GGUF loader now keeps the physical row count as `vocab_size`
+  and records the smaller logical/tokenizer vocab in a new
+  `logical_vocab_size` field; the loader uses exact file-size dtype detection
+  (fails loudly on mismatch instead of silently misdetecting) and the lm_head
+  sampling path masks padding rows. **Rebuild the vindex without the
+  hand-edit** to pick up the fix.
 
 ### Inference results
 
@@ -201,7 +211,7 @@ Weight cache initialized empty on backend construction (expected — weights are
 | 5 | 5 Q6_K tests use exact float comparison | Test infrastructure | Medium | Fixed: `assert_vec_approx_eq` |
 | 6 | KV-append error message string mismatch | Test infrastructure | Low | Fixed: test string |
 | 7 | Decode pipeline parity: max_abs=0.13 | **Numerical parity** | **High** | **Deferred** — kernel bug in decode attention |
-| 8 | Vindex vocab_size padding mismatch (151643 vs 151936) | Data/vindex | Medium | Worked around; root cause in extractor |
+| 8 | Vindex vocab_size padding mismatch (151643 vs 151936) | Data/vindex | Medium | **Resolved (VINDEX-001).** Root cause: GGUF loader collapsed physical embedding rows + logical metadata vocab into one value. Fixed: physical rows are now `vocab_size`, logical vocab stored in `logical_vocab_size`, loader uses exact-size dtype detection, lm_head masks padding rows. |
 | 9 | Extraction pipeline serial bottlenecks | Performance | Medium | Documented for follow-up |
 | 10 | OpenBLAS single-threaded on multi-core host | Performance | Low | Environmental; not a LARQL bug |
 
@@ -236,7 +246,7 @@ All fixes are on the 3090rig working copy (not committed to the repo). They shou
 |---|---|---|
 | **P0** | Fix decode attention parity bug (max_abs=0.13) | Blocks correct inference on CUDA; root cause likely in `decode_attention` kernel indexing/accumulation |
 | **P1** | Submit NVRTC compilation fixes as PR | 3 blocker fixes that make CUDA usable on any real Linux host |
-| **P1** | Fix vindex vocab_size padding | Extractor writes padded vocab (151936) but index.json records unpadded (151643); causes loader dtype misdetection |
+| **P1** | ~~Fix vindex vocab_size padding~~ **Resolved (VINDEX-001)** | Extractor wrote padded vocab (151936) but index.json recorded unpadded (151643), causing loader dtype misdetection. Fixed: physical rows = `vocab_size`, logical vocab in new `logical_vocab_size` field, exact-size dtype detection + padding-row masking. |
 | **P2** | Gate `write_down_meta_and_clusters` and `run_clustering` by extract level | These stages take hours and aren't needed for `--level inference` |
 | **P2** | Parallelize `write_down_meta` layer loop with rayon | 36 independent layers × 252 TFLOP serial matmul → ~8-10x speedup with rayon |
 | **P3** | Wire parallel kquant writer through GGUF in-memory path | GGUF extraction bypasses the parallel `transform_then_write` code |

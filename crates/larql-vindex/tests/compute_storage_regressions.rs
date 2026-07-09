@@ -151,6 +151,7 @@ fn test_config(model_config: Option<VindexModelConfig>) -> VindexConfig {
         hidden_size: HIDDEN_SIZE,
         intermediate_size: INTERMEDIATE_SIZE,
         vocab_size: VOCAB_SIZE,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         layers: vec![],
         down_top_k: DOWN_TOP_K,

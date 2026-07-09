@@ -55,6 +55,7 @@ fn main() {
         hidden_size: hidden,
         intermediate_size: features,
         vocab_size: 100,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         extract_level: larql_vindex::ExtractLevel::Browse,
         dtype: larql_vindex::StorageDtype::F32,

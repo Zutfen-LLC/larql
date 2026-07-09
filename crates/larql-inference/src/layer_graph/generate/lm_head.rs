@@ -128,6 +128,15 @@ pub(super) fn backend_lm_head_topk(
         return Vec::new();
     }
 
+    // When the lm_head tensor is padded above the logical/tokenizer vocab
+    // (GGUF/kquant — e.g. Qwen2.5: 151936 physical rows vs 151643 tokens),
+    // restrict every kernel call to the logical rows `[0, logical)`. Padding
+    // rows sit at the end, so slicing to `logical` rows keeps them out of
+    // the matmul AND the in-kernel top-1/top-K fast paths. When logical ==
+    // physical this is a no-op. (VINDEX-001)
+    let logical = weights.logical_vocab_size.unwrap_or(vocab).min(vocab);
+    let lm_view = lm.slice(ndarray::s![0..logical, ..]);
+
     let query_slice = match query.as_slice() {
         Some(s) => s,
         None => &query.to_vec(),
@@ -136,20 +145,20 @@ pub(super) fn backend_lm_head_topk(
     // Fast path for top-1 (greedy decode): GPU gemv + GPU argmax
     // reads back only 8 KB partial results instead of 1 MB, saving ~0.33ms.
     if top_k == 1 {
-        if let Some((idx, score)) = backend.f32_gemv_topk1(lm.view(), query_slice) {
+        if let Some((idx, score)) = backend.f32_gemv_topk1(lm_view, query_slice) {
             return vec![(idx, score)];
         }
     }
 
     // General path: GPU gemv → full Vec<f32> → CPU top-k.
-    let scores_vec: Vec<f32> = if let Some(s) = backend.f32_gemv(lm.view(), query_slice) {
+    let scores_vec: Vec<f32> = if let Some(s) = backend.f32_gemv(lm_view, query_slice) {
         s
     } else {
         let q_row = match query.view().into_shape_with_order((1, hidden)) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
-        backend.matmul_transb(q_row, lm.view()).row(0).to_vec()
+        backend.matmul_transb(q_row, lm_view).row(0).to_vec()
     };
 
     // Fast path for greedy decode (top_k=1): a single linear scan avoids
@@ -172,7 +181,6 @@ pub(super) fn backend_lm_head_topk(
                     }
                 })
             });
-        let _ = vocab;
         return match best {
             Some((i, s)) => vec![(i as u32, s)],
             None => vec![],
@@ -181,14 +189,15 @@ pub(super) fn backend_lm_head_topk(
 
     // Min-heap of size k: O(k) space, O(N log k) time.
     // Avoids allocating the full 262K×8=2MB indexed Vec.
-    let k = top_k.min(vocab);
+    // `scores_vec` is sized to `logical` (padding rows sliced off above),
+    // so cap k at the logical vocab, not the physical row count.
+    let k = top_k.min(scores_vec.len());
     if k == 0 {
         // top_k=0 means "no results requested" — return empty without
         // touching the heap (else `heap[0]` indexes out of bounds in
         // the per-score loop).
         return Vec::new();
     }
-    let _ = vocab;
     let mut heap: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
 
     // sift-down to maintain min-heap property (smallest score at index 0).

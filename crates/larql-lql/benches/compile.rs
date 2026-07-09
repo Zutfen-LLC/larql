@@ -84,6 +84,7 @@ fn make_compile_bench_vindex(tag: &str, with_down_weights: bool) -> PathBuf {
         hidden_size: hidden,
         intermediate_size: intermediate,
         vocab_size,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         extract_level: if with_down_weights {
             ExtractLevel::All

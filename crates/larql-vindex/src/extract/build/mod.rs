@@ -66,6 +66,10 @@ pub(super) struct BuildContext<'a> {
     pub(super) hidden_size: usize,
     pub(super) intermediate_size: usize,
     pub(super) vocab_size: usize,
+    /// Logical/tokenizer vocab when smaller than `vocab_size` (GGUF/kquant
+    /// padding). Forwarded into `index.json` so the loader can mask padding
+    /// rows during sampling. `None` ⇒ logical == physical.
+    pub(super) logical_vocab_size: Option<usize>,
     pub(super) embed_scale: f32,
     pub(super) is_moe: bool,
     pub(super) n_experts: usize,
@@ -101,6 +105,7 @@ impl<'a> BuildContext<'a> {
             hidden_size: weights.hidden_size,
             intermediate_size: weights.intermediate_size,
             vocab_size: weights.vocab_size,
+            logical_vocab_size: weights.logical_vocab_size,
             embed_scale: weights.arch.embed_scale(),
             is_moe: weights.arch.is_moe(),
             n_experts: weights.arch.num_experts(),
@@ -450,6 +455,7 @@ mod tests {
             hidden_size: HIDDEN,
             intermediate_size: INTERMEDIATE,
             vocab_size: VOCAB,
+            logical_vocab_size: None,
             head_dim: HIDDEN,
             num_q_heads: 1,
             num_kv_heads: 1,
@@ -792,6 +798,7 @@ mod tests {
             hidden_size: HIDDEN,
             intermediate_size: INTERMEDIATE,
             vocab_size: VOCAB,
+            logical_vocab_size: None,
             head_dim: HIDDEN,
             num_q_heads: 1,
             num_kv_heads: 1,

@@ -17,7 +17,10 @@ use crate::format::filenames::*;
 use crate::index::core::IndexLoadCallbacks;
 
 /// Mmap + decode `embeddings.bin` into a `[vocab_size, hidden_size]`
-/// array of f32. Auto-detects f32 vs f16 storage from the byte count.
+/// array of f32. Detects f32 vs f16 storage from the byte count and
+/// fails loudly when the file length is incompatible with the recorded
+/// `vocab_size × hidden_size` (which would otherwise silently decode
+/// garbage — the original padded-vocab failure mode).
 ///
 /// Emits `on_file_start` / `on_file_done` callbacks around the work.
 pub(super) fn load_embeddings(
@@ -32,10 +35,19 @@ pub(super) fn load_embeddings(
     let embed_file = std::fs::File::open(dir.join(EMBEDDINGS_BIN))?;
     let embed_mmap = unsafe { memmap2::Mmap::map(&embed_file)? };
     let expected_f32_bytes = config.vocab_size * config.hidden_size * 4;
-    let embed_dtype = if embed_mmap.len() == expected_f32_bytes {
-        crate::config::dtype::StorageDtype::F32
-    } else {
-        crate::config::dtype::StorageDtype::F16
+    let expected_f16_bytes = config.vocab_size * config.hidden_size * 2;
+    let embed_dtype = match embed_mmap.len() {
+        len if len == expected_f32_bytes => crate::config::dtype::StorageDtype::F32,
+        len if len == expected_f16_bytes => crate::config::dtype::StorageDtype::F16,
+        len => {
+            return Err(VindexError::Parse(format!(
+                "embeddings.bin length {} incompatible with vocab_size={} hidden_size={} \
+                 (expected f32={} or f16={} bytes). The recorded vocab_size disagrees with \
+                 the embedding tensor's physical row count — rebuild the vindex with a \
+                 current extractor.",
+                len, config.vocab_size, config.hidden_size, expected_f32_bytes, expected_f16_bytes,
+            )))
+        }
     };
     let embed_floats = crate::config::dtype::decode_floats(&embed_mmap, embed_dtype);
     let arr = Array2::from_shape_vec((config.vocab_size, config.hidden_size), embed_floats)
@@ -89,6 +101,7 @@ mod tests {
             hidden_size: hidden,
             intermediate_size: hidden * 2,
             vocab_size: vocab,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             layers: Vec::new(),
             down_top_k: 1,
@@ -135,9 +148,9 @@ mod tests {
     }
 
     #[test]
-    fn load_embeddings_falls_back_to_f16_on_byte_count_mismatch() {
-        // f16 file has half the byte count of f32; the dtype detector
-        // routes through StorageDtype::F16.
+    fn load_embeddings_decodes_f16_storage() {
+        // f16 file byte count exactly matches `vocab * hidden * 2`, so the
+        // dtype detector routes through StorageDtype::F16.
         let tmp = tempfile::tempdir().unwrap();
         let vocab = 2;
         let hidden = 4;
@@ -154,6 +167,115 @@ mod tests {
         for (got, want) in arr.iter().zip(floats.iter()) {
             assert!((got - want).abs() < 1e-2, "f16 round-trip: {got} vs {want}");
         }
+    }
+
+    /// VINDEX-001: a padded-vocab f16 embedding file (physical rows > the
+    /// logical/tokenizer vocab) is loaded at the physical row count when
+    /// `config.vocab_size` records the physical count. This is the Qwen2.5
+    /// shape (151936 physical rows vs 151643 logical tokens); here scaled
+    /// down to physical=16, logical=8.
+    #[test]
+    fn load_embeddings_padded_f16_uses_physical_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let physical = 16;
+        let logical = 8;
+        let hidden = 4;
+        let floats: Vec<f32> = (0..physical * hidden).map(|i| i as f32).collect();
+        write_embeddings_bin(tmp.path(), &floats, StorageDtype::F16);
+
+        let mut config = config_for(physical, hidden);
+        config.logical_vocab_size = Some(logical);
+        let recording = Recording::default();
+        let mut cb = &recording;
+        let arr = load_embeddings(tmp.path(), &config, &mut cb).unwrap();
+
+        // Physical row count, not the logical vocab — the file holds
+        // physical rows and must reshape to physical × hidden.
+        assert_eq!(arr.shape(), &[physical, hidden]);
+        assert_eq!(arr[[0, 0]], 0.0);
+        assert_eq!(
+            arr[[physical - 1, hidden - 1]],
+            (physical * hidden - 1) as f32
+        );
+    }
+
+    /// VINDEX-001: padded f32 embedding file loads at the physical row count.
+    #[test]
+    fn load_embeddings_padded_f32_uses_physical_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let physical = 16;
+        let logical = 8;
+        let hidden = 4;
+        let floats: Vec<f32> = (0..physical * hidden).map(|i| i as f32).collect();
+        write_embeddings_bin(tmp.path(), &floats, StorageDtype::F32);
+
+        let mut config = config_for(physical, hidden);
+        config.logical_vocab_size = Some(logical);
+        let recording = Recording::default();
+        let mut cb = &recording;
+        let arr = load_embeddings(tmp.path(), &config, &mut cb).unwrap();
+
+        assert_eq!(arr.shape(), &[physical, hidden]);
+        assert_eq!(arr[[0, 0]], 0.0);
+        assert_eq!(
+            arr[[physical - 1, hidden - 1]],
+            (physical * hidden - 1) as f32
+        );
+    }
+
+    /// VINDEX-001: an embeddings.bin whose length is incompatible with the
+    /// recorded `vocab_size × hidden_size` fails loudly instead of silently
+    /// misdetecting dtype and decoding garbage. This is the regression that
+    /// produced garbage CPU/CUDA output for padded-vocab models.
+    #[test]
+    fn load_embeddings_incompatible_length_fails_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let declared_physical = 16;
+        let hidden = 4;
+        // File sized for only 12 rows — neither f32 nor f16 expectation.
+        let floats: Vec<f32> = (0..12 * hidden).map(|i| i as f32).collect();
+        write_embeddings_bin(tmp.path(), &floats, StorageDtype::F32);
+
+        let config = config_for(declared_physical, hidden);
+        let recording = Recording::default();
+        let mut cb = &recording;
+        let err = load_embeddings(tmp.path(), &config, &mut cb)
+            .expect_err("incompatible length must error");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("incompatible"),
+            "error should mention incompatible length: {msg}"
+        );
+        assert!(
+            msg.contains("vocab_size") || msg.contains("f32") || msg.contains("f16"),
+            "error should reference the expected shapes: {msg}"
+        );
+    }
+
+    /// VINDEX-001: `logical_vocab_size` round-trips through serde and is
+    /// omitted from JSON when `None` (backward compat for old vindexes).
+    #[test]
+    fn logical_vocab_size_serde_round_trip() {
+        // Some(logical) — serialised and deserialised.
+        let mut cfg = config_for(16, 4);
+        cfg.logical_vocab_size = Some(8);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains("\"logical_vocab_size\""),
+            "field present: {json}"
+        );
+        let parsed: VindexConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.logical_vocab_size, Some(8));
+
+        // None — omitted from JSON; old vindexes without the field still load.
+        let cfg_none = config_for(16, 4);
+        let json_none = serde_json::to_string(&cfg_none).unwrap();
+        assert!(
+            !json_none.contains("logical_vocab_size"),
+            "None should be skipped: {json_none}"
+        );
+        let parsed_none: VindexConfig = serde_json::from_str(&json_none).unwrap();
+        assert_eq!(parsed_none.logical_vocab_size, None);
     }
 
     #[test]

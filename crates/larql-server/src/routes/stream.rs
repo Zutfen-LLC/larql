@@ -655,6 +655,7 @@ mod tests {
             hidden_size: 4,
             intermediate_size: 3,
             vocab_size: 8,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             extract_level: ExtractLevel::Browse,
             dtype: larql_vindex::StorageDtype::default(),
