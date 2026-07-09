@@ -670,4 +670,57 @@ mod tests {
         let hits = v.lm_head_knn_backend(&q, 1, &cpu);
         assert!(hits.is_empty());
     }
+
+    /// VINDEX-001: `lm_head_f16_backend_hits` must respect
+    /// `logical_vocab_size`. We populate both an f32 and an f16 lm_head
+    /// (tied-embed shape), set `logical_vocab_size = 3` on a 4-row tensor,
+    /// and engineer the padding row (id 3) to dominate the query. On the
+    /// CPU backend the specialised f16 GEMV kernels return `None`, so the
+    /// dispatch path runs (exercising the `logical`/`eff_expected` slicing)
+    /// then falls through to the f32 path — where masking must still
+    /// exclude the padding row. Pins the contract for both `top_k == 1`
+    /// (topk1 branch) and `top_k > 1` (topk branch).
+    #[test]
+    fn lm_head_f16_dispatch_masks_padding_rows_when_logical_vocab_set() {
+        // 4 physical rows × 2 hidden; row 3 is padding and dominates
+        // query [1, 1] (score 100 vs 1 for the logical rows).
+        let lm_head: Vec<f32> = vec![
+            1.0, 0.0, // token 0 → 1.0
+            0.0, 1.0, // token 1 → 1.0
+            0.5, 0.5, // token 2 → 1.0
+            50.0, 50.0, // padding row 3 → 100.0 (would dominate)
+        ];
+        let f16_bytes = larql_models::quant::half::encode_f16(&lm_head);
+        let mut anon = memmap2::MmapOptions::new()
+            .len(f16_bytes.len())
+            .map_anon()
+            .unwrap();
+        anon.copy_from_slice(&f16_bytes);
+        let f16_mmap = anon.make_read_only().unwrap();
+
+        let mut v = vindex_with_lm_head(4, 2, &lm_head);
+        v.set_lm_head_f16_mmap(std::sync::Arc::new(f16_mmap));
+        v.logical_vocab_size = Some(3);
+
+        let cpu = larql_compute::CpuBackend;
+        let q = Array1::from_vec(vec![1.0_f32, 1.0]);
+
+        // top_k == 1 → exercises the f16_gemv_topk1 branch.
+        let hits = v.lm_head_knn_backend(&q, 1, &cpu);
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].0 < 3,
+            "padding row {} must never be sampled; logical_vocab=3",
+            hits[0].0
+        );
+
+        // top_k > 1 → exercises the f16_gemv_topk branch.
+        let hits = v.lm_head_knn_backend(&q, 2, &cpu);
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter().all(|(id, _)| *id < 3),
+            "padding rows sampled: {:?}; logical_vocab=3",
+            hits
+        );
+    }
 }
