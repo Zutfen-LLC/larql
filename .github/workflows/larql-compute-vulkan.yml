@@ -43,6 +43,7 @@ env:
   AWS_ACCESS_KEY_ID: sccache
   AWS_SECRET_ACCESS_KEY: QurhTA4fSewUayZI7z5ovNmO
   SCCACHE_CACHE_SIZE: 20G
+  SCCACHE_REGION: us-east-1
 
 jobs:
   check:
