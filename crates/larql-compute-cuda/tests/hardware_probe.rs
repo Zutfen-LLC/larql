@@ -12,10 +12,7 @@ fn hardware_probe_native_runtime_is_active() {
     let supports_decode = backend.supports(Capability::DecodeToken);
     let device_info = backend.device_info();
 
-    println!(
-        "HARDWARE_PROBE: supports(QuantMatVec) = {}",
-        supports_quant
-    );
+    println!("HARDWARE_PROBE: supports(QuantMatVec) = {}", supports_quant);
     println!(
         "HARDWARE_PROBE: supports(DecodeToken) = {}",
         supports_decode
@@ -25,8 +22,7 @@ fn hardware_probe_native_runtime_is_active() {
 
     assert!(
         supports_quant,
-        "QuantMatVec capability is false — CUDA runtime was NOT active. \
-         All runtime-gated tests silently used the CPU scaffold fallback."
+        "QuantMatVec capability is false — CUDA runtime was NOT active.          All runtime-gated tests silently used the CPU scaffold fallback."
     );
     assert!(
         supports_decode,
