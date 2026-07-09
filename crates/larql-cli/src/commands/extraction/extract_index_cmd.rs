@@ -116,6 +116,42 @@ pub struct ExtractIndexArgs {
     /// `LARQL_EXTRACT_PROFILE=1`.
     #[arg(long)]
     profile_extract: bool,
+
+    /// Bounded worker count for attention + dense-FFN Q4_K/Q6_K layer
+    /// transforms (`--quant q4k` only; IMPORT-002). Must be a positive
+    /// integer. `1` runs the exact serial path used before this flag
+    /// existed. Overrides `LARQL_EXTRACT_JOBS`. Default:
+    /// `min(available_parallelism, 4)` — deliberately conservative so a
+    /// large-core-count box doesn't default to all-core extraction.
+    #[arg(long)]
+    jobs: Option<usize>,
+}
+
+/// Resolve the bounded worker count for parallel kquant layer
+/// transforms: `--jobs` takes precedence over `LARQL_EXTRACT_JOBS`,
+/// which takes precedence over a conservative default. An invalid
+/// `--jobs` (zero) is a hard CLI error; an invalid env value is a
+/// warning that falls back to the default rather than panicking.
+fn resolve_jobs(cli_jobs: Option<usize>) -> Result<usize, String> {
+    if let Some(n) = cli_jobs {
+        return if n > 0 {
+            Ok(n)
+        } else {
+            Err("--jobs must be a positive integer".to_string())
+        };
+    }
+    if let Ok(raw) = std::env::var("LARQL_EXTRACT_JOBS") {
+        match raw.parse::<usize>() {
+            Ok(n) if n > 0 => return Ok(n),
+            _ => eprintln!(
+                "  warning: LARQL_EXTRACT_JOBS={raw:?} is not a positive integer; using default"
+            ),
+        }
+    }
+    Ok(std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4))
 }
 
 fn parse_quant(s: &str) -> Result<larql_vindex::QuantFormat, String> {
@@ -217,6 +253,8 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    let jobs = resolve_jobs(args.jobs)?;
 
     // Resolve extract level: --include-weights upgrades to All (backwards compat)
     let level = if args.include_weights {
@@ -385,6 +423,7 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 larql_vindex::DownProjFormat::Q6K
             },
             feature_major_down: args.feature_major_down,
+            jobs,
         };
 
         // Per-expert SVD-summary tier (opt-in via `--summary-features-per-expert`)

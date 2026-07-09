@@ -38,6 +38,7 @@ mod ffn;
 mod lm_head;
 mod moe_layers;
 mod norms;
+mod parallel;
 
 pub mod feature_major_down;
 
@@ -204,6 +205,17 @@ pub struct KquantWriteOptions {
     /// the ~840 MB heap cache ceiling is the binding constraint.
     /// Default `false` so existing extracts don't grow on disk.
     pub feature_major_down: bool,
+
+    /// Bounded worker count for per-layer attention/dense-FFN transforms
+    /// (IMPORT-002). `0` or `1` run the exact original serial path — no
+    /// thread pool is constructed. `> 1` transforms up to `jobs` layers
+    /// concurrently (bounded, chunked — see [`parallel::transform_then_write`])
+    /// while writes stay strictly ordered and single-threaded, so output
+    /// bytes/manifests/offsets are identical to the serial path regardless
+    /// of this value. Resolved by the CLI from `--jobs` / `LARQL_EXTRACT_JOBS`;
+    /// the `Default` derive gives `0` (serial) so every existing
+    /// `KquantWriteOptions::default()` call site keeps its prior behavior.
+    pub jobs: usize,
 }
 
 /// Write model weights in Q4_K/Q6_K format, zero f32 intermediate on disk.
@@ -264,9 +276,13 @@ pub fn write_model_weights_kquant_with_opts(
     }
     ensure_standard_attention_supported(arch, SURFACE_Q4K_WEIGHT_WRITER)?;
     let num_layers = source.num_layers();
+    let jobs = opts.jobs.max(1);
+    if let Some(p) = profiler {
+        p.set_jobs(jobs);
+    }
 
-    attn::write_attn_weights_kquant(source, dir, num_layers, callbacks, &rec)?;
-    ffn::write_interleaved_ffn_kquant(source, dir, num_layers, opts, callbacks, &rec)?;
+    attn::write_attn_weights_kquant(source, dir, num_layers, jobs, callbacks, &rec)?;
+    ffn::write_interleaved_ffn_kquant(source, dir, num_layers, jobs, opts, callbacks, &rec)?;
     moe_layers::write_per_layer_moe_kquant(source, dir, num_layers, &rec)?;
 
     let norms_start = rec.now();

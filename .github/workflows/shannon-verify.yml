@@ -83,25 +83,24 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-hf-smollm2-
 
-      - name: Install BLAS (CPU forward path uses OpenBLAS)
+      - name: Install BLAS + Python (CPU forward path uses OpenBLAS)
+        # actions/setup-python@v6 has no prebuilt toolcache entries for
+        # `rust:1-bookworm` (Debian 12) — its binaries are published per
+        # Ubuntu/RHEL release only, so any requested version fails with
+        # "not found for debian 12". Bookworm ships CPython 3.11.2, which
+        # is plenty for the HF scoring scripts (>=3.9). `python3-venv` is
+        # required on Debian for `python3 -m venv` to work.
         run: |
           apt-get update
-          apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
+          apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev \
+                            python3 python3-venv
 
       - name: Build larql-cli (release)
         run: cargo build --release -p larql-cli
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          # `rust:1-bookworm` maps to Debian 12 in GitHub's Python toolcache.
-          # Python 3.12 isn't currently published there, but the repo only
-          # requires >=3.11 for the HF scoring scripts and Python bindings.
-          python-version: '3.11'
-
       - name: Install HF reference scorer deps
         run: |
-          python -m venv .venv
+          python3 -m venv .venv
           .venv/bin/pip install --upgrade pip
           # CPU-only torch — about 200 MB, ~30 s. Skips CUDA libs.
           .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
