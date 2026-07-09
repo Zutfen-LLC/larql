@@ -2,6 +2,7 @@
 #
 # Runs fmt + check + clippy + tests + bench test-mode on the Linux self-hosted
 # runner. No model weights or MLX required — the crate is pure Rust.
+# Containerized (rust:1-bookworm) for a hermetic cc/linker/libssl toolchain.
 
 name: larql-boundary
 
@@ -37,22 +38,19 @@ jobs:
     name: test · self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
+    container:
+      image: rust:1-bookworm
 
     steps:
-      - name: Reclaim root-owned workspace paths for host checkout
-        run: chmod -R a+rwX . || true
       - uses: actions/checkout@v6
 
-      - name: Install sccache (if missing)
+      - name: Install sccache
+        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary.
         # If MinIO is unreachable, fall back to compiling without cache.
         run: |
-          if ! command -v sccache >/dev/null 2>&1; then
-            curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
-            mkdir -p "$HOME/.local/bin"
-            mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache "$HOME/.local/bin/sccache"
-            chmod +x "$HOME/.local/bin/sccache"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          fi
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          chmod +x /usr/local/bin/sccache
           if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
             echo "::warning::MinIO cache unreachable — compiling without sccache"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -87,26 +85,27 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
+      - name: Reclaim root-owned workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX . || true
+
   coverage:
     name: coverage · self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
+    container:
+      image: rust:1-bookworm
 
     steps:
-      - name: Reclaim root-owned workspace paths for host checkout
-        run: chmod -R a+rwX . || true
       - uses: actions/checkout@v6
 
-      - name: Install sccache (if missing)
+      - name: Install sccache
+        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary.
         # If MinIO is unreachable, fall back to compiling without cache.
         run: |
-          if ! command -v sccache >/dev/null 2>&1; then
-            curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
-            mkdir -p "$HOME/.local/bin"
-            mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache "$HOME/.local/bin/sccache"
-            chmod +x "$HOME/.local/bin/sccache"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          fi
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          chmod +x /usr/local/bin/sccache
           if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
             echo "::warning::MinIO cache unreachable — compiling without sccache"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -116,10 +115,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-llvm-cov
-        # cargo install puts the binary in ~/.cargo/bin (no sudo); the
-        # taiki-e/install-action tries /usr/local/bin via sudo, which the
-        # bare host runner rejects (password required).
-        run: cargo install cargo-llvm-cov --locked --quiet
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Disable sccache for coverage instrumentation
         # sccache serves cached, uninstrumented object code, which suppresses
@@ -132,3 +128,7 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
+
+      - name: Reclaim root-owned workspace paths for host checkout
+        if: always()
+        run: chmod -R a+rwX . || true
