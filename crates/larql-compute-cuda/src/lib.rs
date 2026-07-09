@@ -1732,7 +1732,19 @@ mod tests {
 
     /// Decode parity: after a CPU prefill (to seed the host KV mirror via the
     /// `populate_kv_layer`-equivalent), CUDA's `decode_token` vs the CPU
-    /// direct decode step. Runtime-gated.
+    /// f32-activation decode step. Runtime-gated.
+    ///
+    /// The CPU reference is `predict_kquant_decode_step` (f32-activation
+    /// Q4_K/Q6_K matvec → dequant-then-BLAS), NOT the production
+    /// `predict_kquant_decode_step_direct` (int8 Q8_K SDOT). CUDA has no SDOT
+    /// instruction, so its decode pipeline — like its prefill pipeline and
+    /// the CPU `predict_kquant_prefill` reference — uses f32-activation
+    /// numerics (see `pipeline.rs` `host_attention_block` / `host_ffn_block`).
+    /// Comparing f32-activation (CUDA) against int8-SDOT (the `_direct`
+    /// production path) is a numerics mismatch by design (~2% scale-relative,
+    /// see `q8k_direct_proj_matches_f32_activation_within_quant_tolerance`),
+    /// not a CUDA bug. The f32 reference is the correct parity oracle here —
+    /// the same oracle the passing prefill parity test uses.
     #[test]
     fn decode_token_matches_cpu_reference_when_runtime_available() {
         let b = backend();
@@ -1765,19 +1777,18 @@ mod tests {
             .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
             .expect("prefill seeding should succeed");
 
-        // CPU reference: prefill then one direct decode step.
+        // CPU reference: prefill then one f32-activation decode step.
         let (_h_prefill, mut cpu_cache, _timings) =
             larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
         let next_tok = 4u32;
-        let cpu_decode = larql_compute::kquant_forward::predict_kquant_decode_step_direct(
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
             &weights,
             next_tok,
             &index,
-            &larql_compute::CpuBackend,
             &mut cpu_cache,
             seq_len,
         )
-        .expect("CPU direct decode step");
+        .expect("CPU f32 decode step");
 
         // CUDA decode of the same next token.
         let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
@@ -1800,9 +1811,16 @@ mod tests {
     }
 
     /// Multi-token decode parity: after prefill, run several decode steps and
-    /// compare each against the CPU direct decode path. This locks the RoPE
-    /// position fix — without it, the second+ token reuses the post-prefill
+    /// compare each against the CPU f32-activation decode path. This locks the
+    /// RoPE position fix — without it, the second+ token reuses the post-prefill
     /// position and diverges. Runtime-gated.
+    ///
+    /// Uses `predict_kquant_decode_step` (f32-activation) as the reference, not
+    /// `predict_kquant_decode_step_direct` (int8 Q8_K SDOT) — CUDA's decode
+    /// pipeline uses f32-activation numerics (no SDOT on CUDA), matching its
+    /// prefill pipeline and the `predict_kquant_prefill` reference. See
+    /// `decode_token_matches_cpu_reference_when_runtime_available` for the
+    /// full rationale.
     #[test]
     fn multi_token_decode_matches_cpu_reference() {
         let b = backend();
@@ -1834,22 +1852,21 @@ mod tests {
             .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
             .expect("prefill seeding should succeed");
 
-        // CPU reference: prefill then a sequence of direct decode steps.
+        // CPU reference: prefill then a sequence of f32-activation decode steps.
         let (_h_prefill, mut cpu_cache, _timings) =
             larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
 
         let next_tokens = [4u32, 5, 6, 7];
         let mut cpu_pos = seq_len;
         for tok in next_tokens {
-            let cpu_decode = larql_compute::kquant_forward::predict_kquant_decode_step_direct(
+            let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
                 &weights,
                 tok,
                 &index,
-                &larql_compute::CpuBackend,
                 &mut cpu_cache,
                 cpu_pos,
             )
-            .expect("CPU direct decode step");
+            .expect("CPU f32 decode step");
             cpu_pos += 1;
 
             let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
@@ -3587,6 +3604,241 @@ mod tests {
         assert!(
             result.is_err(),
             "reps == 0 should error, not silently launch"
+        );
+    }
+
+    // ── ASTAB-001C: focused native decode-attention parity ───────────────
+    //
+    // These exercise the CUDA `decode_attention` kernel directly (through
+    // `decode_attention_native`, which routes to the native kernel above the
+    // 8192 work gate and to the host reference below it) against the CPU
+    // `gqa_attention_decode_step` reference with small deterministic tensors.
+    // They cover single-head, multi-head, GQA (asymmetric Q-head vs KV-head),
+    // multi-position context, nonzero-scale, and nontrivial Q/K/V values —
+    // the cases the ASTAB-001 audit requires. Runtime-gated: clean no-op on
+    // hosts without CUDA (the early return mirrors the existing convention).
+    //
+    // The decode-attention kernel itself was confirmed correct against the
+    // host reference (the 0.1314532 decode-pipeline divergence was traced to
+    // an int8-Q8K-vs-f32-activation numerics mismatch between the production
+    // CPU decode reference and the CUDA f32-activation decode pipeline, NOT
+    // to the kernel — see `decode_token_matches_cpu_reference_when_runtime_available`).
+    // These tests pin the kernel's correctness directly so a future kernel
+    // regression can't hide behind the pipeline-level numerics choice.
+
+    /// Shared helper: run `decode_attention_native` above the work gate and
+    /// compare against the host `gqa_attention_decode_step` reference. Scales
+    /// the context length so the work (`num_q * total_len * head_dim`) clears
+    /// the 8192 native-dispatch gate, forcing the kernel path. Returns the
+    /// max absolute divergence.
+    #[allow(clippy::too_many_arguments)]
+    fn native_decode_attention_parity(
+        b: &CudaBackend,
+        num_q: usize,
+        num_kv: usize,
+        head_dim: usize,
+        total_len: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        q_vals: &[f32],
+        k_vals: &[f32],
+        v_vals: &[f32],
+    ) -> f32 {
+        let reps = num_q / num_kv;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let q = Array2::from_shape_vec((1, q_dim), q_vals.to_vec()).unwrap();
+        let k = Array2::from_shape_vec((total_len, kv_dim), k_vals.to_vec()).unwrap();
+        let v = Array2::from_shape_vec((total_len, kv_dim), v_vals.to_vec()).unwrap();
+
+        let got =
+            b.decode_attention_native(&q, &k, &v, num_q, head_dim, kv_dim, reps, scale, softcap);
+        let want = larql_compute::attention::decode::gqa_attention_decode_step(
+            &q, &k, &v, num_q, head_dim, reps, scale, softcap,
+        );
+        assert_eq!(got.shape(), want.shape());
+        let denom = want
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-3);
+        let mut max_diff = 0.0f32;
+        for (a, c) in got.iter().zip(want.iter()) {
+            max_diff = max_diff.max((a - c).abs());
+        }
+        // Scale-relative bound matching the existing decode-attention parity
+        // test (1e-4 * denom): the kernel mirrors the reference's f32 QKᵀ /
+        // f64 softmax sum / f32 weighted-V; only device `exp`/`tanhf` libm
+        // differences remain, well under 1e-4 relative.
+        assert!(
+            max_diff <= 1e-4 * denom,
+            "decode attention diverged from host reference by {max_diff} (> 1e-4 * {denom})"
+        );
+        max_diff
+    }
+
+    /// Single-head attention: `num_q == num_kv == 1` (reps = 1, no GQA).
+    /// Nontrivial Q/K/V values, multi-position context above the work gate.
+    #[test]
+    fn native_decode_attention_parity_single_head() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let head_dim = 128usize;
+        let num_q = 1usize;
+        let num_kv = 1usize;
+        // work = 1 * total_len * 128 >= 8192 → total_len >= 64.
+        let total_len = 64usize;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let q: Vec<f32> = (0..q_dim).map(|i| (i as f32 * 0.011).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.013).cos() * 0.4)
+            .collect();
+        let v: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.017).sin() * 0.3)
+            .collect();
+        let scale = (1.0_f64 / head_dim as f64).sqrt();
+        native_decode_attention_parity(
+            &b, num_q, num_kv, head_dim, total_len, scale, None, &q, &k, &v,
+        );
+    }
+
+    /// Multi-head attention: `num_q == num_kv` (reps = 1, no GQA), several
+    /// heads. Nontrivial Q/K/V.
+    #[test]
+    fn native_decode_attention_parity_multi_head() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let head_dim = 64usize;
+        let num_q = 8usize;
+        let num_kv = 8usize;
+        // work = 8 * total_len * 64 >= 8192 → total_len >= 16.
+        let total_len = 32usize;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let q: Vec<f32> = (0..q_dim)
+            .map(|i| (i as f32 * 0.019).sin() * 0.45)
+            .collect();
+        let k: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.021).cos() * 0.35)
+            .collect();
+        let v: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.023).sin() * 0.28)
+            .collect();
+        let scale = (1.0_f64 / head_dim as f64).sqrt();
+        native_decode_attention_parity(
+            &b, num_q, num_kv, head_dim, total_len, scale, None, &q, &k, &v,
+        );
+    }
+
+    /// GQA / asymmetric Q-head vs KV-head mapping: `num_q = 4 * num_kv`
+    /// (reps = 4). This is the shape that exercised the original decode
+    /// pipeline divergence; here the kernel is isolated from the pipeline.
+    #[test]
+    fn native_decode_attention_parity_gqa_asymmetric() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let head_dim = 64usize;
+        let num_kv = 4usize;
+        let num_q = 16usize; // reps = 4
+                             // work = 16 * total_len * 64 >= 8192 → total_len >= 8.
+        let total_len = 16usize;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let q: Vec<f32> = (0..q_dim).map(|i| (i as f32 * 0.031).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.033).cos() * 0.4)
+            .collect();
+        let v: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.037).sin() * 0.3)
+            .collect();
+        let scale = (1.0_f64 / head_dim as f64).sqrt();
+        native_decode_attention_parity(
+            &b, num_q, num_kv, head_dim, total_len, scale, None, &q, &k, &v,
+        );
+    }
+
+    /// Multi-position context (total_len > 1) with a nonzero attention scale
+    /// and softcap — exercises the `tanhf(s / softcap) * softcap` logit-capping
+    /// branch in the kernel, which the no-softcap cases don't reach.
+    #[test]
+    fn native_decode_attention_parity_softcap_multi_position() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let head_dim = 64usize;
+        let num_kv = 4usize;
+        let num_q = 16usize;
+        let total_len = 24usize;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let q: Vec<f32> = (0..q_dim).map(|i| (i as f32 * 0.041).sin() * 0.6).collect();
+        let k: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.043).cos() * 0.5)
+            .collect();
+        let v: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.047).sin() * 0.35)
+            .collect();
+        let scale = (1.0_f64 / head_dim as f64).sqrt();
+        native_decode_attention_parity(
+            &b,
+            num_q,
+            num_kv,
+            head_dim,
+            total_len,
+            scale,
+            Some(30.0),
+            &q,
+            &k,
+            &v,
+        );
+    }
+
+    /// A case shaped to shrink the 0.1314532 divergence: GQA with a context
+    /// length and head count matching the Q4K test fixture (num_q=4, num_kv=2,
+    /// head_dim=64) but scaled up past the work gate. If the divergence were
+    /// in the decode-attention kernel, this would reproduce a large max_abs;
+    /// it instead matches the reference within 1e-4 relative, confirming the
+    /// kernel is correct and the pipeline-level divergence was the int8-vs-f32
+    /// numerics mismatch (now fixed at the test-reference level).
+    #[test]
+    fn native_decode_attention_parity_fixture_shape_shrinks_divergence() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // Q4K test fixture: num_q=4, num_kv=2, head_dim=64 (hidden=256/4).
+        let head_dim = 64usize;
+        let num_q = 4usize;
+        let num_kv = 2usize;
+        // work = 4 * total_len * 64 >= 8192 → total_len >= 32.
+        let total_len = 48usize;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let q: Vec<f32> = (0..q_dim).map(|i| (i as f32 * 0.053).sin() * 0.4).collect();
+        let k: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.059).cos() * 0.3)
+            .collect();
+        let v: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32 * 0.061).sin() * 0.25)
+            .collect();
+        let scale = (1.0_f64 / head_dim as f64).sqrt();
+        let max_abs = native_decode_attention_parity(
+            &b, num_q, num_kv, head_dim, total_len, scale, None, &q, &k, &v,
+        );
+        // The kernel must NOT reproduce the 0.1314532 pipeline divergence —
+        // it must be within the 1e-4-relative parity bound (asserted inside
+        // the helper). This explicit check documents the expected magnitude.
+        assert!(
+            max_abs < 1e-3,
+            "decode-attention kernel diverged by {max_abs}; the 0.1314532 pipeline divergence was not in the kernel"
         );
     }
 
