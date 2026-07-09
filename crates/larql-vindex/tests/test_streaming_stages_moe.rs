@@ -386,21 +386,43 @@ fn write_synthetic_gemma4_hybrid_moe(
         );
     }
 
+    // The packed expert tensors (`experts.gate_up_proj` /
+    // `experts.down_proj`) are emitted as BF16: the Q4K writer's
+    // `get_packed_bf16` fetch rejects anything that isn't
+    // `Dtype::BF16`, so a PackedBF16 fixture must round-trip its experts
+    // as BF16 for `write_per_layer_moe_kquant` to see them. Everything
+    // else stays f32 — the streaming pipeline's f32 readers expect that.
+    let is_expert_tensor =
+        |name: &str| name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj");
+    let f32_to_bf16 = |f: f32| -> [u8; 2] {
+        let bits = f.to_bits();
+        // round-to-nearest-even, then take the top 16 bits.
+        let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) >> 16;
+        (rounded as u16).to_le_bytes()
+    };
     let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
         .iter()
         .map(|(name, shape)| {
             let data = &tensors[name];
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let bytes: Vec<u8> = if is_expert_tensor(name) {
+                data.iter().flat_map(|f| f32_to_bf16(*f)).collect()
+            } else {
+                data.iter().flat_map(|f| f.to_le_bytes()).collect()
+            };
             (name.clone(), bytes, shape.clone())
         })
         .collect();
     let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
         .iter()
         .map(|(name, bytes, shape)| {
+            let dtype = if is_expert_tensor(name) {
+                safetensors::Dtype::BF16
+            } else {
+                safetensors::Dtype::F32
+            };
             (
                 name.clone(),
-                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
-                    .unwrap(),
+                safetensors::tensor::TensorView::new(dtype, shape.clone(), bytes).unwrap(),
             )
         })
         .collect();
