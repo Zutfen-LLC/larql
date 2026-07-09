@@ -51,7 +51,7 @@ impl<'a> WalkFfn<'a> {
 
         let metal_q4 = self
             .backend
-            .and_then(|be| be.supports_quant(::larql_compute::QuantFormat::Q4_K).then_some(be));
+            .filter(|be| be.supports_quant(::larql_compute::QuantFormat::Q4_K));
 
         if let Some(be) = metal_q4 {
             // Metal: ONE GPU submission for all gate+up across ALL seq positions

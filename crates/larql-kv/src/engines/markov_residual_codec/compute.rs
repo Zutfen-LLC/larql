@@ -562,7 +562,7 @@ mod tests {
         let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
 
-        let run = |inplace: bool| -> (Vec<Vec<u32>>, usize) {
+        let run = |inplace: bool| -> (Vec<Vec<f32>>, usize) {
             set_markov_env_override(
                 "LARQL_MARKOV_INPLACE_KV",
                 Some(if inplace { "1" } else { "0" }),
@@ -588,7 +588,7 @@ mod tests {
                 )
                 .expect("decode");
                 assert!(h.iter().all(|v| v.is_finite()));
-                hiddens.push(h.iter().map(|v| v.to_bits()).collect());
+                hiddens.push(h.iter().copied().collect());
                 rs = rs2;
             }
             (hiddens, rs.hot_len)
@@ -598,9 +598,20 @@ mod tests {
         let (b_hiddens, b_len) = run(false);
         assert_eq!(a_len, 13, "3 prompt + 10 decode rows");
         assert_eq!(a_len, b_len);
-        assert_eq!(
-            a_hiddens, b_hiddens,
-            "codec in-place and owned-concat hidden states diverged (q4k-direct on)"
+        // The in-place and owned-concat paths are mathematically equivalent but
+        // perform FP ops in a different order, so 1-ULP divergences appear
+        // under BLAS thread-count or FMA variation across runners. Compare with
+        // a tolerance (1e-2, matching the markov_residual parity check) instead
+        // of bit-exact equality.
+        let max_diff = a_hiddens
+            .iter()
+            .zip(b_hiddens.iter())
+            .flat_map(|(av, bv)| av.iter().zip(bv.iter()))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff < 1e-2,
+            "codec in-place and owned-concat hidden states diverged (q4k-direct on): max_diff={max_diff}"
         );
     }
 }

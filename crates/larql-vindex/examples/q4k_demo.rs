@@ -196,7 +196,7 @@ fn main() {
     println!("  first 5 source:  {:?}", &source_sample[..5]);
     println!(
         "  first 5 dequant: {:?}",
-        &dequant[..5]
+        dequant[..5]
             .iter()
             .map(|x| (x * 10000.0).round() / 10000.0)
             .collect::<Vec<_>>()
