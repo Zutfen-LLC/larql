@@ -338,6 +338,7 @@ pub fn build_vindex_from_vectors(
         hidden_size,
         intermediate_size,
         vocab_size,
+        logical_vocab_size: None,
         embed_scale: architecture.embed_scale,
         layers: layer_infos,
         down_top_k: down_top_k_size,

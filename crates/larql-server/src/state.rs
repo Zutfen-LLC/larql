@@ -406,6 +406,7 @@ mod loaded_model_tests {
             hidden_size: 4,
             intermediate_size: 4,
             vocab_size: 4,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             extract_level: ExtractLevel::Browse,
             dtype: larql_vindex::StorageDtype::default(),

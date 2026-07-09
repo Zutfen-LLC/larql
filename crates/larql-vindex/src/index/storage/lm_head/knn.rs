@@ -64,7 +64,9 @@ impl VectorIndex {
                 let hidden = self.hidden_size;
                 if vocab > 0 {
                     if let Some(x) = query.as_slice() {
-                        if let Some(scores_vec) = backend.q4k_matvec(q4_data, x, vocab, hidden) {
+                        if let Some(mut scores_vec) = backend.q4k_matvec(q4_data, x, vocab, hidden)
+                        {
+                            self.mask_padding_rows(&mut scores_vec);
                             return Self::top_k_sorted(scores_vec, top_k);
                         }
                     }
@@ -150,21 +152,39 @@ impl VectorIndex {
                 let expected = vocab * hidden * 2;
                 if f16_mmap.len() >= expected {
                     if let Some(x) = query.as_slice() {
+                        // When the embedding tensor is padded above the
+                        // logical/tokenizer vocab (GGUF/kquant), restrict the
+                        // kernel to the logical rows `[0, logical)`. Padding
+                        // rows sit at the end (`[logical..vocab)`), so slicing
+                        // the mmap to `logical*hidden*2` and passing `logical`
+                        // as the vocab keeps them out of every top-K path
+                        // (including the in-kernel topk1/topk fast paths that
+                        // can't be masked post-hoc). When logical == physical
+                        // this is a no-op.
+                        let logical = self.logical_vocab_size.unwrap_or(vocab).min(vocab);
+                        let eff_expected = logical * hidden * 2;
                         if top_k == 1 {
-                            if let Some((idx, score)) =
-                                backend.f16_gemv_topk1(&f16_mmap[..expected], x, vocab, hidden)
-                            {
+                            if let Some((idx, score)) = backend.f16_gemv_topk1(
+                                &f16_mmap[..eff_expected],
+                                x,
+                                logical,
+                                hidden,
+                            ) {
                                 return Some(vec![(idx, score)]);
                             }
-                        } else if let Some(hits) =
-                            backend.f16_gemv_topk(&f16_mmap[..expected], x, vocab, hidden, top_k)
-                        {
+                        } else if let Some(hits) = backend.f16_gemv_topk(
+                            &f16_mmap[..eff_expected],
+                            x,
+                            logical,
+                            hidden,
+                            top_k,
+                        ) {
                             if !hits.is_empty() {
                                 return Some(hits);
                             }
                         }
                         if let Some(scores_vec) =
-                            backend.f16_gemv(&f16_mmap[..expected], x, vocab, hidden)
+                            backend.f16_gemv(&f16_mmap[..eff_expected], x, logical, hidden)
                         {
                             return Some(Self::top_k_sorted(scores_vec, top_k));
                         }
@@ -193,7 +213,10 @@ impl VectorIndex {
         let x = query.as_slice()?;
         backend
             .q4k_matvec_stride32(q4_data, x, vocab, hidden)
-            .map(|scores_vec| Self::top_k_sorted(scores_vec, top_k))
+            .map(|mut scores_vec| {
+                self.mask_padding_rows(&mut scores_vec);
+                Self::top_k_sorted(scores_vec, top_k)
+            })
     }
 
     /// Sort `scores` by descending value and keep the top `top_k`. Shared
@@ -280,6 +303,22 @@ impl VectorIndex {
         heap.into_iter().map(|(s, i)| (i, s)).collect()
     }
 
+    /// Mask padding rows in a full-vocab score vector. When
+    /// `logical_vocab_size` is set and smaller than `vocab_size` (GGUF/kquant
+    /// padding — e.g. Qwen2.5: 151936 physical rows vs 151643 logical
+    /// tokens), the rows in `[logical..vocab)` are padding and must never be
+    /// sampled. Setting them to `-inf` keeps emitted token IDs in the valid
+    /// `[0, logical)` tokenizer range. No-op when logical == physical.
+    ///
+    /// Called by every lm_head dispatch path (Q4_K, f16, f32) before top-K.
+    fn mask_padding_rows(&self, scores: &mut [f32]) {
+        if let Some(logical) = self.logical_vocab_size {
+            if logical < scores.len() {
+                scores[logical..].fill(f32::NEG_INFINITY);
+            }
+        }
+    }
+
     /// KNN against lm_head: find top-K tokens by dot product with query vector.
     /// Single BLAS gemv: query[1, hidden] @ lm_head[vocab, hidden]^T → [1, vocab].
     /// Then top-K selection. Returns (token_id, score) sorted by score descending.
@@ -313,7 +352,12 @@ impl VectorIndex {
         let cpu = larql_compute::CpuBackend;
         use larql_compute::MatMul;
         let result = cpu.matmul_transb(x, lm_view); // [1, hidden] @ [vocab, hidden]^T → [1, vocab]
-        let scores = ndarray::Array1::from_vec(result.into_raw_vec_and_offset().0);
+        let mut scores = ndarray::Array1::from_vec(result.into_raw_vec_and_offset().0);
+
+        // Mask padding rows so they can never be sampled (VINDEX-001).
+        if let Some(slice) = scores.as_slice_mut() {
+            self.mask_padding_rows(slice);
+        }
 
         // Top-K selection
         let mut indexed: Vec<(u32, f32)> = scores
@@ -449,6 +493,50 @@ mod tests {
         assert_eq!(hits.len(), 2);
     }
 
+    /// VINDEX-001: padding rows in `[logical..physical)` must never be
+    /// sampled. This vindex has 4 physical rows but `logical_vocab_size =
+    /// Some(3)`; row 3 (a padding row) is engineered to be the highest-
+    /// scoring row for the query. Without masking it would be the argmax;
+    /// with masking it must be excluded and a logical row returned instead.
+    #[test]
+    fn lm_head_knn_masks_padding_rows_when_logical_vocab_set() {
+        // rows: token0, token1, token2 (logical), then row3 = padding.
+        // Query [1, 1]: scores = [1, 1, 1, 1000] — padding row dominates.
+        let lm_head: Vec<f32> = vec![
+            1.0, 0.0, // token 0 → 1.0
+            0.0, 1.0, // token 1 → 1.0
+            0.5, 0.5, // token 2 → 1.0
+            50.0, 50.0, // padding row 3 → 100.0 (would dominate)
+        ];
+        let mut v = vindex_with_lm_head(4, 2, &lm_head);
+        v.logical_vocab_size = Some(3);
+        let q = Array1::from_vec(vec![1.0_f32, 1.0]);
+        let hits = v.lm_head_knn(&q, 1);
+        assert_eq!(hits.len(), 1);
+        // The padding row (id 3) is masked — one of the logical rows wins.
+        let (id, _score) = hits[0];
+        assert!(
+            id < 3,
+            "padding row {id} must never be sampled; logical_vocab=3"
+        );
+    }
+
+    /// VINDEX-001: when `logical_vocab_size` is unset (`None`), no masking
+    /// happens — every physical row is a candidate. Pins backward-compat for
+    /// non-padded models.
+    #[test]
+    fn lm_head_knn_no_masking_when_logical_vocab_unset() {
+        let lm_head: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.5, 50.0, 50.0];
+        let v = vindex_with_lm_head(4, 2, &lm_head);
+        // logical_vocab_size is None by default.
+        assert_eq!(v.logical_vocab_size, None);
+        let q = Array1::from_vec(vec![1.0_f32, 1.0]);
+        let hits = v.lm_head_knn(&q, 1);
+        assert_eq!(hits.len(), 1);
+        // No masking → row 3 (score 100) wins as expected.
+        assert_eq!(hits[0].0, 3);
+    }
+
     // ── lm_head_stride32_mode ──
 
     /// RAII override for `LARQL_LM_HEAD_STRIDE32` via the larql-compute
@@ -581,5 +669,58 @@ mod tests {
         // f16 returns None (vocab=0), f32 fallback also vocab=0 → empty.
         let hits = v.lm_head_knn_backend(&q, 1, &cpu);
         assert!(hits.is_empty());
+    }
+
+    /// VINDEX-001: `lm_head_f16_backend_hits` must respect
+    /// `logical_vocab_size`. We populate both an f32 and an f16 lm_head
+    /// (tied-embed shape), set `logical_vocab_size = 3` on a 4-row tensor,
+    /// and engineer the padding row (id 3) to dominate the query. On the
+    /// CPU backend the specialised f16 GEMV kernels return `None`, so the
+    /// dispatch path runs (exercising the `logical`/`eff_expected` slicing)
+    /// then falls through to the f32 path — where masking must still
+    /// exclude the padding row. Pins the contract for both `top_k == 1`
+    /// (topk1 branch) and `top_k > 1` (topk branch).
+    #[test]
+    fn lm_head_f16_dispatch_masks_padding_rows_when_logical_vocab_set() {
+        // 4 physical rows × 2 hidden; row 3 is padding and dominates
+        // query [1, 1] (score 100 vs 1 for the logical rows).
+        let lm_head: Vec<f32> = vec![
+            1.0, 0.0, // token 0 → 1.0
+            0.0, 1.0, // token 1 → 1.0
+            0.5, 0.5, // token 2 → 1.0
+            50.0, 50.0, // padding row 3 → 100.0 (would dominate)
+        ];
+        let f16_bytes = larql_models::quant::half::encode_f16(&lm_head);
+        let mut anon = memmap2::MmapOptions::new()
+            .len(f16_bytes.len())
+            .map_anon()
+            .unwrap();
+        anon.copy_from_slice(&f16_bytes);
+        let f16_mmap = anon.make_read_only().unwrap();
+
+        let mut v = vindex_with_lm_head(4, 2, &lm_head);
+        v.set_lm_head_f16_mmap(std::sync::Arc::new(f16_mmap));
+        v.logical_vocab_size = Some(3);
+
+        let cpu = larql_compute::CpuBackend;
+        let q = Array1::from_vec(vec![1.0_f32, 1.0]);
+
+        // top_k == 1 → exercises the f16_gemv_topk1 branch.
+        let hits = v.lm_head_knn_backend(&q, 1, &cpu);
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].0 < 3,
+            "padding row {} must never be sampled; logical_vocab=3",
+            hits[0].0
+        );
+
+        // top_k > 1 → exercises the f16_gemv_topk branch.
+        let hits = v.lm_head_knn_backend(&q, 2, &cpu);
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter().all(|(id, _)| *id < 3),
+            "padding rows sampled: {:?}; logical_vocab=3",
+            hits
+        );
     }
 }

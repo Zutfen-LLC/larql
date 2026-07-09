@@ -16,7 +16,23 @@ impl<'a> StreamingContext<'a> {
             .tensor_source
             .get_tensor_f32(&embed_key)?
             .ok_or_else(|| VindexError::MissingTensor(embed_key.clone()))?;
-        self.vocab_size = embed.shape()[0];
+        // Physical vocab = actual embedding row count (GGUF/kquant may pad
+        // above the tokenizer vocab; e.g. Qwen2.5: 151936 rows vs 151643
+        // tokens). The lm_head matmul and byte-length checks all use the
+        // physical count. Preserve the smaller logical/tokenizer vocab so
+        // the loader can mask padding rows during sampling.
+        let physical = embed.shape()[0];
+        self.vocab_size = physical;
+        let cfg_vocab = self
+            .arch
+            .config()
+            .vocab_size
+            .filter(|&v| v > 0 && v < physical);
+        let logical = cfg_vocab.or_else(|| {
+            let tok_vocab = self.tokenizer.get_vocab_size(false);
+            (tok_vocab > 0 && tok_vocab < physical).then_some(tok_vocab)
+        });
+        self.logical_vocab_size = logical;
         let embed_data = embed.as_slice().unwrap();
         let embed_bytes = crate::config::dtype::encode_floats(embed_data, self.dtype);
         std::fs::write(self.output_dir.join(EMBEDDINGS_BIN), &embed_bytes)?;

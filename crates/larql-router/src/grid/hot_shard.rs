@@ -59,7 +59,7 @@ impl GridState {
         }
         let mut out: Vec<(String, u32, u32, u32, u32)> = max_rate
             .into_iter()
-            .filter_map(|(k, v)| if v > threshold { Some(k) } else { None })
+            .filter_map(|(k, v)| (v > threshold).then_some(k))
             .collect();
         out.sort();
         out

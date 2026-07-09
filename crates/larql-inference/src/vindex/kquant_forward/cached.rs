@@ -724,6 +724,7 @@ mod branch_tests {
             hidden_size: Q4K_TEST_HIDDEN,
             intermediate_size: Q4K_TEST_INTER,
             vocab_size: Q4K_TEST_VOCAB,
+            logical_vocab_size: None,
             head_dim,
             num_q_heads: num_q,
             num_kv_heads: num_kv,

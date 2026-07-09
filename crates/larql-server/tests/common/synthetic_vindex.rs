@@ -142,6 +142,7 @@ fn make_weights() -> larql_models::ModelWeights {
         hidden_size: hidden,
         intermediate_size: intermediate,
         vocab_size,
+        logical_vocab_size: None,
         head_dim: hidden,
         num_q_heads: 1,
         num_kv_heads: 1,

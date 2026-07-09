@@ -58,7 +58,6 @@ pub(super) const TOKENIZER_MODEL: &str = "model";
 pub(super) const TOKENIZER_VOCAB: &str = "vocab";
 
 pub(super) const GGUF_OUTPUT_WEIGHT: &str = "output.weight";
-pub(super) const DEFAULT_GGUF_VOCAB_SIZE: usize = 262_144;
 pub(super) const GEMMA4_GGUF_HEAD_DIM: u32 = 256;
 
 pub(super) const GGUF_TO_HF_KEY_REPLACEMENTS: &[(&str, &str)] = &[

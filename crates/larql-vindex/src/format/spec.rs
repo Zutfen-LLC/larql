@@ -238,6 +238,7 @@ mod tests {
             hidden_size: 256,
             intermediate_size: 1024,
             vocab_size: 32,
+            logical_vocab_size: None,
             embed_scale: 1.0,
             extract_level: ExtractLevel::Inference,
             dtype: StorageDtype::F16,

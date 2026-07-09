@@ -71,6 +71,12 @@ pub(super) struct StreamingContext<'a> {
     pub(super) checkpoint: crate::extract::checkpoint::Checkpoint,
     pub(super) layer_infos: Vec<VindexLayerInfo>,
     pub(super) vocab_size: usize,
+    /// Logical/tokenizer vocab when smaller than `vocab_size` (GGUF/kquant
+    /// padding). Set by the embeddings stage from `arch.config().vocab_size`
+    /// or the tokenizer when either is smaller than the physical embedding
+    /// row count. Written into `index.json` so the loader can mask padding
+    /// rows during sampling.
+    pub(super) logical_vocab_size: Option<usize>,
     /// Set by the embeddings stage; read by the down-meta stage. Held
     /// in an `Option` so down-meta can `take()` it if it ever needs to.
     pub(super) embed: Option<Array2<f32>>,
@@ -229,6 +235,7 @@ impl<'a> StreamingContext<'a> {
             checkpoint,
             layer_infos: Vec::new(),
             vocab_size: 0,
+            logical_vocab_size: None,
             embed: None,
         })
     }

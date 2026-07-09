@@ -436,9 +436,16 @@ pub(crate) fn load_gguf_filtered_with_validation_and_keep(
         .position_embed_key()
         .and_then(|key| normalized_tensors.get(key).cloned());
 
-    let vocab_size = expected_vocab_size
-        .or_else(|| (embed.shape()[0] > 0).then_some(embed.shape()[0]))
-        .unwrap_or(DEFAULT_GGUF_VOCAB_SIZE);
+    // Physical vocab = actual embedding/lm_head row count. GGUF/kquant
+    // pads the embedding tensor to a quantisation block boundary (e.g.
+    // Qwen2.5: 151936 physical rows vs 151643 logical tokens). The
+    // tensors ALWAYS carry the padded count, so `vocab_size` (used to
+    // size lm_head matmuls and byte-length checks) must be the physical
+    // count. The logical/tokenizer vocab is preserved separately so the
+    // sampling path can mask padding rows — keeping emitted token IDs
+    // in the valid `[0, logical)` range.
+    let physical_vocab = embed.shape()[0];
+    let logical_vocab = expected_vocab_size.filter(|&v| v > 0 && v < physical_vocab);
 
     let cfg_clone = cfg.clone();
     Ok(ModelWeights {
@@ -454,7 +461,8 @@ pub(crate) fn load_gguf_filtered_with_validation_and_keep(
         num_layers: cfg_clone.num_layers,
         hidden_size: cfg_clone.hidden_size,
         intermediate_size: cfg_clone.intermediate_size,
-        vocab_size,
+        vocab_size: physical_vocab,
+        logical_vocab_size: logical_vocab,
         head_dim: cfg_clone.head_dim,
         num_q_heads: cfg_clone.num_q_heads,
         num_kv_heads: cfg_clone.num_kv_heads,
@@ -884,6 +892,91 @@ mod tests {
         assert_eq!(weights.lm_head.shape(), &[8, 4]);
         assert_eq!(weights.vocab_size, 8);
         assert!(weights.raw_bytes.is_empty());
+    }
+
+    /// VINDEX-001: GGUF/kquant pads the embedding tensor above the
+    /// logical/tokenizer vocab (e.g. Qwen2.5: 151936 physical rows vs
+    /// 151643 logical tokens reported in `*.vocab_size` metadata). The
+    /// loader must keep the physical row count as `vocab_size` (what the
+    /// tensors actually contain) and record the smaller logical value in
+    /// `logical_vocab_size` so the sampling path can mask padding rows.
+    /// Before the fix the loader picked the metadata value (151643) and
+    /// discarded the physical count, producing a self-inconsistent
+    /// `ModelWeights` that corrupted downstream extraction + inference.
+    #[test]
+    fn load_gguf_padded_vocab_keeps_physical_and_records_logical() {
+        const HIDDEN: u64 = 4;
+        const LOGICAL_VOCAB: u64 = 50; // metadata `llama.vocab_size`
+        const PHYSICAL_VOCAB: u64 = 64; // actual token_embd rows (padded)
+        let f32t = crate::quant::ggml::TYPE_F32;
+        let align32 = |n: u64| n.div_ceil(32) * 32;
+
+        let embed = vec![0u8; (HIDDEN * PHYSICAL_VOCAB * 4) as usize];
+        let norm = vec![0u8; (HIDDEN * 4) as usize];
+        // output.weight also padded to physical rows (tied-shape).
+        let output = vec![0u8; (HIDDEN * PHYSICAL_VOCAB * 4) as usize];
+        let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = vec![
+            (
+                "token_embd.weight",
+                vec![HIDDEN, PHYSICAL_VOCAB],
+                f32t,
+                embed,
+            ),
+            ("output.weight", vec![HIDDEN, PHYSICAL_VOCAB], f32t, output),
+            ("output_norm.weight", vec![HIDDEN], f32t, norm),
+        ];
+        let mut offsets = Vec::with_capacity(tensors.len());
+        let mut running = 0u64;
+        for (_, _, _, data) in &tensors {
+            offsets.push(running);
+            running = align32(running + data.len() as u64);
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&9u64.to_le_bytes()); // n_metadata (one more: vocab_size)
+        kq_meta_str(&mut buf, "general.architecture", "llama");
+        kq_meta_u32(&mut buf, "llama.embedding_length", HIDDEN as u32);
+        // The logical/tokenizer vocab — SMALLER than the embedding rows.
+        kq_meta_u32(&mut buf, "llama.vocab_size", LOGICAL_VOCAB as u32);
+        kq_meta_u32(&mut buf, "llama.block_count", 1);
+        kq_meta_u32(&mut buf, "llama.feed_forward_length", 16);
+        kq_meta_u32(&mut buf, "llama.attention.head_count", 2);
+        kq_meta_u32(&mut buf, "llama.attention.head_count_kv", 2);
+        kq_meta_u32(&mut buf, "llama.attention.key_length", 2);
+        kq_meta_f32(&mut buf, "llama.rope.freq_base", 10000.0);
+        for ((name, dims, ty, _), &off) in tensors.iter().zip(&offsets) {
+            kq_tensor_info(&mut buf, name, dims, *ty, off);
+        }
+        let pad = (32 - (buf.len() % 32)) % 32;
+        buf.resize(buf.len() + pad, 0);
+        let data_start = buf.len();
+        for ((_, _, _, data), &off) in tensors.iter().zip(&offsets) {
+            buf.resize(data_start + off as usize, 0);
+            buf.extend_from_slice(data);
+        }
+
+        let (_dir, path) = write_tmp_gguf(&buf);
+        let weights = load_gguf(&path).unwrap();
+
+        // Physical row count wins — matches the actual tensor contents.
+        assert_eq!(
+            weights.embed.shape(),
+            &[PHYSICAL_VOCAB as usize, HIDDEN as usize]
+        );
+        assert_eq!(
+            weights.lm_head.shape(),
+            &[PHYSICAL_VOCAB as usize, HIDDEN as usize]
+        );
+        assert_eq!(weights.vocab_size, PHYSICAL_VOCAB as usize);
+        // The smaller logical/tokenizer vocab is preserved separately.
+        assert_eq!(
+            weights.logical_vocab_size,
+            Some(LOGICAL_VOCAB as usize),
+            "logical vocab must be recorded when smaller than physical"
+        );
     }
 
     #[test]

@@ -127,6 +127,7 @@ fn build_minimal_vindex() -> (
         hidden_size: hidden,
         intermediate_size: *per_layer_features.iter().max().unwrap(),
         vocab_size: 16,
+        logical_vocab_size: None,
         embed_scale: 1.0,
         extract_level: ExtractLevel::Browse,
         dtype: StorageDtype::F32,

@@ -336,6 +336,10 @@ fn load_model_dir_filtered_with_validation(
 
     let vocab_size = lm_head.shape()[0];
     let cfg = arch.config();
+    // Preserve a smaller logical/tokenizer vocab when config declares one
+    // and the embedding/lm_head tensor is padded above it. Mirrors the
+    // GGUF loader's physical-vs-logical split.
+    let logical_vocab_size = cfg.vocab_size.filter(|&v| v > 0 && v < vocab_size);
 
     Ok(ModelWeights {
         tensors,
@@ -351,6 +355,7 @@ fn load_model_dir_filtered_with_validation(
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
         vocab_size,
+        logical_vocab_size,
         head_dim: cfg.head_dim,
         num_q_heads: cfg.num_q_heads,
         num_kv_heads: cfg.num_kv_heads,
