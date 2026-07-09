@@ -138,3 +138,14 @@ jobs:
             --python .venv/bin/python \
             --hf-script scripts/shannon_score_hf.py \
             --hf-device cpu
+
+      - name: Reclaim root-owned target/ for the host
+        # This job runs in a `rust:1-bookworm` container, so target/ is
+        # owned by root. Non-containerized jobs sharing this workspace
+        # (larql-models et al.) then fail at checkout's `git clean` with
+        # "Permission denied" — before any build runs. Make the tree
+        # world-writable so the host can remove it. `if: always()` covers
+        # the failed-job path too (cancellations skip it, but those are
+        # rare here).
+        if: always()
+        run: chmod -R a+rwX target || true

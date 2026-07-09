@@ -83,6 +83,17 @@ jobs:
       - name: Backend contract tests
         run: cargo test -p larql-compute --test test_backend_matmul_quant
 
+      - name: Reclaim root-owned target/ for the host
+        # This job runs in a `rust:1-bookworm` container, so target/ is
+        # owned by root. Non-containerized jobs sharing this workspace
+        # (larql-models et al.) then fail at checkout's `git clean` with
+        # "Permission denied" — before any build runs. Make the tree
+        # world-writable so the host can remove it. `if: always()` covers
+        # the failed-job path too (cancellations skip it, but those are
+        # rare here).
+        if: always()
+        run: chmod -R a+rwX target || true
+
   coverage:
     name: coverage · self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
@@ -110,3 +121,11 @@ jobs:
         # `scripts/check_coverage_policy.py`, so any regression on
         # per-file floors or the total floor fails CI here.
         run: make larql-compute-coverage-summary
+
+      - name: Reclaim root-owned target/ for the host
+        # See the same-named step in the `test` job above: this container
+        # writes target/llvm-cov-target/ as root, which the host cannot
+        # git-clean at the next checkout. Make it world-writable.
+        # `if: always()` so a failed coverage run still reclaims the tree.
+        if: always()
+        run: chmod -R a+rwX target || true

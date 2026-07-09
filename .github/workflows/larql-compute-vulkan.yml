@@ -7,32 +7,17 @@
 # of only on a developer machine with a GPU.
 #
 # No GPU is required, and no runtime tests are executed.
+#
+# DORMANT: `larql-compute-vulkan` is currently a scaffold that delegates to
+# CPU reference implementations (`supports_*` all return false). To avoid
+# spending self-hosted runner time verifying a stub against upstream trait
+# changes, this workflow is gated to manual dispatch only. When real Vulkan
+# kernel work begins, restore push/pull_request triggers with the original
+# path set (larql-compute/models/vindex/inference + Cargo files).
 
 name: larql-compute-vulkan
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - crates/larql-compute-vulkan/**
-      - crates/larql-compute/**
-      - crates/larql-models/**
-      - crates/larql-vindex/**
-      - crates/larql-inference/**
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/larql-compute-vulkan.yml
-  pull_request:
-    branches: [main]
-    paths:
-      - crates/larql-compute-vulkan/**
-      - crates/larql-compute/**
-      - crates/larql-models/**
-      - crates/larql-vindex/**
-      - crates/larql-inference/**
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/larql-compute-vulkan.yml
   workflow_dispatch: {}
 
 jobs:
@@ -87,3 +72,14 @@ jobs:
         # facade (optional dep + `larql-vindex/vulkan`) still compiles
         # end-to-end.
         run: cargo check -p larql-inference --features vulkan
+
+      - name: Reclaim root-owned target/ for the host
+        # This job runs in a `rust:1-bookworm` container, so target/ is
+        # owned by root. Non-containerized jobs sharing this workspace
+        # (larql-models et al.) then fail at checkout's `git clean` with
+        # "Permission denied" — before any build runs. Make the tree
+        # world-writable so the host can remove it. `if: always()` covers
+        # the failed-job path too (cancellations skip it, but those are
+        # rare here).
+        if: always()
+        run: chmod -R a+rwX target || true
