@@ -27,6 +27,16 @@ on:
       - '.github/workflows/larql-compute.yml'
   workflow_dispatch: {}
 
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: sccache
+  SCCACHE_ENDPOINT: http://10.0.0.33:9000
+  SCCACHE_S3_USE_SSL: "false"
+  AWS_ACCESS_KEY_ID: sccache
+  AWS_SECRET_ACCESS_KEY: QurhTA4fSewUayZI7z5ovNmO
+  SCCACHE_CACHE_SIZE: 20G
+  SCCACHE_REGION: us-east-1
+
 jobs:
   test:
     name: test · self-hosted-linux-x64
@@ -38,6 +48,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install sccache
+        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary.
+        # If MinIO is unreachable, fall back to compiling without cache.
+        run: |
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          chmod +x /usr/local/bin/sccache
+          if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
+            echo "::warning::MinIO cache unreachable — compiling without sccache"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
+
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,17 +69,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
-
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-compute-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-compute-
 
       - name: Format check
         run: cargo fmt -p larql-compute -- --check
@@ -83,9 +94,13 @@ jobs:
       - name: Backend contract tests
         run: cargo test -p larql-compute --test test_backend_matmul_quant
 
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
-        run: chmod -R a+rwX .git target || true
+        run: chmod -R a+rwX . || true
   coverage:
     name: coverage · self-hosted-linux-x64
     runs-on: [self-hosted, Linux, X64]
@@ -95,6 +110,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install sccache
+        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary.
+        # If MinIO is unreachable, fall back to compiling without cache.
+        run: |
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          chmod +x /usr/local/bin/sccache
+          if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
+            echo "::warning::MinIO cache unreachable — compiling without sccache"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -107,12 +134,21 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Disable sccache for coverage instrumentation
+        # sccache serves cached, uninstrumented object code, which suppresses
+        # llvm-cov region/line measurement. Run the coverage build uncached.
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
       - name: Coverage policy gate
         # `make larql-compute-coverage-summary` runs `cargo llvm-cov`
         # with `--fail-under-lines` AND invokes
         # `scripts/check_coverage_policy.py`, so any regression on
         # per-file floors or the total floor fails CI here.
         run: make larql-compute-coverage-summary
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
-        run: chmod -R a+rwX .git target || true
+        run: chmod -R a+rwX . || true
