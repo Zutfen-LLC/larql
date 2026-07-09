@@ -265,12 +265,18 @@ mod tests {
             "attention_prefill_async hidden vs sync attention_prefill",
         );
 
-        // K/V parity holds on every platform once the Windows CI
-        // job sets `OPENBLAS_NUM_THREADS=1` + `OMP_NUM_THREADS=1` +
-        // `RUST_TEST_THREADS=1` (root-cause fix for the
-        // `BLAS : Bad memory unallocation!` flake — see
-        // `.github/workflows/larql-inference.yml`). The earlier
-        // `#[cfg(not(windows))]` gate is gone with the CI fix.
+        // K/V parity holds once OpenBLAS is pinned to a single thread.
+        // Without that, OpenBLAS' pthread worker pool races on its global
+        // buffer pool when multiple cargo test threads enter BLAS matmuls
+        // concurrently — on Windows this surfaces as
+        // `BLAS : Bad memory unallocation!`; on the many-core self-hosted
+        // Linux runner it surfaces as a SIGSEGV (signal 11) in the lib
+        // test binary. The larql-inference workflow sets
+        // `OPENBLAS_NUM_THREADS=1` + `OMP_NUM_THREADS=1` +
+        // `RUST_TEST_THREADS=1` in its `env:` block to collapse the pool
+        // and serialise the runner (see .github/workflows/larql-inference.yml;
+        // root-cause analysis in commit 351b1ac4). The earlier
+        // `#[cfg(not(windows))]` gate is gone with that CI fix.
         let (k_sync, v_sync) = backend.read_kv_to_host(&handle_sync).unwrap();
         let (k_async, v_async) = backend.read_kv_to_host(&handle_async).unwrap();
         assert_array_close(&k_sync, &k_async, "prefill K");

@@ -48,6 +48,19 @@ env:
   AWS_SECRET_ACCESS_KEY: QurhTA4fSewUayZI7z5ovNmO
   SCCACHE_CACHE_SIZE: 20G
   SCCACHE_REGION: us-east-1
+  # Collapse OpenBLAS to single-threaded mode and serialise the cargo
+  # test runner. Without these, OpenBLAS' pthread worker pool races on
+  # its global buffer pool when multiple cargo test threads enter BLAS
+  # matmuls concurrently, intermittently SIGSEGV-ing the lib test binary
+  # (`larql_inference-<hash>`, signal 11). The async sync-vs-async K/V
+  # parity tests in crates/larql-compute/src/async_compute_backend/cpu.rs
+  # are the heaviest matmul callers that trip it. Same root-cause fix
+  # proven on Windows in commit 351b1ac4; the self-hosted Linux runner
+  # has enough cores (22+) to surface the race too. The inference test
+  # set finishes in ~3 s, so single-threaded BLAS is negligible cost.
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
+  RUST_TEST_THREADS: "1"
 
 jobs:
   test:
