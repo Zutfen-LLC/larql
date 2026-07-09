@@ -104,50 +104,8 @@ jobs:
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
         run: chmod -R a+rwX . || true
-  coverage:
-    name: coverage - self-hosted-linux-x64
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 45
-    container:
-      image: rust:1-bookworm
 
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install sccache
-        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary.
-        # If MinIO is unreachable, fall back to compiling without cache.
-        run: |
-          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
-          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-          chmod +x /usr/local/bin/sccache
-          if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
-            echo "::warning::MinIO cache unreachable — compiling without sccache"
-            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          fi
-
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install OpenBLAS
-        run: |
-          apt-get update
-          apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Disable sccache for coverage instrumentation
-        # sccache serves cached, uninstrumented object code, which suppresses
-        # llvm-cov region/line measurement. Run the coverage build uncached.
-        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-
-      - name: Coverage summary
-        run: cargo llvm-cov --package larql-inference --summary-only
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
-
-      - name: Reclaim root-owned Git workspace paths for host checkout
-        if: always()
-        run: chmod -R a+rwX . || true
+  # No coverage job: this crate's coverage was `cargo llvm-cov --summary-only`
+  # with no `--fail-under` threshold and no policy file — an uncached
+  # instrumented build that asserted nothing. (larql-compute and -models, the
+  # two crates this depends on, keep their gating coverage jobs.)
