@@ -2470,6 +2470,24 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 /// transparently falls back to a fresh compile, so the cache can never make
 /// CUDA unavailable. The PTX is keyed on the source text, the target arch, the
 /// `fmad` policy, and a cache-format/cudarc version component (see
+/// Discover directories NVRTC should search for CUDA headers (e.g.
+/// `cuda_fp16.h`). Checks `$CUDA_HOME/include`, the Debian/Ubuntu
+/// `/usr/include` (where `nvidia-cuda-dev` places headers), and the
+/// conventional `/usr/local/cuda/include`. Returns only directories that
+/// actually exist and contain `cuda_fp16.h`.
+fn cuda_include_paths() -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(cuda_home) = std::env::var("CUDA_HOME") {
+        candidates.push(format!("{cuda_home}/include"));
+    }
+    candidates.push("/usr/local/cuda/include".to_string());
+    candidates.push("/usr/include".to_string());
+    candidates
+        .into_iter()
+        .filter(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists())
+        .collect()
+}
+
 /// [`crate::ptx_cache`]). After a successful compile the PTX text is written
 /// atomically (temp file + rename) so a crash can't leave a corrupt entry.
 fn compile_or_load_module(
@@ -2488,9 +2506,11 @@ fn compile_or_load_module(
             Err(_) => { /* fall through to recompile */ }
         }
     }
+    let include_paths = cuda_include_paths();
     let opts = CompileOptions {
         fmad: Some(fmad),
         arch: Some(arch),
+        include_paths,
         ..Default::default()
     };
     let ptx = compile_ptx_with_opts(src, opts)
