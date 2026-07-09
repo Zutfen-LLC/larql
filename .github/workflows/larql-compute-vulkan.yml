@@ -35,6 +35,15 @@ on:
       - .github/workflows/larql-compute-vulkan.yml
   workflow_dispatch: {}
 
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: sccache
+  SCCACHE_ENDPOINT: http://100.109.47.61:9000
+  SCCACHE_S3_USE_SSL: "false"
+  AWS_ACCESS_KEY_ID: sccache
+  AWS_SECRET_ACCESS_KEY: QurhTA4fSewUayZI7z5ovNmO
+  SCCACHE_CACHE_SIZE: 20G
+
 jobs:
   check:
     name: check · self-hosted-linux-x64
@@ -45,6 +54,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install sccache
+        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary
+        run: |
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          chmod +x /usr/local/bin/sccache
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -58,17 +74,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
-
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: Linux-cargo-compute-vulkan-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            Linux-cargo-compute-vulkan-
 
       - name: Format check
         run: cargo fmt -p larql-compute-vulkan -- --check
@@ -87,6 +92,10 @@ jobs:
         # facade (optional dep + `larql-vindex/vulkan`) still compiles
         # end-to-end.
         run: cargo check -p larql-inference --features vulkan
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
         run: chmod -R a+rwX .git target || true

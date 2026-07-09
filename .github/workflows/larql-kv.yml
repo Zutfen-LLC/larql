@@ -45,6 +45,13 @@ on:
 
 env:
   LARQL_KV_COVERAGE_MIN: 85
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: sccache
+  SCCACHE_ENDPOINT: http://100.109.47.61:9000
+  SCCACHE_S3_USE_SSL: "false"
+  AWS_ACCESS_KEY_ID: sccache
+  AWS_SECRET_ACCESS_KEY: QurhTA4fSewUayZI7z5ovNmO
+  SCCACHE_CACHE_SIZE: 20G
 
 jobs:
   test:
@@ -57,6 +64,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install sccache
+        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary
+        run: |
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          chmod +x /usr/local/bin/sccache
+
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -66,17 +80,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y libopenblas-dev pkg-config cmake g++ protobuf-compiler libssl-dev
-
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-kv-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-kv-
 
       - name: Format check
         run: cargo fmt -p larql-kv -- --check
@@ -101,6 +104,10 @@ jobs:
       - name: Benchmark compile/tests
         run: cargo test -p larql-kv --benches
 
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
         run: chmod -R a+rwX .git target || true
@@ -113,6 +120,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install sccache
+        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary
+        run: |
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
+          chmod +x /usr/local/bin/sccache
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -133,6 +147,10 @@ jobs:
           mkdir -p coverage/larql-kv
           cargo llvm-cov report --package larql-kv --json --summary-only --output-path coverage/larql-kv/summary.json
           python3 scripts/check_coverage_policy.py coverage/larql-kv/summary.json crates/larql-kv/coverage-policy.json
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
       - name: Reclaim root-owned Git workspace paths for host checkout
         if: always()
         run: chmod -R a+rwX .git target || true
