@@ -542,6 +542,10 @@ impl CudaBackend {
         inter: usize,
         li: usize,
     ) -> bool {
+        #[cfg(test)]
+        if self.resident_hidden_fallback_forced_for_test(li) {
+            return false;
+        }
         let head_dim = layer.head_dim;
         let num_q = layer.num_q_heads;
         let num_kv = layer.num_kv_heads;

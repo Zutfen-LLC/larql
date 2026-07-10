@@ -36,6 +36,10 @@ pub struct CudaBackend {
     /// via `device_info()` when `LARQL_GPU_DIAG=1`. Thread-safe (atomic).
     resident_hidden_uses: std::sync::atomic::AtomicU64,
     resident_hidden_fallbacks: std::sync::atomic::AtomicU64,
+    /// Test-only eligibility hook for exercising a resident → fallback →
+    /// resident transition without changing any layer math.
+    #[cfg(test)]
+    resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize,
 }
 
 impl CudaBackend {
@@ -55,6 +59,10 @@ impl CudaBackend {
                 resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_uses: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
+                    usize::MAX,
+                ),
             }),
             Err(err) if options.allow_cpu_delegate => Ok(Self {
                 options,
@@ -66,6 +74,10 @@ impl CudaBackend {
                 resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_uses: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
+                    usize::MAX,
+                ),
             }),
             Err(err) => Err(BackendInitError::Unavailable(err.to_string())),
         }
@@ -326,6 +338,24 @@ impl CudaBackend {
             self.resident_hidden_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Force one layer through the resident-hidden host fallback in tests.
+    /// This is intentionally backend-local and does not mutate the pipeline
+    /// layer, so the fallback and CPU reference retain identical semantics.
+    #[cfg(test)]
+    pub(crate) fn force_resident_hidden_fallback_layer_for_test(&self, layer: Option<usize>) {
+        use std::sync::atomic::Ordering;
+        self.resident_hidden_forced_fallback_layer
+            .store(layer.unwrap_or(usize::MAX), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_hidden_fallback_forced_for_test(&self, layer: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        self.resident_hidden_forced_fallback_layer
+            .load(Ordering::Relaxed)
+            == layer
     }
 
     /// A one-line diagnostic string for the resident-hidden decode usage, or
