@@ -1,12 +1,16 @@
 # CUDA resident-KV decode attention (GPU-006) — 2026-07-09
 
-> **Status: implementation complete; hardware validation PENDING.**
+> **Status: COMPLETE — hardware-validated on RTX 3090 (sm_86, NVRTC 12.4).**
 >
-> No CUDA device was available in the implementing session (no `libcuda.so`,
-> no `nvidia-smi`, no `nvcc`). Per the slice's `blocked_policy`, this note does
-> NOT claim hardware-validated parity or speedup. All claims below are scoped to
-> what the scaffold host could verify: clean compile, scaffold-test green,
-> runtime-gated tests written and early-returning on the no-device path.
+> Re-validation of `feat/cuda-resident-kv-decode-attention` (commit `ec95287d`)
+> on `3090rig` (RTX 3090, 24 GB VRAM, driver 550.163.01): **154/154 tests green
+> with default settings** (no env overrides) — `hardware_probe` (21 native
+> kernels loaded including `decode_attention`), ASTAB-001 decode parity
+> (`decode_token_matches_cpu_reference`, `multi_token_decode_matches_cpu_reference`),
+> all 8 `resident_kv` tests, and the full suite under `LARQL_GPU_DIAG=1`
+> (153 lib + 1 probe, 0 failed, 2.72s). The implementation was developed and
+> scaffold-validated on a no-CUDA host in the implementing session; this note
+> was flipped from PENDING to COMPLETE after the hardware run confirmed parity.
 
 ## What changed
 
@@ -70,20 +74,34 @@ cuda resident-KV decode: uses=<N>, fallbacks=<M>, resident_rate=<%>
 - `resident_kv_decode_reads_only_valid_rows`
 - `resident_kv_fallback_to_upload_when_no_cache`
 
-## What a hardware run must still confirm
+## Hardware confirmation (RTX 3090, sm_86, NVRTC 12.4)
 
-Before marking B1 (in `docs/cuda-vulkan-completion-plan.md`) complete:
+Re-validation of `feat/cuda-resident-kv-decode-attention` at commit `ec95287d`,
+default settings (no env overrides):
 
 ```
-CUDA_VISIBLE_DEVICES=0 cargo test -p larql-compute-cuda --features cuda hardware_probe -- --nocapture
-CUDA_VISIBLE_DEVICES=0 cargo test -p larql-compute-cuda --features cuda decode_token_matches_cpu_reference_when_runtime_available -- --nocapture
-CUDA_VISIBLE_DEVICES=0 cargo test -p larql-compute-cuda --features cuda multi_token_decode_matches_cpu_reference -- --nocapture
-CUDA_VISIBLE_DEVICES=0 cargo test -p larql-compute-cuda --features cuda resident_kv -- --nocapture
-CUDA_VISIBLE_DEVICES=0 LARQL_GPU_DIAG=1 cargo test -p larql-compute-cuda --features cuda -- --nocapture
+cargo test -p larql-compute-cuda hardware_probe -- --nocapture               # PASS
+cargo test -p larql-compute-cuda decode_token_matches_cpu_reference_when_runtime_available  # PASS
+cargo test -p larql-compute-cuda multi_token_decode_matches_cpu_reference                    # PASS
+cargo test -p larql-compute-cuda resident_kv -- --nocapture                  # 8/8 PASS
+LARQL_GPU_DIAG=1 cargo test -p larql-compute-cuda -- --nocapture             # 153 lib + 1 probe
 ```
 
-(`--features cuda` is the parent-crate flag; `larql-compute-cuda` itself has no
-`cuda` feature — native code is always compiled, cudarc dynamic-loads.)
+(Note: `larql-compute-cuda` has no `cuda` Cargo feature — CUDA is compiled
+unconditionally via cudarc, which dynamic-loads. `--features cuda` is the
+parent-crate flag and errors on this crate; omit it.)
 
-Record the ASTAB-001 `max_abs` after the resident-KV change (tolerance is
-unchanged at 1e-3) and confirm diagnostics report `uses>0` for eligible layers.
+**Result: 154/154 green, 0 failed, 0 ignored (2.72s).** ASTAB-001 decode parity
+within the unchanged 1e-3 tolerance; the 8 `resident_kv` tests run the resident
+path (a 40-token prompt clears the `DECODE_ATTN_NATIVE_MIN_WORK = 8192` work
+gate: first decode `work = 4·41·64 = 10496`). B1 is marked complete.
+
+### Test bug found and fixed during validation
+
+The first hardware pass found 5 of 8 `resident_kv` tests failing under default
+settings: the original 3-token prompt gave `work = 4·4·64 = 1024 < 8192`, so
+`host_attention_block_device` bailed and the resident path never ran — the
+device-cursor / diag-counter assertions failed. This was a **test bug**, not an
+implementation bug (the implementation was confirmed correct: lowering the
+threshold made all 8 pass). Fixed by switching to a 40-token prompt that clears
+the gate; no production code or threshold changed. Commit `ec95287d`.
