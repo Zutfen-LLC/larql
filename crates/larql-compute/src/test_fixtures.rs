@@ -19,9 +19,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use larql_models::quant::ggml::q6_k::dequantize_q6_k;
 use larql_models::ModelWeights;
 
-use crate::cpu::ops::q4_common::{dequantize_q4_k, quantize_q4_k};
+use crate::cpu::ops::q4_common::{dequantize_q4_k, quantize_q4_k, quantize_q6_k};
 use crate::kv_index::{KvIndex, FFN_COMPONENTS_PER_LAYER};
 
 /// Per-(layer, component) dequantised FFN block — lazily populated on first
@@ -263,6 +264,245 @@ pub fn make_q4k_fixture_index(weights: &ModelWeights) -> Q4kFixtureIndex {
     }
 }
 
+// ── Q4_K_M (mixed-format) fixture ─────────────────────────────────────
+//
+// A faithful `KvIndex` for the production-default Q4_K_M layout:
+//   attention: Q/K/O = Q4_K, V = Q6_K
+//   FFN:        gate/up = Q4_K, down = Q6_K
+// This mirrors the real `convert quantize q4k` output (gate/up Q4_K, down
+// Q6_K is the model-level mixture policy; V Q6_K is the attention-side mix
+// Qwen/Llama Q4_K_M extracts produce). It exists so the CUDA resident-hidden
+// path (GPU-007/D6) can be parity-tested against the mixed triple the real
+// default model ships, not just the uniform-Q4_K synthetic fixture.
+//
+// The structural difference from [`Q4kFixtureIndex`] is that FFN gate/up and
+// down have *different* per-matrix byte sizes (Q4_K = 144 B/super-block,
+// Q6_K = 210 B/super-block), so the contiguous FFN mmap is no longer a uniform
+// `per_matrix` stride. We track the two sizes explicitly and slice the per-
+// layer triple `[gate Q4_K | up Q4_K | down Q6_K]` at the right offsets.
+// Attention V is Q6_K while Q/K/O stay Q4_K, so `attn_kquant_layer_data`
+// returns a per-component tag ("Q4_K"/"Q6_K") and the per-layer offsets
+// already accommodate the V component's different size.
+
+/// `KvIndex` backed by the production-default Q4_K_M mixed quantization:
+/// attention Q/K/O = Q4_K, V = Q6_K; FFN gate/up = Q4_K, down = Q6_K. The
+/// faithful twin of [`Q4kFixtureIndex`] for the format users actually have.
+///
+/// Construct via [`make_q4km_fixture_index`].
+pub struct Q4kmFixtureIndex {
+    /// Concatenated FFN bytes across all layers, laid out per layer as
+    /// `[gate Q4_K | up Q4_K | down Q6_K]`. `gate_up_per_matrix` and
+    /// `down_per_matrix` give the per-component strides.
+    ffn_mmap: Vec<u8>,
+    /// Per-matrix byte size for the Q4_K gate/up components
+    /// (`Q4_K::packed_matrix_bytes(intermediate, hidden)`).
+    gate_up_per_matrix: usize,
+    /// Per-matrix byte size for the Q6_K down component
+    /// (`Q6_K::packed_matrix_bytes(hidden, intermediate)`).
+    down_per_matrix: usize,
+    /// Concatenated attention bytes for Q/K/V/O across all layers, laid out as
+    /// `[layer 0: Q, K, V, O; layer 1: Q, K, V, O; ...]`. Q/K/O are Q4_K; V is
+    /// Q6_K (the production Q4_K_M attention mix).
+    attn_mmap: Vec<u8>,
+    /// Per-layer (offset, length) pairs for Q/K/V/O in `attn_mmap`. V has a
+    /// different length (Q6_K vs Q4_K at the same shape) so the offsets aren't
+    /// a fixed stride.
+    attn_offsets: Vec<[(usize, usize); 4]>,
+    /// Per-(layer, component) dequantised FFN cache populated lazily on first
+    /// request through `kquant_ffn_layer_once` (gate/up via Q4_K dequant, down
+    /// via Q6_K dequant — format-aware, unlike the uniform-Q4_K fixture).
+    ffn_cache: FfnDequantCache,
+    /// Intermediate dimension — `num_features` returns this.
+    intermediate: usize,
+    /// Vocabulary size — `vocab_size` returns this.
+    vocab_size: usize,
+}
+
+impl KvIndex for Q4kmFixtureIndex {
+    fn num_features(&self, _layer: usize) -> usize {
+        self.intermediate
+    }
+
+    fn attn_kquant_layer_data(&self, layer: usize) -> Option<[(&[u8], &str); 4]> {
+        let offsets = self.attn_offsets.get(layer)?;
+        let attn = &self.attn_mmap;
+        // Q/K/O are Q4_K; V is Q6_K (production Q4_K_M attention mix).
+        Some([
+            (&attn[offsets[0].0..offsets[0].0 + offsets[0].1], "Q4_K"),
+            (&attn[offsets[1].0..offsets[1].0 + offsets[1].1], "Q4_K"),
+            (&attn[offsets[2].0..offsets[2].0 + offsets[2].1], "Q6_K"),
+            (&attn[offsets[3].0..offsets[3].0 + offsets[3].1], "Q4_K"),
+        ])
+    }
+
+    fn interleaved_kquant_layer_data(
+        &self,
+        layer: usize,
+    ) -> Option<[(&[u8], &str); FFN_COMPONENTS_PER_LAYER]> {
+        let gu = self.gate_up_per_matrix;
+        let dn = self.down_per_matrix;
+        let layer_start = layer * (gu * 2 + dn);
+        let mmap = &self.ffn_mmap;
+        if layer_start + 2 * gu + dn > mmap.len() {
+            return None;
+        }
+        // gate/up Q4_K, down Q6_K — the production Q4_K_M FFN mix.
+        Some([
+            (&mmap[layer_start..layer_start + gu], "Q4_K"),
+            (&mmap[layer_start + gu..layer_start + 2 * gu], "Q4_K"),
+            (
+                &mmap[layer_start + 2 * gu..layer_start + 2 * gu + dn],
+                "Q6_K",
+            ),
+        ])
+    }
+
+    fn interleaved_kquant_mmap_ref(&self) -> Option<&[u8]> {
+        Some(&self.ffn_mmap)
+    }
+
+    fn kquant_ffn_layer_once(&self, layer: usize, component: usize) -> Option<Arc<Vec<f32>>> {
+        use larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
+        if component >= FFN_COMPONENTS_PER_LAYER {
+            return None;
+        }
+        let mut cache = self.ffn_cache.lock().ok()?;
+        if let Some(cached) = cache.get(&(layer, component)) {
+            return Some(Arc::clone(cached));
+        }
+        let gu = self.gate_up_per_matrix;
+        let dn = self.down_per_matrix;
+        let layer_start = layer * (gu * 2 + dn);
+        // Component-major: gate/up are [intermediate × hidden] (Q4_K, 144 B/sb);
+        // down is [hidden × intermediate] (Q6_K, 210 B/sb) but stored transposed
+        // as feature-major (intermediate × hidden) for the consumer
+        // (`walk_ffn::kquant_ffn_forward_layer` indexes `w_down_t`). Element
+        // count is the same for all three (`intermediate × hidden`).
+        let (start, end, is_down) = match component {
+            0 => (layer_start, layer_start + gu, false),
+            1 => (layer_start + gu, layer_start + 2 * gu, false),
+            2 => (layer_start + 2 * gu, layer_start + 2 * gu + dn, true),
+            _ => return None,
+        };
+        if end > self.ffn_mmap.len() {
+            return None;
+        }
+        let bytes = &self.ffn_mmap[start..end];
+        // Element count per component = intermediate × hidden. Derive from the
+        // per-format block geometry (Q4_K: 144 B/256 elems; Q6_K: 210 B/256).
+        let bytes_per_sb = if is_down { 210 } else { 144 };
+        let n_elements = bytes.len() / bytes_per_sb * K_QUANT_BLOCK_ELEMS;
+        let arc = if is_down {
+            // `dequantize_q6_k` returns `Result<Vec<f32>, ModelError>`.
+            Arc::new(dequantize_q6_k(bytes, n_elements).ok()?)
+        } else {
+            Arc::new(dequantize_q4_k(bytes, n_elements))
+        };
+        cache.insert((layer, component), Arc::clone(&arc));
+        Some(arc)
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+}
+
+/// Build a [`Q4kmFixtureIndex`] from `weights`, quantizing each per-layer
+/// attention Q/K/O to Q4_K and V to Q6_K, and each FFN gate/up to Q4_K and
+/// down to Q6_K — the production-default Q4_K_M layout. Pair with
+/// [`larql_models::test_fixtures::make_test_q4k_weights_inter`] (or its
+/// `_layers` sibling); the shape constraint (every dim a multiple of 256)
+/// is the same as the uniform-Q4_K fixture.
+pub fn make_q4km_fixture_index(weights: &ModelWeights) -> Q4kmFixtureIndex {
+    let num_layers = weights.num_layers;
+    let arch = &*weights.arch;
+    let intermediate = weights.intermediate_size;
+    let vocab_size = weights.vocab_size;
+    let hidden = weights.hidden_size;
+
+    let q4k_for = |key: &str| -> Vec<u8> {
+        let tensor = weights
+            .tensors
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tensor {key} in test weights"));
+        let slice = tensor.as_slice().expect("contiguous row-major");
+        quantize_q4_k(slice)
+    };
+    let q6k_for = |key: &str| -> Vec<u8> {
+        let tensor = weights
+            .tensors
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tensor {key} in test weights"));
+        let slice = tensor.as_slice().expect("contiguous row-major");
+        quantize_q6_k(slice)
+    };
+
+    // Attention: Q/K/O = Q4_K, V = Q6_K (production Q4_K_M mix).
+    let mut attn_mmap: Vec<u8> = Vec::new();
+    let mut attn_offsets: Vec<[(usize, usize); 4]> = Vec::with_capacity(num_layers);
+    for layer in 0..num_layers {
+        let mut layer_offsets: [(usize, usize); 4] = [(0, 0); 4];
+        // Q, K, O are Q4_K; V is Q6_K. The keys come back in Q/K/V/O order but
+        // the mmap lays them out Q, K, V, O (the conventional attention order).
+        let q = q4k_for(&arch.attn_q_key(layer));
+        let k = q4k_for(&arch.attn_k_key(layer));
+        let v = q6k_for(&arch.attn_v_key(layer));
+        let o = q4k_for(&arch.attn_o_key(layer));
+        for (i, bytes) in [q, k, v, o].into_iter().enumerate() {
+            let offset = attn_mmap.len();
+            let length = bytes.len();
+            attn_mmap.extend_from_slice(&bytes);
+            layer_offsets[i] = (offset, length);
+        }
+        attn_offsets.push(layer_offsets);
+    }
+
+    // FFN: gate/up = Q4_K, down = Q6_K (production Q4_K_M mix).
+    let q4k = crate::QuantFormat::Q4_K;
+    let q6k = crate::QuantFormat::Q6_K;
+    let gate_up_per_matrix = q4k
+        .packed_matrix_bytes(intermediate, hidden)
+        .expect("Q4_K gate/up per-matrix bytes");
+    let down_per_matrix = q6k
+        .packed_matrix_bytes(hidden, intermediate)
+        .expect("Q6_K down per-matrix bytes");
+    let mut ffn_mmap: Vec<u8> = Vec::new();
+    for layer in 0..num_layers {
+        let gate = q4k_for(&arch.ffn_gate_key(layer));
+        let up = q4k_for(&arch.ffn_up_key(layer));
+        let down = q6k_for(&arch.ffn_down_key(layer));
+        assert_eq!(
+            gate.len(),
+            gate_up_per_matrix,
+            "Q4_K gate per-matrix size drifted across layers"
+        );
+        assert_eq!(
+            up.len(),
+            gate_up_per_matrix,
+            "Q4_K up per-matrix size drifted across layers"
+        );
+        assert_eq!(
+            down.len(),
+            down_per_matrix,
+            "Q6_K down per-matrix size drifted across layers"
+        );
+        ffn_mmap.extend_from_slice(&gate);
+        ffn_mmap.extend_from_slice(&up);
+        ffn_mmap.extend_from_slice(&down);
+    }
+
+    Q4kmFixtureIndex {
+        ffn_mmap,
+        gate_up_per_matrix,
+        down_per_matrix,
+        attn_mmap,
+        attn_offsets,
+        ffn_cache: std::sync::Mutex::new(HashMap::new()),
+        intermediate,
+        vocab_size,
+    }
+}
+
 /// Minimal `ComputeBackend` that overrides the `DecodeBackend` methods
 /// `kquant_forward::cached::fused_*` reaches: `supports_quant(Q4_K)`,
 /// `prefill_kquant`, `decode_token{,_with_state_dump}`. Each override
@@ -462,5 +702,65 @@ mod tests {
         // CpuBackend's `prefill_kquant` default returns None, so the
         // chain bottoms out there — but every gate above passes.
         assert!(result.is_none());
+    }
+
+    /// Smoke test for the mixed Q4_K_M fixture (`Q4kmFixtureIndex`): verify
+    /// every accessor returns sensible data with the production-default
+    /// per-component format mix (attn Q/K/O Q4_K, V Q6_K; FFN gate/up Q4_K,
+    /// down Q6_K), and that the format-aware `kquant_ffn_layer_once` dequants
+    /// both Q4_K (gate/up) and Q6_K (down) components correctly.
+    #[test]
+    fn q4km_fixture_index_returns_mixed_format_slices() {
+        let weights = make_test_q4k_weights();
+        let idx = make_q4km_fixture_index(&weights);
+
+        // Trait accessors.
+        assert_eq!(idx.num_features(0), weights.intermediate_size);
+        assert_eq!(idx.vocab_size(), weights.vocab_size);
+
+        // Per-layer attention bytes: Q/K/O Q4_K, V Q6_K (production Q4_K_M mix).
+        let attn = idx.attn_kquant_layer_data(0).expect("layer 0 attn");
+        assert_eq!(attn.len(), 4);
+        assert_eq!(attn[0].1, "Q4_K"); // Q
+        assert_eq!(attn[1].1, "Q4_K"); // K
+        assert_eq!(attn[2].1, "Q6_K"); // V (the Q4_K_M attention mix)
+        assert_eq!(attn[3].1, "Q4_K"); // O
+        for (bytes, _fmt) in &attn {
+            assert!(!bytes.is_empty(), "empty attention bytes");
+        }
+
+        // Per-layer FFN data: gate/up Q4_K, down Q6_K (production Q4_K_M mix).
+        let ffn = idx.interleaved_kquant_layer_data(0).expect("layer 0 ffn");
+        assert_eq!(ffn.len(), FFN_COMPONENTS_PER_LAYER);
+        assert_eq!(ffn[0].1, "Q4_K"); // gate
+        assert_eq!(ffn[1].1, "Q4_K"); // up
+        assert_eq!(ffn[2].1, "Q6_K"); // down (the Q4_K_M FFN mix)
+        for (bytes, _fmt) in &ffn {
+            assert!(!bytes.is_empty(), "empty FFN bytes");
+        }
+        let mmap = idx.interleaved_kquant_mmap_ref().expect("mmap");
+        assert!(!mmap.is_empty());
+
+        // Out-of-range layer returns None.
+        assert!(idx.attn_kquant_layer_data(weights.num_layers).is_none());
+        assert!(idx
+            .interleaved_kquant_layer_data(weights.num_layers)
+            .is_none());
+
+        // Format-aware dequant cache: gate/up via Q4_K, down via Q6_K.
+        // Each component has `intermediate * hidden` elements.
+        let elems = weights.intermediate_size * weights.hidden_size;
+        let gate = idx.kquant_ffn_layer_once(0, 0).expect("layer 0 gate cache");
+        assert_eq!(gate.len(), elems, "gate dequant element count");
+        let up = idx.kquant_ffn_layer_once(0, 1).expect("layer 0 up cache");
+        assert_eq!(up.len(), elems, "up dequant element count");
+        let down = idx.kquant_ffn_layer_once(0, 2).expect("layer 0 down cache");
+        assert_eq!(down.len(), elems, "down dequant element count (Q6_K)");
+        // Second call returns the same Arc (cache hit).
+        let down_again = idx.kquant_ffn_layer_once(0, 2).expect("hit down cache");
+        assert!(Arc::ptr_eq(&down, &down_again));
+
+        // Out-of-range component returns None.
+        assert!(idx.kquant_ffn_layer_once(0, 99).is_none());
     }
 }

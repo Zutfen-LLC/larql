@@ -178,24 +178,30 @@ Ordered by expected wall-clock impact; re-rank against the A4 profile.
   confirmed, release-mode focused tests pass. See
   bench/baselines/cuda-cross-layer-residency-2026-07-10.md.
   <!-- LARQL-GPU-PROFILE-001 (2026-07-10, RTX 3060): the resident-hidden
-       eligibility gate (pipeline.rs resident_hidden_layer_eligible) requires a
+       eligibility gate (pipeline.rs resident_hidden_layer_eligible) required a
        uniform Q4_K or Q6_K FFN (gate,up,down) triple. The default Q4_K_M mix
        (gate/up Q4_K, down Q6_K — the `convert quantize q4k` default and the
-       Ollama-compatible format) fails this gate, so GPU-007 engages 0% on a
-       real Q4_K_M model (measured: 0 uses / 612 fallbacks). It engages 100%
+       Ollama-compatible format) failed this gate, so GPU-007 engaged 0% on a
+       real Q4_K_M model (measured: 0 uses / 612 fallbacks). It engaged 100%
        only with `--down-q4k` (uniform Q4_K). The synthetic fixtures used for
-       the GPU-007 validation are uniform Q4_K, so the code was validated but
-       the production default format never reaches it. See D6 below and
-       bench/baselines/cuda-post-residency-profile-2026-07-10.md. -->
-- **D6. resident-hidden Q4_K_M eligibility** (1 session, NEW — outside B3/B4/
-  B5/C1). Extend `host_ffn_block_device_resident` to handle the mixed Q4_K/Q6_K
-  FFN triple (gate/up Q4_K, down Q6_K) so GPU-007 engages on the default
-  Q4_K_M format. Profile evidence (RTX 3060, pending 3090 re-validation): the
-  resident path is 7% faster (122 vs 131 ms/tok) and does 13× less DtoH
-  traffic (0.5 vs 6.6 MiB/tok) — currently left on the table for the format
-  users actually have. This is the A4-profile-recommended next slice; it
-  outranks B3/B4 because until it lands GPU-007 is dead code on the critical
-  path. See bench/baselines/cuda-post-residency-profile-2026-07-10.md §PROFILE-001J.
+       the GPU-007 validation were uniform Q4_K, so the code was validated but
+       the production default format never reached it. See
+       bench/baselines/cuda-post-residency-profile-2026-07-10.md.
+       ✅ RESOLVED by D6 (2026-07-10, RTX 3060) — see below. -->
+- ✅ **D6. resident-hidden Q4_K_M eligibility — DONE (2026-07-10, RTX 3060).**
+  Broadened the GPU-007 resident-hidden eligibility gate and the resident FFN
+  chain through one shared pure helper (`supported_resident_ffn_triple`) so
+  they accept the production-default Q4_K_M FFN triple (gate/up Q4_K, down
+  Q6_K) in addition to uniform Q4_K×3 and Q6_K×3. No CUDA kernel changes
+  needed — `matvec_dev_by_fmt` already dispatches each projection
+  independently. GPU-007 engagement on the real default Q4_K_M model went
+  0% → 100% (uses=0/fallbacks=288 → uses=288/fallbacks=0). Same-day A/B
+  (main `70cc8fb9` vs D6 `8584ae32`, 5 reps × 79 decode steps): 131.30 →
+  127.15 ms/tok median p50 (3.3% faster), htod −62%, dtoh −61%, syncs −65%.
+  Full CUDA suite 172/172 green (+11 new tests); ASTAB-001, GPU-006, GPU-007
+  all green; release-mode D6 green. RTX 3060 validation is final per the
+  verification policy — no RTX 3090 rerun required. See
+  bench/baselines/cuda-q4km-resident-hidden-2026-07-10.md.
 - B3. **Launch batching / graphization** (1-2 sessions, optional until A4 says
   launch overhead matters). Collapse per-op `launch → stream` calls into
   fewer submissions (CUDA Graphs via cudarc if exposed, else simple
@@ -308,7 +314,7 @@ parallel (the scaffold already mirrors CUDA's module layout).
 | ~~1~~ | ~~A — hardware validation~~ | ~~2-4~~ | ~~✅ DONE (GPU-004)~~ |
 | 1 | **A-stabilization** — decode parity fix | 1-2 | ⏳ fix applied (ASTAB-001), pending hardware validation — blocks correct inference |
 | 2 | B1 + B2 — resident KV + cross-layer | 2-4 | after A-stabilization |
-| 2b | **D6 — resident-hidden Q4_K_M eligibility** | 1 | after B2 — A4 profile's #1 recommendation (RTX 3060 evidence, pending 3090) |
+| ~~2b~~ | ~~**D6 — resident-hidden Q4_K_M eligibility**~~ | ~~1~~ | ~~✅ DONE (2026-07-10, RTX 3060) — 0%→100% engagement, 3.3% faster, final per verification policy~~ |
 | 3 | D1 + D2 + D5 — Vulkan bootstrap + first kernel + pipeline extraction | 3-4 | can start during B |
 | 4 | C1 + C3 — coarse bridge + CLI polish | 1½-2½ | any time |
 | 5 | E — CI (E2 as soon as D2 lands) | 1-2 | with D2 |
