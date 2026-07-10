@@ -476,6 +476,10 @@ impl ComputeBackend for CudaBackend {
                 info.push('\n');
                 info.push_str(&diag);
             }
+            if let Some(diag) = self.graph_diag() {
+                info.push('\n');
+                info.push_str(&diag);
+            }
             // LARQL-GPU-PROFILE-001: launch/copy/sync/mirror decomposition.
             // Only populated when LARQL_GPU_PROFILE=1 (otherwise the recorders
             // are no-ops and this returns None).
