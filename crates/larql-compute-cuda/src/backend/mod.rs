@@ -46,18 +46,22 @@ pub struct CudaBackend {
     /// path reads this field, never process-global env). `Auto` = use the
     /// graph path when a layer is eligible; `Disabled` = never (kill switch).
     /// Default is `Disabled` until the B3A-11 performance gate flips it.
+    #[allow(dead_code)]
     graph_mode: crate::ffn_graph::GraphMode,
     /// B3A: capture-aware graph profiling counters (point 8). All zeroed at
     /// construction; only mutated when `LARQL_GPU_PROFILE=1`. Surfaced via
     /// `graph_diag()` / `take_profile_counters()`.
+    #[allow(dead_code)]
     graph_profile: GraphProfileCounters,
     /// B3A: generation-scoped cache of per-layer resident-FFN executable
     /// graphs. Allocated lazily; reset (graphs destroyed, generation
     /// advanced) at every `reset_kv_cache` BEFORE the weight cache flushes.
+    #[allow(dead_code)]
     graph_cache: std::sync::Mutex<crate::ffn_graph_state::ResidentFfnGraphCache>,
     /// B3A: the resident decode arena (ping-pong hidden buffers + capture
     /// stream). `None` until the first graph-eligible decode token allocates
     /// it; dropped (with the graphs) at generation reset.
+    #[allow(dead_code)]
     arena: std::sync::Mutex<Option<crate::ffn_graph_state::ResidentDecodeArena>>,
     /// Test-only eligibility hook for exercising a resident → fallback →
     /// resident transition without changing any layer math.
@@ -88,7 +92,12 @@ struct ProfileCounters {
 /// graph contains, counted once at build) is what makes the submission-
 /// reduction accounting honest. `logical_graph_kernel_executions` =
 /// `captured_kernel_nodes` × replays.
+//
+// The fields are written by the `note_graph_*` recorder methods which land
+// with the B3A-5 pipeline integration. Until then the `dead_code` allow
+// silences the "never read" warning.
 #[derive(Default)]
+#[allow(dead_code)]
 struct GraphProfileCounters {
     /// One per `CudaGraph::launch()` (incl. token 1 — review point 1).
     graph_submissions: std::sync::atomic::AtomicU64,
@@ -393,6 +402,7 @@ impl CudaBackend {
     /// B3A: the resident-FFN graph replay mode (B3A review point 9). Resolved
     /// once at construction from `LARQL_CUDA_GRAPHS`; the decode hot path reads
     /// this field, never process-global env.
+    #[allow(dead_code)]
     pub(crate) fn graph_mode(&self) -> crate::ffn_graph::GraphMode {
         self.graph_mode
     }
