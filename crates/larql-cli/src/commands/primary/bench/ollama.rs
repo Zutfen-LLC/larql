@@ -122,6 +122,7 @@ fn unreachable_row(model: &str) -> BenchRow {
         p99_ms: 0.0,
         tok_per_s: 0.0,
         stages: None,
+        profile: None,
         ffn_rtt_ms: None,
         attn_ms: None,
         wire_bytes_per_tok: None,

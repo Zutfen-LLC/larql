@@ -36,7 +36,9 @@ pub mod matmul;
 pub mod quant_matvec;
 
 pub use capability::Capability;
-pub use decode::{DecodeBackend, DecodeStateDump, ProfileTimings, StateDumpMask};
+pub use decode::{
+    DecodeBackend, DecodeStateDump, ProfileCountersSnapshot, ProfileTimings, StateDumpMask,
+};
 pub use helpers::{dot_proj_gpu, matmul_gpu};
 pub use matmul::{MatMul, MatMulOp};
 pub use quant_matvec::QuantMatVec;
@@ -112,6 +114,14 @@ pub trait ComputeBackend: MatMul + QuantMatVec + DecodeBackend + Send + Sync {
     /// was honoured on the preceding call. Default returns `None` —
     /// engines treat that as "no instrumentation available."
     fn take_split_timings(&self) -> Option<ProfileTimings> {
+        None
+    }
+
+    /// Consume the LARQL-GPU-PROFILE-001 decomposition counters (CUDA only)
+    /// and return them as a machine-readable snapshot, or `None` when the
+    /// backend has no profiling support or nothing was recorded. The counters
+    /// are reset on read. Default returns `None`.
+    fn take_profile_counters(&self) -> Option<ProfileCountersSnapshot> {
         None
     }
 

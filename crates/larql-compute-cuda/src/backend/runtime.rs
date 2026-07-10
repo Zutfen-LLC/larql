@@ -56,6 +56,10 @@ pub(crate) struct CudaRuntime {
     /// collapse. Activations stay on the fresh `clone_htod` path.
     weight_cache: WeightCache,
     summary: String,
+    /// LARQL-GPU-PROFILE-001 launch/copy/sync counters. All relaxed atomics;
+    /// only mutated when `LARQL_GPU_PROFILE=1` (the `note_*` helpers gate on
+    /// `gpu_profile_enabled()`).
+    pub(crate) profile: super::RuntimeProfile,
 }
 
 impl CudaRuntime {
@@ -185,6 +189,7 @@ impl CudaRuntime {
             decode_attention,
             prefill_attention,
             weight_cache: WeightCache::default(),
+            profile: super::RuntimeProfile::default(),
             summary: format!(
                 "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}, NVRTC target {arch}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention loaded, remaining ops use CPU fallback"
             ),
@@ -317,6 +322,7 @@ impl CudaRuntime {
             .arg(&row_elems_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context("launching CUDA kv_append kernel", err))?;
+        self.note_launch();
         self.stream
             .synchronize()
             .map_err(|err| RuntimeError::context("synchronizing CUDA kv_append stream", err))
@@ -1494,6 +1500,7 @@ impl CudaRuntime {
             .arg(&total_len_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context("launching CUDA decode_attention kernel", err))?;
+        self.note_launch();
         Ok(out_dev)
     }
 
@@ -1680,6 +1687,12 @@ impl CudaRuntime {
     /// device-resident handle. The chain caller holds this for the lifetime of
     /// the chain (until the final `sync_dtoh_f32`).
     pub(crate) fn upload_f32(&self, x: &[f32]) -> Result<CudaSlice<f32>, RuntimeError> {
+        // LARQL-GPU-PROFILE-001: count the per-token activation host→device
+        // upload. Weights go through the (cached) weight cache; activations
+        // are fresh every call, so this is the dominant per-token htod cost.
+        if crate::options::gpu_profile_enabled() {
+            self.note_htod(x.len() * 4);
+        }
         self.stream
             .clone_htod(x)
             .map_err(|err| RuntimeError::context("uploading activation to CUDA", err))
@@ -1717,9 +1730,64 @@ impl CudaRuntime {
         self.stream
             .synchronize()
             .map_err(|err| RuntimeError::context("synchronizing CUDA device chain stream", err))?;
+        // LARQL-GPU-PROFILE-001: count the sync (the synchronize above) +
+        // the dtoh readback of `dev` (the device→host copy that returns the
+        // chain result). No-op unless LARQL_GPU_PROFILE=1.
+        if crate::options::gpu_profile_enabled() {
+            self.note_sync();
+            self.note_dtoh(dev.len() * 4);
+        }
         self.stream
             .clone_dtoh(dev)
             .map_err(|err| RuntimeError::context("reading CUDA device chain output", err))
+    }
+
+    // ── LARQL-GPU-PROFILE-001 runtime-side recorder helpers ─────────────
+    //
+    // All gate on `gpu_profile_enabled()` so normal decode is a no-op branch.
+
+    fn note_launch(&self) {
+        use std::sync::atomic::Ordering;
+        self.profile.launches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_htod(&self, bytes: usize) {
+        use std::sync::atomic::Ordering;
+        self.profile.htod_copies.fetch_add(1, Ordering::Relaxed);
+        self.profile
+            .htod_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn note_dtoh(&self, bytes: usize) {
+        use std::sync::atomic::Ordering;
+        self.profile.dtoh_copies.fetch_add(1, Ordering::Relaxed);
+        self.profile
+            .dtoh_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn note_sync(&self) {
+        use std::sync::atomic::Ordering;
+        self.profile.syncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Consume and reset the runtime profile counters, returning the snapshot
+    /// or `None` when nothing was recorded.
+    pub(crate) fn take_profile_counters(&self) -> Option<super::RuntimeProfileSnapshot> {
+        use std::sync::atomic::Ordering;
+        let launches = self.profile.launches.swap(0, Ordering::Relaxed);
+        if launches == 0 {
+            return None;
+        }
+        Some(super::RuntimeProfileSnapshot {
+            launches,
+            htod_copies: self.profile.htod_copies.swap(0, Ordering::Relaxed),
+            htod_bytes: self.profile.htod_bytes.swap(0, Ordering::Relaxed),
+            dtoh_copies: self.profile.dtoh_copies.swap(0, Ordering::Relaxed),
+            dtoh_bytes: self.profile.dtoh_bytes.swap(0, Ordering::Relaxed),
+            syncs: self.profile.syncs.swap(0, Ordering::Relaxed),
+        })
     }
 
     /// Amortised Q4_K × f32 matmul, device-resident: `x_dev` is the already-
@@ -1795,6 +1863,7 @@ impl CudaRuntime {
             .arg(&seq);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context("launching CUDA q4k_matmul_dev kernel", err))?;
+        self.note_launch();
         Ok(out_dev)
     }
 
@@ -1934,6 +2003,7 @@ impl CudaRuntime {
             .arg(&k);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context("launching CUDA q4k_matvec_dev kernel", err))?;
+        self.note_launch();
         Ok(out_dev)
     }
 
@@ -1996,6 +2066,7 @@ impl CudaRuntime {
             .arg(&k);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context("launching CUDA q6k_matvec_dev kernel", err))?;
+        self.note_launch();
         Ok(out_dev)
     }
 
@@ -2137,6 +2208,7 @@ impl CudaRuntime {
         launch_args.arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
+        self.note_launch();
         Ok(out_dev)
     }
 
@@ -2181,6 +2253,7 @@ impl CudaRuntime {
         launch_args.arg(input).arg(&mut out_dev).arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
+        self.note_launch();
         Ok(out_dev)
     }
 
@@ -2273,6 +2346,7 @@ impl CudaRuntime {
             .arg(&has_weight);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context("launching CUDA rms_norm_dev kernel", err))?;
+        self.note_launch();
         Ok(out_dev)
     }
 
@@ -2364,6 +2438,7 @@ impl CudaRuntime {
         unsafe { launch_args.launch(cfg) }.map_err(|err| {
             RuntimeError::context("launching CUDA rms_norm_heads_dev kernel", err)
         })?;
+        self.note_launch();
         Ok(out_dev)
     }
 
@@ -2495,6 +2570,7 @@ impl CudaRuntime {
             .arg(&n_u64);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context("launching CUDA rope_dev kernel", err))?;
+        self.note_launch();
         Ok(out_dev)
     }
 

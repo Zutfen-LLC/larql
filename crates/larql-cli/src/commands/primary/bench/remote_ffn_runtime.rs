@@ -191,6 +191,7 @@ pub(super) fn run_remote_ffn_bench(
         p99_ms: summary.p99_ms,
         tok_per_s: summary.tok_per_s,
         stages: None,
+        profile: None,
         ffn_rtt_ms: summary.ffn_rtt_ms,
         attn_ms: summary.attn_ms,
         wire_bytes_per_tok,
