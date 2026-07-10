@@ -540,25 +540,22 @@ impl CudaBackend {
 
     // ── B3A graph profiling recorders (capture-aware, point 8) ──────────
     //
-    // All gate on `gpu_profile_enabled()` so normal decode is a no-op branch.
-    // The direct/graph/captured distinction makes submission accounting honest.
+    // The structural counters (builds, submissions, failures, fallbacks) are
+    // UNCONDITIONAL — they're the diagnostic surface (`graph_diag`), not the
+    // profile decomposition, and they're cheap relaxed atomics. The node-count
+    // + d2d decomposition counters gate on `gpu_profile_enabled()` so normal
+    // decode pays nothing for the detailed breakdown.
 
-    #[allow(dead_code)]
     pub(crate) fn note_graph_build(&self) {
-        if crate::options::gpu_profile_enabled() {
-            self.graph_profile
-                .graph_builds
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.graph_profile
+            .graph_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn note_graph_submission(&self) {
-        if crate::options::gpu_profile_enabled() {
-            self.graph_profile
-                .graph_submissions
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.graph_profile
+            .graph_submissions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -579,22 +576,16 @@ impl CudaBackend {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn note_graph_failure(&self) {
-        if crate::options::gpu_profile_enabled() {
-            self.graph_profile
-                .graph_failures
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.graph_profile
+            .graph_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn note_graph_fallback(&self) {
-        if crate::options::gpu_profile_enabled() {
-            self.graph_profile
-                .graph_fallbacks
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.graph_profile
+            .graph_fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
