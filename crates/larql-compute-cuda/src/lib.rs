@@ -45,7 +45,8 @@ mod tests {
     use larql_compute::KvIndex;
     use larql_compute::{CpuBackend, QuantFormat};
     use larql_models::test_fixtures::{
-        make_test_q4k_weights, make_test_q4k_weights_layers, make_test_q4k_weights_rope_scaled,
+        make_test_q4k_weights, make_test_q4k_weights_inter, make_test_q4k_weights_inter_layers,
+        make_test_q4k_weights_rope_scaled,
     };
     use ndarray::Array2;
 
@@ -4360,6 +4361,70 @@ mod tests {
         (weights, index, seq_len, hidden, inter, softcap)
     }
 
+    const RESIDENT_HIDDEN_INTER: usize = 8192;
+
+    /// Shared GPU-007 setup. Unlike the GPU-006 fixture, this uses an
+    /// intermediate width that clears the production activation-native gate
+    /// without threshold overrides, while retaining valid Q4_K geometry.
+    fn resident_hidden_seed(
+        b: &CudaBackend,
+        token_ids: &[u32],
+    ) -> (
+        larql_models::ModelWeights,
+        larql_compute::test_fixtures::Q4kFixtureIndex,
+        usize,
+        usize,
+        usize,
+        f32,
+    ) {
+        resident_hidden_seed_layers(
+            b,
+            token_ids,
+            larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS,
+        )
+    }
+
+    fn resident_hidden_seed_layers(
+        b: &CudaBackend,
+        token_ids: &[u32],
+        num_layers: usize,
+    ) -> (
+        larql_models::ModelWeights,
+        larql_compute::test_fixtures::Q4kFixtureIndex,
+        usize,
+        usize,
+        usize,
+        f32,
+    ) {
+        let weights = if num_layers == larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS {
+            make_test_q4k_weights_inter(RESIDENT_HIDDEN_INTER)
+        } else {
+            make_test_q4k_weights_inter_layers(RESIDENT_HIDDEN_INTER, num_layers)
+        };
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let (x, seq_len, hidden) = prefill_input(&weights, token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let layers = build_layers(&weights, &index);
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("resident-hidden prefill seeding should succeed");
+        (weights, index, seq_len, hidden, inter, softcap)
+    }
+
     /// GPU-006E: prefill N then one decode keeps host and device cache lengths
     /// in lockstep. The resident-KV path advances the device cursor by one per
     /// decode token; the host mirror grows by one too; they must agree.
@@ -4755,7 +4820,7 @@ mod tests {
             return;
         }
         let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
-        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let (weights, index, seq_len, hidden, inter, _) = resident_hidden_seed(&b, &token_ids);
         let layers = build_layers(&weights, &index);
 
         // CPU reference: prefill then one f32-activation decode step.
@@ -4813,7 +4878,7 @@ mod tests {
             return;
         }
         let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
-        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let (weights, index, seq_len, hidden, inter, _) = resident_hidden_seed(&b, &token_ids);
         let layers = build_layers(&weights, &index);
 
         let (_h_prefill, mut cpu_cache, _timings) =
@@ -4873,7 +4938,7 @@ mod tests {
             return;
         }
         let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
-        let (weights, index, _seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let (weights, index, _seq_len, hidden, inter, _) = resident_hidden_seed(&b, &token_ids);
         let layers = build_layers(&weights, &index);
 
         let next_tok = resident_kv_first_decode_tok();
@@ -4911,7 +4976,7 @@ mod tests {
         // 3-token prompt → first decode work = 4·4·64 = 1024 < 8192 gate →
         // the attention device chain bails → the resident path is ineligible.
         let token_ids = resident_kv_prompt(3);
-        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let (weights, index, seq_len, hidden, inter, _) = resident_hidden_seed(&b, &token_ids);
         let layers = build_layers(&weights, &index);
 
         let (_h_prefill, mut cpu_cache, _timings) =
@@ -4964,7 +5029,7 @@ mod tests {
             return;
         }
         let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
-        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let (weights, index, seq_len, hidden, inter, _) = resident_hidden_seed(&b, &token_ids);
         let layers = build_layers(&weights, &index);
         assert_eq!(b.kv_cache_len(), seq_len);
         assert_eq!(b.kv_cache_len_native(), seq_len);
@@ -5001,30 +5066,10 @@ mod tests {
         }
         // 4-layer fixture: at least 2 consecutive eligible layers guaranteed.
         let num_layers = 4;
-        let weights = make_test_q4k_weights_layers(num_layers);
-        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
-        let layers = build_layers(&weights, &index);
         let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
-        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
-        let inter = index.num_features(0);
-        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
-
-        b.reset_kv_cache();
-        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
-            .map(|l| {
-                (
-                    weights.arch.num_kv_heads_for_layer(l),
-                    weights.arch.head_dim_for_layer(l),
-                )
-            })
-            .collect();
-        b.preallocate_kv_cache_per_layer(
-            &kv_shapes,
-            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
-        );
-        let _ = b
-            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
-            .expect("prefill seeding should succeed");
+        let (weights, index, seq_len, hidden, inter, _) =
+            resident_hidden_seed_layers(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
 
         let next_tok = resident_kv_first_decode_tok();
         let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
@@ -5072,5 +5117,119 @@ mod tests {
             uses >= num_layers as u64,
             "resident-hidden uses ({uses}) should be >= num_layers ({num_layers}); diag: {diag}"
         );
+    }
+
+    /// GPU-007G: an ineligible middle layer transitions Device → Host, while
+    /// the following eligible layer re-enters Host → Device. Zeroing every
+    /// norm weight on the middle layer makes both RMSNorm and LayerNorm yield
+    /// the same zero branch contribution, so marking only the pipeline layer
+    /// as unsupported LayerNorm forces fallback without changing the CPU f32
+    /// reference result.
+    #[test]
+    fn resident_hidden_mixed_eligibility_transitions_and_matches_cpu() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+
+        let num_layers = 3;
+        let middle = 1;
+        let mut weights = make_test_q4k_weights_inter_layers(RESIDENT_HIDDEN_INTER, num_layers);
+        let mut norm_keys = vec![
+            weights.arch.input_layernorm_key(middle),
+            weights.arch.post_attention_layernorm_key(middle),
+        ];
+        if let Some(key) = weights.arch.pre_feedforward_layernorm_key(middle) {
+            norm_keys.push(key);
+        }
+        if let Some(key) = weights.arch.post_feedforward_layernorm_key(middle) {
+            norm_keys.push(key);
+        }
+        for key in norm_keys {
+            weights
+                .vectors
+                .get_mut(&key)
+                .expect("middle-layer norm fixture")
+                .fill(0.0);
+        }
+
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+        let mut layers = build_layers(&weights, &index);
+        layers[middle].norm_type = larql_compute::NormType::LayerNorm;
+
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
+            .map(|layer| {
+                (
+                    weights.arch.num_kv_heads_for_layer(layer),
+                    weights.arch.head_dim_for_layer(layer),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("mixed-eligibility prefill should succeed");
+
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let next_tok = resident_kv_first_decode_tok();
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let cuda_decode = b
+            .decode_token(
+                &layers,
+                h_tok.row(0).as_slice().expect("contiguous embedding"),
+                hidden,
+                inter,
+            )
+            .expect("mixed-eligibility CUDA decode should succeed");
+        let max_abs = cpu_decode
+            .row(0)
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(cpu, cuda)| (cpu - cuda).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "mixed-eligibility decode diverged: max_abs={max_abs:.6e}"
+        );
+
+        let diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden mixed-transition diagnostics");
+        let count = |name: &str| {
+            diag.split(name)
+                .nth(1)
+                .and_then(|s| s.split([',', ')']).next())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        assert!(
+            count("uses=") > 0,
+            "eligible layers must run resident: {diag}"
+        );
+        assert!(
+            count("fallbacks=") > 0,
+            "middle layer must register fallback: {diag}"
+        );
+        assert_eq!(b.host_kv_len(), seq_len + 1);
+        assert_eq!(b.kv_cache_len_native(), seq_len + 1);
+        assert_eq!(b.kv_cache_len(), seq_len + 1);
     }
 }

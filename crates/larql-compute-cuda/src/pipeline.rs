@@ -89,6 +89,33 @@ impl DecodeHiddenState {
         }
     }
 
+    /// Materialize the device copy if currently host-resident, transitioning
+    /// to `Device`. The host state is replaced only after `upload_f32`
+    /// succeeds, so a failed upload leaves the current host data intact.
+    /// Already-device-resident state is an idempotent no-op.
+    fn ensure_device(&mut self, runtime: &crate::backend::CudaRuntime) -> bool {
+        let uploaded = match self {
+            Self::Host(arr) => {
+                let hidden = arr.shape()[1];
+                let Some(slice) = arr.as_slice() else {
+                    return false;
+                };
+                match runtime.upload_f32(slice) {
+                    Ok(dev) => Some((dev, hidden)),
+                    Err(_) => None,
+                }
+            }
+            Self::Device { .. } => return true,
+        };
+
+        if let Some((dev, hidden)) = uploaded {
+            *self = Self::Device { dev, hidden };
+            true
+        } else {
+            false
+        }
+    }
+
     /// Materialize the host copy if currently device-resident, transitioning
     /// to `Host`. One `sync_dtoh_f32` per transition (idempotent thereafter).
     /// Returns `false` if the device readback fails (caller should bail to
@@ -341,7 +368,7 @@ impl CudaBackend {
                 && h.hidden() == hidden
                 && self.resident_hidden_layer_eligible(layer, hidden, inter, li);
 
-            if resident_ok {
+            if resident_ok && h.ensure_device(runtime) {
                 if let Some((h_post_attn_dev, k_new_row, v_new_row)) =
                     self.host_attention_block_device_resident(runtime, layer, &h, li, abs_position)
                 {
