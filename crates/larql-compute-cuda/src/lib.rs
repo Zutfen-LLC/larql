@@ -4289,11 +4289,39 @@ mod tests {
     // runtime-gated: on a no-CUDA host they early-return (scaffold-pass),
     // never claiming native validation.
 
+    /// Prompt length used by the resident-KV decode tests. The decode-attention
+    /// work gate (`native_decode_attention_worthwhile`, default
+    /// `DEFAULT_DECODE_ATTN_NATIVE_MIN_WORK = 8192`) compares
+    /// `work = num_q × total_len × head_dim`. The fixture has `num_q=4,
+    /// head_dim=64`, so the FIRST decode token needs
+    /// `total_len = seq_len + 1 ≥ 8192 / (4·64) = 32`, i.e. `seq_len ≥ 31`.
+    /// A 3-token prompt (used elsewhere in this file for sub-gate tests) gives
+    /// `work = 4·4·64 = 1024 < 8192`, which blocks `host_attention_block_device`
+    /// entirely — so the resident-KV code would never execute and the device
+    /// cursor / diag-counter assertions would fail. 40 gives comfortable margin
+    /// (first decode `work = 4·41·64 = 10496 ≥ 8192`) and stays well under the
+    /// `DEFAULT_GPU_KV_CACHE_MAX_SEQ = 4096` capacity.
+    const RESIDENT_KV_PROMPT_LEN: usize = 40;
+
+    /// The first decode token after a `RESIDENT_KV_PROMPT_LEN` prompt (keeps
+    /// decode IDs distinct from the prefill IDs 0..PROMPT_LEN).
+    fn resident_kv_first_decode_tok() -> u32 {
+        RESIDENT_KV_PROMPT_LEN as u32
+    }
+
+    /// Build a prompt of `n` token IDs `0..n` (all valid in the fixture's
+    /// 256-entry vocab).
+    fn resident_kv_prompt(n: usize) -> Vec<u32> {
+        (0..n as u32).collect()
+    }
+
     /// Shared setup for the resident-KV decode tests: build + prefill the
     /// fixture model through both the host mirror and the device cache. Returns
     /// the owned weights/index (so each test can build its own `layers` with
-    /// the right borrow lifetime) plus the decode dims. Mirrors the ASTAB-001
-    /// decode parity test's seeding sequence.
+    /// the right borrow lifetime) plus the decode dims. Uses a
+    /// `RESIDENT_KV_PROMPT_LEN`-token prompt so the first decode clears the
+    /// decode-attention work gate (see that const's rationale) — without it,
+    /// `host_attention_block_device` bails and the resident-KV path never runs.
     fn resident_kv_seed(
         b: &CudaBackend,
         token_ids: &[u32],
@@ -4339,14 +4367,15 @@ mod tests {
         if !b.native_runtime_available() {
             return;
         }
-        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &[0u32, 1, 2]);
+        let prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &prompt);
         let layers = build_layers(&weights, &index);
         // Post-prefill: both caches at seq_len.
         assert_eq!(b.kv_cache_len(), seq_len);
         assert_eq!(b.kv_cache_len_native(), seq_len);
 
-        // One decode token.
-        let next_tok = 4u32;
+        // One decode token (clears the work gate → resident-KV path runs).
+        let next_tok = resident_kv_first_decode_tok();
         let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
         let x_dec: Vec<f32> = h_tok.row(0).to_vec();
         let _ = b
@@ -4372,9 +4401,11 @@ mod tests {
         if !b.native_runtime_available() {
             return;
         }
-        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &[0u32, 1, 2]);
+        let prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &prompt);
         let layers = build_layers(&weights, &index);
-        let next_tokens = [4u32, 5, 6, 7];
+        let start = resident_kv_first_decode_tok();
+        let next_tokens = [start, start + 1, start + 2, start + 3];
         let mut expected = seq_len;
         for tok in next_tokens {
             let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
@@ -4406,7 +4437,8 @@ mod tests {
         if !b.native_runtime_available() {
             return;
         }
-        let (_weights, _index, seq_len, _hidden, _inter, _) = resident_kv_seed(&b, &[0u32, 1, 2]);
+        let prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (_weights, _index, seq_len, _hidden, _inter, _) = resident_kv_seed(&b, &prompt);
         assert_eq!(b.kv_cache_len(), seq_len);
         assert_eq!(b.kv_cache_len_native(), seq_len);
 
@@ -4418,11 +4450,12 @@ mod tests {
             "reset must clear the device cursor"
         );
 
-        // Re-prefill a different-length prompt: device cache lands at the new
-        // prompt length, not seq_len and not a stale value.
-        let new_tokens = [10u32, 11, 12, 13];
-        let (_w2, _i2, seq2, _h2, _in2, _s2) = resident_kv_seed(&b, &new_tokens);
-        assert_eq!(new_tokens.len(), seq2);
+        // Re-prefill a different-length prompt (still clears the decode gate):
+        // device cache lands at the new prompt length, not seq_len and not a
+        // stale value.
+        let new_prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN + 8);
+        let (_w2, _i2, seq2, _h2, _in2, _s2) = resident_kv_seed(&b, &new_prompt);
+        assert_eq!(new_prompt.len(), seq2);
         assert_eq!(b.kv_cache_len(), seq2);
         assert_eq!(b.kv_cache_len_native(), seq2);
     }
@@ -4434,10 +4467,13 @@ mod tests {
         if !b.native_runtime_available() {
             return;
         }
-        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &[0u32, 1, 2]);
+        let prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &prompt);
         let layers = build_layers(&weights, &index);
-        // Decode two tokens, then truncate back by one.
-        for tok in [4u32, 5] {
+        // Decode two tokens (clearing the gate → resident path advances the
+        // device cursor), then truncate back by one.
+        let start = resident_kv_first_decode_tok();
+        for tok in [start, start + 1] {
             let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
             let x_dec: Vec<f32> = h_tok.row(0).to_vec();
             let _ = b.decode_token(&layers, &x_dec, hidden, inter);
@@ -4466,14 +4502,15 @@ mod tests {
         if !b.native_runtime_available() {
             return;
         }
-        let token_ids = [0u32, 1, 2];
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
         let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
         let layers = build_layers(&weights, &index);
 
         // CPU reference: prefill then one f32-activation decode step.
         let (_h_prefill, mut cpu_cache, _timings) =
             larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
-        let next_tok = 4u32;
+        // Decode token clears the work gate → resident-KV path runs.
+        let next_tok = resident_kv_first_decode_tok();
         let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
             &weights,
             next_tok,
@@ -4522,14 +4559,16 @@ mod tests {
         if !b.native_runtime_available() {
             return;
         }
-        let token_ids = [0u32, 1, 2];
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
         let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
         let layers = build_layers(&weights, &index);
 
         let (_h_prefill, mut cpu_cache, _timings) =
             larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
 
-        let next_tokens = [4u32, 5, 6, 7];
+        // Each decode token clears the work gate (total_len grows from 41).
+        let start = resident_kv_first_decode_tok();
+        let next_tokens = [start, start + 1, start + 2, start + 3];
         let mut cpu_pos = seq_len;
         for tok in next_tokens {
             let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
@@ -4580,13 +4619,14 @@ mod tests {
         if !b.native_runtime_available() {
             return;
         }
-        let token_ids = [0u32, 1, 2];
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
         let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
         let layers = build_layers(&weights, &index);
 
         let (_h_prefill, mut cpu_cache, _timings) =
             larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
-        let next_tok = 4u32;
+        // Decode token clears the work gate → resident path runs.
+        let next_tok = resident_kv_first_decode_tok();
         let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
             &weights,
             next_tok,
@@ -4630,7 +4670,7 @@ mod tests {
         let weights = make_test_q4k_weights();
         let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
         let layers = build_layers(&weights, &index);
-        let token_ids = [0u32, 1, 2];
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
         let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
         let inter = index.num_features(0);
         let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
@@ -4638,6 +4678,10 @@ mod tests {
         // Prefill WITHOUT preallocating the device cache → prefill's
         // populate_kv_layer is a no-op on the device, so the resident path is
         // ineligible and decode falls back to the full-upload device path.
+        // (The prompt length clears the decode-attention work gate so the
+        // device attention block — where the fallback lives — actually runs;
+        // otherwise the gate blocks the whole device path and the fallback
+        // counter would never advance.)
         b.reset_kv_cache();
         // Deliberately skip preallocate_kv_cache_per_layer.
         let _ = b
@@ -4650,7 +4694,7 @@ mod tests {
 
         let (_h_prefill, mut cpu_cache, _timings) =
             larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
-        let next_tok = 4u32;
+        let next_tok = resident_kv_first_decode_tok();
         let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
             &weights,
             next_tok,
