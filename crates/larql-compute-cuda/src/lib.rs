@@ -14,6 +14,7 @@ pub mod async_compute_backend_impl;
 pub mod backend;
 pub mod buffers;
 pub mod decode;
+pub mod ffn_graph;
 pub mod kernels;
 pub mod kv_cache;
 pub mod kv_dispatch_impl;
