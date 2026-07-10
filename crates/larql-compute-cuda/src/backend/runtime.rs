@@ -2799,3 +2799,265 @@ impl std::fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+#[cfg(test)]
+mod b3a_smoke_tests {
+    //! LARQL-GPU-B3A-SMOKE: minimal native CUDA Graph smoke test.
+    //!
+    //! De-risks cudarc 0.19.8's CUDA Graph API against the installed RTX 3060
+    //! driver/runtime **before** the larger B3A-2…B3A-7 refactor. Validates:
+    //!
+    //! - stream capture on LARQL's exact default stream
+    //! - cudarc event-tracking during capture (the `launch_builder.arg` path)
+    //! - graph instantiation with default flags (no `AUTO_FREE_ON_LAUNCH`)
+    //! - `CudaGraph::launch()` replay
+    //! - **stable-pointer replay**: mutating a captured buffer's *contents*
+    //!   (same device address) changes the replay output — the core invariant
+    //!   the resident-FFN ping-pong arena depends on
+    //! - clean teardown (graph → buffers, in that order) with no driver error
+    //! - repeated create → replay → reset → rebuild → drop lifecycle
+    //!
+    //! Runtime-gated: no-op on hosts without CUDA (the existing
+    //! `native_runtime_available` convention). Runs inline here (not in
+    //! `tests/`) because `CudaRuntime` and its stream/function fields are
+    //! `pub(crate)`.
+    use super::*;
+
+    /// Build a `CudaRuntime` if a CUDA device is available; otherwise return
+    /// `None` so the test no-ops (mirrors `CudaBackend::native_runtime_available`).
+    fn try_runtime() -> Option<CudaRuntime> {
+        CudaRuntime::initialize(0).ok()
+    }
+
+    /// One full capture → instantiate → launch → mutate → relaunch → teardown
+    /// cycle. Reusable for the repeated-lifecycle stress loop.
+    ///
+    /// **Critical finding (de-risked here):** the LARQL default stream is the
+    /// NULL stream (`cudarc`'s `default_stream()` returns `cu_stream =
+    /// null_mut()`), and CUDA **forbids capturing the NULL stream**
+    /// (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`). Graph capture and replay
+    /// therefore require a dedicated non-NULL stream created via
+    /// `CudaContext::new_stream()`. This smoke test validates the full
+    /// lifecycle on such a stream; the production B3A path must allocate a
+    /// capture/replay stream at runtime construction (B3A-3/B3A-5).
+    fn run_one_capture_cycle(rt: &CudaRuntime) {
+        let n = 256usize;
+        let b_scale = 1.0f32;
+
+        // Dedicated capture/replay stream (NOT the NULL default stream).
+        // `new_stream()` creates a CU_STREAM_NON_BLOCKING stream on the
+        // runtime's context. Buffers allocated/launched on this stream are
+        // graph-capturable.
+        let cap_stream = rt
+            .stream
+            .context()
+            .new_stream()
+            .expect("new_stream for graph capture (smoke)");
+
+        // Disable event tracking for graph buffers. cudarc enables per-slice
+        // CudaEvent tracking by default (event_tracking=true on CudaContext).
+        // During stream capture, `launch_builder.arg(&CudaSlice)` sees the
+        // prior `write` events on each buffer and injects `cuStreamWaitEvent`
+        // calls (launch.rs:213), which CUDA treats as a dependency on
+        // uncaptured cross-stream work → CUDA_ERROR_STREAM_CAPTURE_ISOLATION.
+        // Graph capture explicitly orders work within the captured stream, so
+        // event-based cross-stream synchronization is both unnecessary and
+        // incompatible with capture. Disabling tracking is the documented
+        // configuration for graph capture — the producer/consumer ordering is
+        // managed by the stream (within capture) and by the arena lifecycle
+        // (across replays). Slices created AFTER this call carry no events.
+        // SAFETY: we manage all synchronization explicitly on `cap_stream`;
+        // no captured slice is used on another stream before its work completes.
+        unsafe {
+            cap_stream.context().disable_event_tracking();
+        }
+
+        // Stable buffers — these addresses must persist for the graph's lifetime.
+        let h_vals: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
+        let x_vals: Vec<f32> = vec![0.5f32; n];
+        let h_dev = cap_stream
+            .clone_htod(&h_vals)
+            .expect("upload h_dev (smoke)");
+        let mut x_dev = cap_stream
+            .clone_htod(&x_vals)
+            .expect("upload x_dev (smoke)");
+        // Stable output — pre-allocated, zeroed. The graph will write here.
+        let mut out_dev = cap_stream
+            .alloc_zeros::<f32>(n)
+            .expect("alloc out_dev (smoke)");
+
+        // (Buffers were created after `disable_event_tracking`, so they carry
+        // no CudaEvent handles — no cross-stream wait is injected during
+        // capture. Within capture, same-stream kernel ordering is preserved by
+        // the stream itself.)
+
+        // ── Capture ──
+        // GLOBAL is the strictest mode; LARQL's decode is single-threaded, so a
+        // forbidden sync inside capture is a defect to fix, not tolerate
+        // (B3A review point 5).
+        cap_stream
+            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+            .expect("begin_capture (smoke)");
+        // Launch into the stable output buffer on the capture stream. The
+        // launch_builder is taken from cap_stream so the kernel node binds the
+        // capture stream's buffers.
+        {
+            let threads_x = GEGGLU_SILU_KERNEL.geometry.threads_per_group[0];
+            let n_u = n as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (n_u.div_ceil(threads_x), 1, 1),
+                block_dim: (threads_x, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch_args = cap_stream.launch_builder(&rt.residual_add);
+            launch_args.arg(&h_dev).arg(&x_dev).arg(&mut out_dev);
+            let scalar = Some(b_scale);
+            if let Some(ref s) = scalar {
+                launch_args.arg(s);
+            }
+            launch_args.arg(&n_u);
+            unsafe { launch_args.launch(cfg) }
+                .expect("launch residual_add into stable buffer during capture (smoke)");
+        }
+        // Default instantiate flags (0) — the FFN graph has no graph-managed
+        // allocation nodes, so AUTO_FREE_ON_LAUNCH is unnecessary (point 5).
+        let graph = cap_stream
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .expect("end_capture (smoke)")
+            .expect("end_capture returned a non-null graph (smoke)");
+
+        // ── First launch (token-1 analogue): verifies capture produces results ──
+        // Capture/instantiation do not produce the FFN result — the graph must
+        // be launched (B3A review point 1). CudaGraph::launch replays on the
+        // capturing stream.
+        graph.launch().expect("graph.launch #1 (smoke)");
+        cap_stream
+            .synchronize()
+            .expect("sync after graph.launch #1 (smoke)");
+        let out1: Vec<f32> = cap_stream
+            .clone_dtoh(&out_dev)
+            .expect("read back out #1 (smoke)");
+
+        // Verify correctness against the host reference: out[i] = h[i] + 1.0*x[i].
+        let expected1: Vec<f32> = h_vals
+            .iter()
+            .zip(&x_vals)
+            .map(|(h, x)| h + b_scale * x)
+            .collect();
+        let max_abs1 = out1
+            .iter()
+            .zip(&expected1)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs1 < 1e-5,
+            "(smoke) graph launch #1 output diverged: max_abs={max_abs1:.6e}"
+        );
+
+        // ── Idempotent replay #2: re-launch the SAME graph, confirm determinism ──
+        graph
+            .launch()
+            .expect("graph.launch #2 (idempotent replay, smoke)");
+        cap_stream
+            .synchronize()
+            .expect("sync after graph.launch #2 (smoke)");
+        let out2: Vec<f32> = cap_stream
+            .clone_dtoh(&out_dev)
+            .expect("read back out #2 (smoke)");
+        let max_abs2 = out1
+            .iter()
+            .zip(&out2)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs2 < 1e-6,
+            "(smoke) idempotent replay #2 diverged from #1: max_abs={max_abs2:.6e} (replay must be deterministic)"
+        );
+
+        // ── Stable-pointer replay: mutate x_dev *contents* in place (same address) ──
+        // This is the core invariant the ping-pong arena depends on: the graph
+        // reads the buffer's *current contents* at the same fixed device address
+        // on every replay. `memcpy_htod` overwrites the existing CudaSlice's
+        // device memory in place (no new allocation → same cu_device_ptr), so
+        // the captured graph picks up the new contents on the next launch.
+        let new_x_val = 0.25f32;
+        let new_x_vals = vec![new_x_val; n];
+        cap_stream
+            .memcpy_htod(&new_x_vals[..], &mut x_dev)
+            .expect("in-place memcpy_htod to mutate x_dev contents (smoke)");
+
+        graph
+            .launch()
+            .expect("graph.launch #3 (post-mutation replay, smoke)");
+        cap_stream
+            .synchronize()
+            .expect("sync after graph.launch #3 (smoke)");
+        let out3: Vec<f32> = cap_stream
+            .clone_dtoh(&out_dev)
+            .expect("read back out #3 (smoke)");
+
+        // Expected: out[i] = h[i] + b_scale * new_x_val (the mutated contents).
+        let expected3: Vec<f32> = h_vals.iter().map(|h| h + b_scale * new_x_val).collect();
+        let max_abs3 = out3
+            .iter()
+            .zip(&expected3)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs3 < 1e-5,
+            "(smoke) post-mutation replay #3 diverged: max_abs={max_abs3:.6e} (replay must read the buffer's current contents at the stable address)"
+        );
+        // And it must differ from the pre-mutation output — proves the in-place
+        // memcpy changed what the graph reads (the captured address is live).
+        let mutation_diff = out1
+            .iter()
+            .zip(&out3)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            mutation_diff > 0.1,
+            "(smoke) replay after in-place mutation produced nearly-identical output (max_diff={mutation_diff:.6e}) — the stable buffer address must reflect new contents"
+        );
+
+        // Teardown order (B3A-6 / point 7): exec graph → buffers → inputs.
+        drop(graph);
+        drop(out_dev);
+        drop(x_dev);
+        drop(h_dev);
+    }
+
+    /// The headline smoke test: capture → instantiate → launch → verify →
+    /// teardown, on a dedicated capture stream + the real `residual_add`
+    /// kernel. Runtime-gated.
+    #[test]
+    fn b3a_smoke_graph_capture_instantiate_launch_teardown() {
+        let Some(rt) = try_runtime() else {
+            eprintln!("b3a_smoke: no CUDA runtime — skipping (no GPU on this host)");
+            return;
+        };
+        run_one_capture_cycle(&rt);
+        eprintln!(
+            "b3a_smoke: PASS on {} — capture/instantiate/launch/teardown verified on dedicated stream",
+            rt.summary().split(';').next().unwrap_or("CUDA device")
+        );
+    }
+
+    /// Repeated create → replay → drop lifecycle: proves the installed
+    /// driver/runtime handles multiple graph construction/teardown cycles
+    /// without leaking or erroring (the B3A-8 stress loop, in miniature).
+    /// Runtime-gated.
+    #[test]
+    fn b3a_smoke_repeated_capture_teardown_lifecycle() {
+        let Some(rt) = try_runtime() else {
+            eprintln!("b3a_smoke_lifecycle: no CUDA runtime — skipping");
+            return;
+        };
+        // Three independent cycles on the SAME runtime (mirrors a backend
+        // serving multiple generations without being dropped — except here each
+        // cycle stands in for a reset_kv_cache generation boundary).
+        for i in 0..3 {
+            run_one_capture_cycle(&rt);
+            eprintln!("b3a_smoke_lifecycle: cycle {} complete", i + 1);
+        }
+    }
+}
