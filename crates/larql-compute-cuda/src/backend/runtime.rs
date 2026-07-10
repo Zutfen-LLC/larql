@@ -1329,6 +1329,133 @@ impl CudaRuntime {
             )));
         }
 
+        self.launch_decode_attention_kernel(
+            q_dev, k_dev, v_dev, scores_dev, scale, softcap, num_q, head_dim, kv_dim, reps,
+            total_len,
+        )
+    }
+
+    /// Native fused decode-step GQA attention over the device-resident
+    /// `CudaKVCache` — the resident-KV twin of
+    /// [`launch_decode_attention_dev`] (GPU-006). `q_dev` is the new token's
+    /// post-RoPE Q (resident from the attention device chain); `k_dev`/`v_dev`
+    /// are the **resident** per-layer K/V buffers from `CudaKVCache.layers[li]`
+    /// (`[max_seq, num_kv_heads, head_dim]` f32 = `[max_seq, kv_dim]` flattened
+    /// — exactly the `i * kv_dim + kv_off` layout the `decode_attention` kernel
+    /// reads, so no new kernel is needed). `scores_dev` is caller-owned scratch
+    /// of length `num_q * total_len`. `total_len` is the post-append cursor
+    /// (the kernel attends over exactly `0..total_len`, never the uninitialized
+    /// capacity rows beyond it). Returns the `[num_q * head_dim]` attention
+    /// output resident on the device (no sync, no dtoh) so the O projection
+    /// consumes it on the same stream — collapsing the per-token full-KV
+    /// host readback + re-upload the full-upload path pays.
+    ///
+    /// Unlike [`launch_decode_attention_dev`], the K/V buffers are borrowed
+    /// (resident in the cache), and `total_len` is trusted to be the valid
+    /// prefix length (the cache cursor) rather than the full buffer length —
+    /// the caller (the resident-KV decode path) guarantees the cursor is
+    /// advanced by exactly one per decode token and the append lands at the
+    /// right slot. The shape validation here checks `kv_dim`-strided capacity
+    /// (`max_seq * kv_dim`) rather than `total_len * kv_dim`: the device buffer
+    /// is pre-allocated to `max_seq` rows, and only the `0..total_len` prefix
+    /// is valid.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_decode_attention_resident_dev(
+        &self,
+        q_dev: &CudaSlice<f32>,
+        k_dev: &CudaSlice<f32>,
+        v_dev: &CudaSlice<f32>,
+        scores_dev: &mut CudaSlice<f32>,
+        scale: f32,
+        softcap: Option<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        total_len: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let q_len = num_q.checked_mul(head_dim);
+        let score_len = num_q.checked_mul(total_len);
+        let (q_len, score_len) = match (q_len, score_len) {
+            (Some(ql), Some(sl)) if q_dev.len() == ql && scores_dev.len() == sl => (ql, sl),
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "decode_attention_resident_dev shape mismatch: q={} (expected {q_len:?}), scores={} (expected {score_len:?}), num_q={num_q}, head_dim={head_dim}, total_len={total_len}",
+                    q_dev.len(),
+                    scores_dev.len(),
+                )))
+            }
+        };
+        // The resident K/V buffer is `max_seq * kv_dim` elements; `total_len`
+        // is the valid cursor (≤ max_seq). Validate the capacity holds the
+        // valid prefix, and that K and V match (same per-layer geometry).
+        if total_len == 0 {
+            return self.stream.alloc_zeros::<f32>(q_len).map_err(|err| {
+                RuntimeError::context("allocating decode_attention_resident_dev output", err)
+            });
+        }
+        if kv_dim == 0 || reps == 0 {
+            return Err(RuntimeError::usage(format!(
+                "decode_attention_resident_dev requires kv_dim >= 1 and reps >= 1 (got kv_dim={kv_dim}, reps={reps})"
+            )));
+        }
+        // `total_len <= max_seq` implied by the cursor invariant; check the
+        // buffer holds at least `total_len * kv_dim` valid elements.
+        let need_kv = match total_len.checked_mul(kv_dim) {
+            Some(n) if k_dev.len() >= n && v_dev.len() >= n => n,
+            _ => {
+                return Err(RuntimeError::usage(format!(
+                    "decode_attention_resident_dev resident K/V capacity {} / {} < total_len*kv_dim ({total_len}*{kv_dim}={})",
+                    k_dev.len(),
+                    v_dev.len(),
+                    total_len.saturating_mul(kv_dim),
+                )))
+            }
+        };
+        let _ = need_kv;
+        if q_len > u32::MAX as usize
+            || score_len > u32::MAX as usize
+            || num_q > u32::MAX as usize
+            || head_dim > u32::MAX as usize
+            || kv_dim > u32::MAX as usize
+            || total_len > u32::MAX as usize
+        {
+            return Err(RuntimeError::usage(format!(
+                "decode_attention_resident_dev shape (num_q={num_q}, head_dim={head_dim}, kv_dim={kv_dim}, total_len={total_len}) exceeds the 32-bit kernel index limit"
+            )));
+        }
+
+        self.launch_decode_attention_kernel(
+            q_dev, k_dev, v_dev, scores_dev, scale, softcap, num_q, head_dim, kv_dim, reps,
+            total_len,
+        )
+    }
+
+    /// Shared kernel launch for [`launch_decode_attention_dev`] and
+    /// [`launch_decode_attention_resident_dev`] — single source of the
+    /// `decode_attention` kernel-arg layout so the two callers can't drift on
+    /// arg order (a drift would be silent UB in the unsafe launch). Allocates
+    /// the `[num_q * head_dim]` output, binds all args, and launches one block
+    /// per query head (the kernel collaboratively fuses QKᵀ → scale → softmax →
+    /// weighted-V within the block). No sync/dtoh — the output stays resident
+    /// for the O projection to consume on the same stream. All shape/u32 guards
+    /// live in the two callers; this helper assumes validated shapes.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_decode_attention_kernel(
+        &self,
+        q_dev: &CudaSlice<f32>,
+        k_dev: &CudaSlice<f32>,
+        v_dev: &CudaSlice<f32>,
+        scores_dev: &mut CudaSlice<f32>,
+        scale: f32,
+        softcap: Option<f32>,
+        num_q: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+        total_len: usize,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let q_len = num_q * head_dim;
         let mut out_dev = self
             .stream
             .alloc_zeros::<f32>(q_len)
@@ -1365,9 +1492,8 @@ impl CudaRuntime {
             .arg(&kv_dim_u)
             .arg(&reps_u)
             .arg(&total_len_u);
-        unsafe { launch_args.launch(cfg) }.map_err(|err| {
-            RuntimeError::context("launching CUDA decode_attention_dev kernel", err)
-        })?;
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA decode_attention kernel", err))?;
         Ok(out_dev)
     }
 

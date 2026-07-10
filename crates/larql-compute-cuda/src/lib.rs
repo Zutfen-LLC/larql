@@ -4279,4 +4279,454 @@ mod tests {
         backend.truncate_kv_cache(4);
         assert_eq!(backend.host_kv_len(), 0);
     }
+
+    // ── GPU-006: resident-KV decode attention ──────────────────────────────
+    //
+    // These tests exercise the resident-KV decode path (append the current
+    // token's K/V to the device CudaKVCache, attend over the resident K/V
+    // instead of re-uploading the full host mirror each token) and the
+    // host/device cache-length lockstep invariants it relies on. All are
+    // runtime-gated: on a no-CUDA host they early-return (scaffold-pass),
+    // never claiming native validation.
+
+    /// Prompt length used by the resident-KV decode tests. The decode-attention
+    /// work gate (`native_decode_attention_worthwhile`, default
+    /// `DEFAULT_DECODE_ATTN_NATIVE_MIN_WORK = 8192`) compares
+    /// `work = num_q × total_len × head_dim`. The fixture has `num_q=4,
+    /// head_dim=64`, so the FIRST decode token needs
+    /// `total_len = seq_len + 1 ≥ 8192 / (4·64) = 32`, i.e. `seq_len ≥ 31`.
+    /// A 3-token prompt (used elsewhere in this file for sub-gate tests) gives
+    /// `work = 4·4·64 = 1024 < 8192`, which blocks `host_attention_block_device`
+    /// entirely — so the resident-KV code would never execute and the device
+    /// cursor / diag-counter assertions would fail. 40 gives comfortable margin
+    /// (first decode `work = 4·41·64 = 10496 ≥ 8192`) and stays well under the
+    /// `DEFAULT_GPU_KV_CACHE_MAX_SEQ = 4096` capacity.
+    const RESIDENT_KV_PROMPT_LEN: usize = 40;
+
+    /// The first decode token after a `RESIDENT_KV_PROMPT_LEN` prompt (keeps
+    /// decode IDs distinct from the prefill IDs 0..PROMPT_LEN).
+    fn resident_kv_first_decode_tok() -> u32 {
+        RESIDENT_KV_PROMPT_LEN as u32
+    }
+
+    /// Build a prompt of `n` token IDs `0..n` (all valid in the fixture's
+    /// 256-entry vocab).
+    fn resident_kv_prompt(n: usize) -> Vec<u32> {
+        (0..n as u32).collect()
+    }
+
+    /// Shared setup for the resident-KV decode tests: build + prefill the
+    /// fixture model through both the host mirror and the device cache. Returns
+    /// the owned weights/index (so each test can build its own `layers` with
+    /// the right borrow lifetime) plus the decode dims. Uses a
+    /// `RESIDENT_KV_PROMPT_LEN`-token prompt so the first decode clears the
+    /// decode-attention work gate (see that const's rationale) — without it,
+    /// `host_attention_block_device` bails and the resident-KV path never runs.
+    fn resident_kv_seed(
+        b: &CudaBackend,
+        token_ids: &[u32],
+    ) -> (
+        larql_models::ModelWeights,
+        larql_compute::test_fixtures::Q4kFixtureIndex,
+        usize,
+        usize,
+        usize,
+        f32,
+    ) {
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let (x, seq_len, hidden) = prefill_input(&weights, token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let layers = build_layers(&weights, &index);
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill seeding should succeed");
+        (weights, index, seq_len, hidden, inter, softcap)
+    }
+
+    /// GPU-006E: prefill N then one decode keeps host and device cache lengths
+    /// in lockstep. The resident-KV path advances the device cursor by one per
+    /// decode token; the host mirror grows by one too; they must agree.
+    #[test]
+    fn resident_kv_decode_lockstep_after_prefill_then_one_decode() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &prompt);
+        let layers = build_layers(&weights, &index);
+        // Post-prefill: both caches at seq_len.
+        assert_eq!(b.kv_cache_len(), seq_len);
+        assert_eq!(b.kv_cache_len_native(), seq_len);
+
+        // One decode token (clears the work gate → resident-KV path runs).
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let _ = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed");
+
+        // Lockstep: host mirror and device cursor both at seq_len + 1.
+        assert_eq!(b.host_kv_len(), seq_len + 1);
+        assert_eq!(
+            b.kv_cache_len_native(),
+            seq_len + 1,
+            "device cursor must advance by one per decode token (lockstep)"
+        );
+        assert_eq!(b.kv_cache_len(), seq_len + 1);
+    }
+
+    /// GPU-006E: multi-token decode keeps host/device cache lengths in lockstep
+    /// across several steps, and the reported `kv_cache_len` advances by one
+    /// per token (the RoPE position source).
+    #[test]
+    fn resident_kv_decode_lockstep_across_multi_token_decode() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &prompt);
+        let layers = build_layers(&weights, &index);
+        let start = resident_kv_first_decode_tok();
+        let next_tokens = [start, start + 1, start + 2, start + 3];
+        let mut expected = seq_len;
+        for tok in next_tokens {
+            let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
+            let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+            let _ = b
+                .decode_token(&layers, &x_dec, hidden, inter)
+                .expect("CUDA decode_token should succeed across the multi-token run");
+            expected += 1;
+            assert_eq!(
+                b.kv_cache_len_native(),
+                expected,
+                "device cursor drifted at tok {tok}"
+            );
+            assert_eq!(
+                b.host_kv_len(),
+                expected,
+                "host mirror drifted at tok {tok}"
+            );
+            assert_eq!(b.kv_cache_len(), expected);
+        }
+    }
+
+    /// GPU-006E: reset clears both caches to zero length. A subsequent prefill
+    /// starts device cache length at the new prompt length, not the stale
+    /// length and not prompt length plus one.
+    #[test]
+    fn resident_kv_reset_clears_both_caches() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (_weights, _index, seq_len, _hidden, _inter, _) = resident_kv_seed(&b, &prompt);
+        assert_eq!(b.kv_cache_len(), seq_len);
+        assert_eq!(b.kv_cache_len_native(), seq_len);
+
+        b.reset_kv_cache();
+        assert_eq!(b.host_kv_len(), 0, "reset must clear the host mirror");
+        assert_eq!(
+            b.kv_cache_len_native(),
+            0,
+            "reset must clear the device cursor"
+        );
+
+        // Re-prefill a different-length prompt (still clears the decode gate):
+        // device cache lands at the new prompt length, not seq_len and not a
+        // stale value.
+        let new_prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN + 8);
+        let (_w2, _i2, seq2, _h2, _in2, _s2) = resident_kv_seed(&b, &new_prompt);
+        assert_eq!(new_prompt.len(), seq2);
+        assert_eq!(b.kv_cache_len(), seq2);
+        assert_eq!(b.kv_cache_len_native(), seq2);
+    }
+
+    /// GPU-006E: truncate keeps host and device cache lengths in lockstep.
+    #[test]
+    fn resident_kv_truncate_keeps_lockstep() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let prompt = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &prompt);
+        let layers = build_layers(&weights, &index);
+        // Decode two tokens (clearing the gate → resident path advances the
+        // device cursor), then truncate back by one.
+        let start = resident_kv_first_decode_tok();
+        for tok in [start, start + 1] {
+            let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
+            let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+            let _ = b.decode_token(&layers, &x_dec, hidden, inter);
+        }
+        let before = b.kv_cache_len();
+        assert_eq!(before, seq_len + 2);
+
+        b.truncate_kv_cache(seq_len + 1);
+        assert_eq!(b.host_kv_len(), seq_len + 1);
+        assert_eq!(
+            b.kv_cache_len_native(),
+            seq_len + 1,
+            "truncate must roll back the device cursor in lockstep"
+        );
+        assert_eq!(b.kv_cache_len(), seq_len + 1);
+    }
+
+    /// GPU-006F: resident-KV decode parity against the CPU f32-activation
+    /// decode reference, single decode token after prefill. This is the
+    /// resident-KV analog of ASTAB-001's
+    /// `decode_token_matches_cpu_reference_when_runtime_available` — same
+    /// tolerance (1e-3), same reference (`predict_kquant_decode_step`).
+    #[test]
+    fn resident_kv_decode_matches_cpu_reference_after_prefill() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let layers = build_layers(&weights, &index);
+
+        // CPU reference: prefill then one f32-activation decode step.
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        // Decode token clears the work gate → resident-KV path runs.
+        let next_tok = resident_kv_first_decode_tok();
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+
+        // CUDA resident-KV decode of the same next token.
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed with a runtime + seeded KV");
+
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        assert_eq!(cpu_row.len(), cuda_decode.len());
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "resident-KV decode diverged from CPU reference: max_abs={max_abs:.6e}"
+        );
+        // The resident path must have been used (the fixture is k-quant + a
+        // runtime + a seeded cache, so eligibility holds) — assert the counter.
+        let diag = b
+            .resident_kv_diag()
+            .expect("resident-KV diag present after decode");
+        assert!(
+            !diag.contains("uses=0,"),
+            "resident-KV decode should register uses, got: {diag}"
+        );
+    }
+
+    /// GPU-006F: multi-token resident-KV decode parity against the CPU
+    /// f32-activation reference (GQA asymmetric: 4 q heads, 2 kv heads,
+    /// reps=2). Locks the resident path across several tokens where the device
+    /// cache grows each step.
+    #[test]
+    fn resident_kv_multi_token_decode_matches_cpu_reference() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let layers = build_layers(&weights, &index);
+
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+
+        // Each decode token clears the work gate (total_len grows from 41).
+        let start = resident_kv_first_decode_tok();
+        let next_tokens = [start, start + 1, start + 2, start + 3];
+        let mut cpu_pos = seq_len;
+        for tok in next_tokens {
+            let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+                &weights,
+                tok,
+                &index,
+                &mut cpu_cache,
+                cpu_pos,
+            )
+            .expect("CPU f32 decode step");
+            cpu_pos += 1;
+
+            let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
+            let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+            let cuda_decode = b
+                .decode_token(&layers, &x_dec, hidden, inter)
+                .expect("CUDA decode_token should succeed across the multi-token run");
+
+            let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+            assert_eq!(cpu_row.len(), cuda_decode.len());
+            let max_abs = cpu_row
+                .iter()
+                .zip(cuda_decode.iter())
+                .map(|(c, g)| (c - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs < 1e-3,
+                "resident-KV multi-token decode (tok {tok}) diverged: max_abs={max_abs:.6e}"
+            );
+            assert_eq!(
+                b.kv_cache_len(),
+                cpu_pos,
+                "kv_cache_len drifted at tok {tok}"
+            );
+        }
+    }
+
+    /// GPU-006F: the resident-KV decode path reads only the valid
+    /// `0..current_len` cache rows and ignores uninitialized capacity beyond
+    /// the cursor. The cache is zero-initialized at allocation, so a regression
+    /// that read `max_seq` rows would attend over zero-score rows and diverge
+    /// from the CPU reference (which has no capacity concept). Matching the
+    /// reference within 1e-3 proves only the valid prefix was attended over.
+    /// Runtime-gated.
+    #[test]
+    fn resident_kv_decode_reads_only_valid_rows() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let layers = build_layers(&weights, &index);
+
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        // Decode token clears the work gate → resident path runs.
+        let next_tok = resident_kv_first_decode_tok();
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed");
+
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "resident-KV decode attended over invalid capacity rows: max_abs={max_abs:.6e}"
+        );
+        assert_eq!(b.kv_cache_len_native(), seq_len + 1);
+    }
+
+    /// GPU-006F: the full-KV-upload fallback still produces correct output when
+    /// the resident path is ineligible. Ineligibility is forced by NOT
+    /// preallocating the device cache (`resident_kv_decode_attention` returns
+    /// `Ok(None)` when no cache is allocated), so decode routes through the
+    /// full-upload path. The output must still match the CPU reference, and the
+    /// fallback counter must advance.
+    #[test]
+    fn resident_kv_fallback_to_upload_when_no_cache() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let weights = make_test_q4k_weights();
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        // Prefill WITHOUT preallocating the device cache → prefill's
+        // populate_kv_layer is a no-op on the device, so the resident path is
+        // ineligible and decode falls back to the full-upload device path.
+        // (The prompt length clears the decode-attention work gate so the
+        // device attention block — where the fallback lives — actually runs;
+        // otherwise the gate blocks the whole device path and the fallback
+        // counter would never advance.)
+        b.reset_kv_cache();
+        // Deliberately skip preallocate_kv_cache_per_layer.
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill should succeed (host-mirror path)");
+        assert!(
+            !b.kv_cache_allocated(),
+            "no device cache should be allocated in this scenario"
+        );
+
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let next_tok = resident_kv_first_decode_tok();
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token (full-upload fallback) should succeed");
+
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "full-upload fallback diverged from CPU reference: max_abs={max_abs:.6e}"
+        );
+        // The fallback counter must have advanced (every decode used fallback).
+        let diag = b
+            .resident_kv_diag()
+            .expect("resident-KV diag present after a fallback decode");
+        assert!(
+            !diag.contains("fallbacks=0)"),
+            "full-upload fallback should register fallbacks, got: {diag}"
+        );
+    }
 }

@@ -140,6 +140,19 @@ Ordered by expected wall-clock impact; re-rank against the A4 profile.
   per-token full-KV upload + row readback. The host mirror stays as the
   parity oracle and the source for `truncate`/state-dump paths. This is the
   single biggest remaining CUDA perf item.
+  <!-- GPU-006 (2026-07-09): COMPLETE — decode now appends the current token's
+       K/V to the device cache and attends over the resident K/V via
+       launch_decode_attention_resident_dev, with an explicit full-KV-upload
+       fallback when ineligible. 8 runtime-gated tests added (lockstep, parity
+       vs CPU f32 reference, valid-rows-only, fallback). HARDWARE-VALIDATED on
+       RTX 3090 (sm_86, NVRTC 12.4): 154/154 tests green with default settings
+       (hardware_probe + ASTAB-001 decode parity + all 8 resident_kv), 21
+       native kernels loaded. See bench/baselines/cuda-resident-kv-2026-07-09.md. -->
+- B2. **Cross-layer residency** (1-2 sessions). Keep `h` resident across
+  blocks and layers within a decode step / prefill pass; read back once per
+  token (logits input) instead of once per block. The residual-add kernel
+  already exists; this is plumbing, not kernels. Likely the next CUDA slice
+  after B1 hardware validation.
 - B2. **Cross-layer residency** (1-2 sessions). Keep `h` resident across
   blocks and layers within a decode step / prefill pass; read back once per
   token (logits input) instead of once per block. The residual-add kernel

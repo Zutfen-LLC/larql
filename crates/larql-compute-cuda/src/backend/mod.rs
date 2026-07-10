@@ -3,6 +3,7 @@ mod runtime;
 use crate::kv_cache::{CudaKVCache, KvCacheError};
 use crate::options::BackendOptions;
 use crate::pipeline::HostKvType;
+use cudarc::driver::CudaSlice;
 use std::sync::{Arc, Mutex};
 
 pub(crate) use runtime::{CudaRuntime, RuntimeError};
@@ -23,6 +24,12 @@ pub struct CudaBackend {
     /// `kv_cache` stays populated for the `DecodeBackend` lifecycle contract
     /// but device-side attention kernels aren't implemented yet).
     pub(crate) host_kv: Mutex<HostKvType>,
+    /// GPU-006 diagnostics: how many decode attention launches used the
+    /// resident-KV device path (`true`) vs. fell back to the full-KV-upload
+    /// path (`false`). Surfaced via `device_info()` when `LARQL_GPU_DIAG=1`.
+    /// Thread-safe (atomic) so concurrent decode steps don't contend.
+    resident_kv_decode_uses: std::sync::atomic::AtomicU64,
+    resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 impl CudaBackend {
@@ -38,6 +45,8 @@ impl CudaBackend {
                 runtime_status: None,
                 kv_cache: Mutex::new(None),
                 host_kv: Mutex::new(Vec::new()),
+                resident_kv_decode_uses: std::sync::atomic::AtomicU64::new(0),
+                resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64::new(0),
             }),
             Err(err) if options.allow_cpu_delegate => Ok(Self {
                 options,
@@ -45,6 +54,8 @@ impl CudaBackend {
                 runtime_status: Some(err.to_string()),
                 kv_cache: Mutex::new(None),
                 host_kv: Mutex::new(Vec::new()),
+                resident_kv_decode_uses: std::sync::atomic::AtomicU64::new(0),
+                resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64::new(0),
             }),
             Err(err) => Err(BackendInitError::Unavailable(err.to_string())),
         }
@@ -253,6 +264,40 @@ impl CudaBackend {
             s.cached_bytes,
             s.cached_u8_buffers,
             s.cached_f32_buffers,
+        ))
+    }
+
+    /// Record one resident-KV decode attention outcome for the `LARQL_GPU_DIAG`
+    /// surface (GPU-006). `resident = true` → the device-resident KV path was
+    /// used; `false` → fell back to the full-KV-upload path. Thread-safe.
+    pub(crate) fn note_resident_kv_decode(&self, resident: bool) {
+        use std::sync::atomic::Ordering;
+        if resident {
+            self.resident_kv_decode_uses.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.resident_kv_decode_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A one-line diagnostic string for the resident-KV decode attention
+    /// usage, or `None` when neither path has ever run (counters at zero).
+    /// Surfaced through `device_info()` when `LARQL_GPU_DIAG` is set.
+    pub fn resident_kv_diag(&self) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let uses = self.resident_kv_decode_uses.load(Ordering::Relaxed);
+        let fallbacks = self.resident_kv_decode_fallbacks.load(Ordering::Relaxed);
+        if uses == 0 && fallbacks == 0 {
+            return None;
+        }
+        let total = uses + fallbacks;
+        let rate = if total == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.1}%", (uses as f64 / total as f64) * 100.0)
+        };
+        Some(format!(
+            "cuda resident-KV decode: uses={uses}, fallbacks={fallbacks}, resident_rate={rate}"
         ))
     }
 
@@ -617,6 +662,116 @@ impl CudaBackend {
         // Lockstep: every layer advances its cursor to `pos + seq_len`.
         layer_cache.current_len = pos + seq_len;
         Ok(true)
+    }
+
+    /// Resident-KV decode attention (GPU-006): append the current token's
+    /// post-RoPE K row + post-V-norm V row to layer `li`'s device cache, then
+    /// launch the `decode_attention` kernel over the device-resident K/V —
+    /// eliminating the per-token full-KV host readback + re-upload the full-
+    /// upload path pays. The host KV mirror stays the parity oracle and the
+    /// source for truncate/state-dump; this path keeps it in lockstep by
+    /// leaving the host append to the caller (which needs the rows anyway for
+    /// the state dump).
+    ///
+    /// Returns `Ok(Some(out_dev))` (the resident `[num_q * head_dim]` attention
+    /// output, no sync/dtoh — the O projection consumes it on the same stream)
+    /// on a successful append + launch; `Ok(None)` when the resident path is
+    /// ineligible (no runtime, no cache, layer out of range, shape mismatch, or
+    /// the device cursor disagrees with `prev` — the lockstep invariant the
+    /// append relies on); `Err` on a launch failure. The cache lock spans the
+    /// append + attention launch; it is released once the attention kernel is
+    /// *launched* (CUDA stream-ordered, so the kernel reads the resident buffer
+    /// before any later append on the same stream writes past `total_len`).
+    ///
+    /// `prev` is the prior host-mirror length (== the device cursor when in
+    /// lockstep); `total_len = prev + 1` is the post-append attention length.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resident_kv_decode_attention(
+        &self,
+        runtime: &Arc<CudaRuntime>,
+        li: usize,
+        q_dev: &CudaSlice<f32>,
+        new_k: &[f32],
+        new_v: &[f32],
+        prev: usize,
+        scale: f32,
+        softcap: Option<f32>,
+        num_q: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        reps: usize,
+    ) -> Result<Option<CudaSlice<f32>>, RuntimeError> {
+        let kv_dim_ok = num_kv_heads.checked_mul(head_dim) == Some(kv_dim) && kv_dim > 0;
+        let mut guard = self.lock_kv_cache();
+        let cache = match guard.as_mut() {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let layer_cache = match cache.layers.get_mut(li) {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        // Shape + lockstep guards. The layer's per-layer geometry must match
+        // the caller's (num_kv_heads, head_dim), and the device cursor must
+        // equal `prev` so the append lands at exactly the slot the host path
+        // would have concatenated the new row into.
+        if !kv_dim_ok
+            || layer_cache.num_kv_heads != num_kv_heads
+            || layer_cache.head_dim != head_dim
+        {
+            return Ok(None);
+        }
+        if layer_cache.current_len != prev {
+            return Ok(None);
+        }
+        // Capacity: the appended row at slot `prev` must fit `max_seq`.
+        if prev >= layer_cache.max_seq {
+            return Ok(None);
+        }
+        // Append the new K/V row at slot `prev` (cursor → prev+1). Uses the
+        // same `launch_kv_append` prefill uses; one htod + one launch + sync.
+        runtime.launch_kv_append(
+            new_k,
+            new_v,
+            &mut layer_cache.k_cache,
+            &mut layer_cache.v_cache,
+            prev,
+            1,
+            layer_cache.num_kv_heads,
+            layer_cache.head_dim,
+        )?;
+        layer_cache.current_len = prev + 1;
+        let total_len = layer_cache.current_len;
+        // Borrow the resident K/V for the attention launch (same lock scope).
+        let k_ref = &layer_cache.k_cache;
+        let v_ref = &layer_cache.v_cache;
+        let score_len = match num_q.checked_mul(total_len) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let mut scores_dev = runtime.alloc_zeros_f32(score_len).map_err(|err| {
+            RuntimeError::usage(format!(
+                "allocating resident decode_attention scores: {err}"
+            ))
+        })?;
+        let out_dev = runtime.launch_decode_attention_resident_dev(
+            q_dev,
+            k_ref,
+            v_ref,
+            &mut scores_dev,
+            scale,
+            softcap,
+            num_q,
+            head_dim,
+            kv_dim,
+            reps,
+            total_len,
+        )?;
+        // The attention kernel is launched on the stream; the output `out_dev`
+        // is an owned allocation. The cache lock can drop now (stream ordering
+        // guarantees the kernel reads the resident K/V before a later append).
+        Ok(Some(out_dev))
     }
 
     /// Reset every layer's `current_len` cursor to 0 (new prompt). The device

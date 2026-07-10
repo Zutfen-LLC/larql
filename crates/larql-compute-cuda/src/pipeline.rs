@@ -52,6 +52,7 @@ use ndarray::Array2;
 
 use crate::options::native_thresholds;
 use crate::CudaBackend;
+use cudarc::driver::CudaSlice;
 
 /// Per-layer host-side KV mirror. `(K_cache, V_cache)` each `[len, kv_dim]`.
 /// Grown by `push_kv_row` during prefill/decode; reset by `clear`.
@@ -1134,62 +1135,87 @@ impl CudaBackend {
                 )
                 .ok()?;
             // Read back the new post-RoPE K / post-V-norm V row (one sync).
-            // Needed to build the full KV the decode-attention kernel attends
-            // over; also the row the caller appends to the host mirror.
+            // Still needed under resident-KV: the caller appends this row to
+            // the host KV mirror (the parity oracle + truncate/state-dump
+            // source), and the state dump captures it. Under the resident path
+            // the device attention no longer needs the full host prefix, but
+            // the host mirror append + state-dump still consume these rows.
             let k_new_row = runtime.sync_dtoh_f32(&k_rope).ok()?;
             let v_new_row = runtime.sync_dtoh_f32(&v_normed).ok()?;
             if k_new_row.len() != kv_dim || v_new_row.len() != kv_dim {
                 return None;
             }
-            // Build the full KV [total_len, kv_dim] from the prior host
-            // mirror + the new row (the host reference concatenates the same
-            // way). The mirror holds post-RoPE K / post-V-norm V.
-            let (k_full, v_full): (Vec<f32>, Vec<f32>) = {
-                let kv = self.lock_host_kv();
-                match kv.get(li) {
-                    Some((k_cache, v_cache)) if prev > 0 => {
-                        let kc = k_cache.as_slice().unwrap_or(&[]);
-                        let vc = v_cache.as_slice().unwrap_or(&[]);
-                        let need = prev * kv_dim;
-                        if kc.len() < need || vc.len() < need {
-                            return None;
-                        }
-                        let mut k_full = Vec::with_capacity(total_len * kv_dim);
-                        let mut v_full = Vec::with_capacity(total_len * kv_dim);
-                        k_full.extend_from_slice(&kc[..need]);
-                        v_full.extend_from_slice(&vc[..need]);
-                        k_full.extend_from_slice(&k_new_row);
-                        v_full.extend_from_slice(&v_new_row);
-                        (k_full, v_full)
-                    }
-                    _ => (k_new_row.clone(), v_new_row.clone()),
+            // GPU-006: prefer the resident-KV device path. Append the new row
+            // to layer `li`'s device CudaKVCache and attend over the resident
+            // K/V (no per-token full-KV host readback + re-upload). Falls back
+            // to the full-upload path below on `Ok(None)` (ineligible:
+            // no/undersized cache, shape mismatch, or device cursor out of
+            // lockstep) or `Err` (launch failure). The eligibility is explicit
+            // and testable; a deterministic ineligibility routes to full-upload
+            // rather than silently degrading.
+            let resident = self.resident_kv_decode_attention(
+                runtime,
+                li,
+                &q_rope,
+                &k_new_row,
+                &v_new_row,
+                prev,
+                scale as f32,
+                softcap_opt,
+                num_q,
+                num_kv,
+                head_dim,
+                kv_dim,
+                reps,
+            );
+            let attn_dev = match resident {
+                Ok(Some(out)) => {
+                    self.note_resident_kv_decode(true);
+                    out
+                }
+                // Resident path ineligible → full-upload fallback (today's
+                // behavior). Counted as a fallback for diagnostics.
+                Ok(None) => {
+                    self.note_resident_kv_decode(false);
+                    self.decode_attention_full_upload(
+                        runtime,
+                        li,
+                        &q_rope,
+                        &k_new_row,
+                        &v_new_row,
+                        prev,
+                        total_len,
+                        kv_dim,
+                        num_q,
+                        head_dim,
+                        reps,
+                        scale as f32,
+                        softcap_opt,
+                    )
+                    .ok()?
+                }
+                // Launch failure on the resident path: fall back to full-upload
+                // too, but record it as a fallback (not a clean ineligibility).
+                Err(_) => {
+                    self.note_resident_kv_decode(false);
+                    self.decode_attention_full_upload(
+                        runtime,
+                        li,
+                        &q_rope,
+                        &k_new_row,
+                        &v_new_row,
+                        prev,
+                        total_len,
+                        kv_dim,
+                        num_q,
+                        head_dim,
+                        reps,
+                        scale as f32,
+                        softcap_opt,
+                    )
+                    .ok()?
                 }
             };
-            // Decode attention over the full KV. The resident Q stays on the
-            // device; the full KV is uploaded fresh (the mirror grows each
-            // token, so a resident device KV buffer would need an append step
-            // — the single-command-buffer follow-on). The scores scratch is
-            // owned by this scope so it drops after the final readback.
-            let score_len = num_q.checked_mul(total_len)?;
-            let k_dev = runtime.upload_f32(&k_full).ok()?;
-            let v_dev = runtime.upload_f32(&v_full).ok()?;
-            // Kernel-write-only scratch: device-local zero alloc, no htod.
-            let mut scores_dev = runtime.alloc_zeros_f32(score_len).ok()?;
-            let attn_dev = runtime
-                .launch_decode_attention_dev(
-                    &q_rope,
-                    &k_dev,
-                    &v_dev,
-                    &mut scores_dev,
-                    scale as f32,
-                    softcap_opt,
-                    num_q,
-                    head_dim,
-                    kv_dim,
-                    reps,
-                    total_len,
-                )
-                .ok()?;
             // O projection: resident attention output → [1, hidden].
             let o_dev =
                 matvec_dev_by_fmt(runtime, of, layer.wo.data, &attn_dev, hidden, q_dim).ok()?;
@@ -1239,6 +1265,78 @@ impl CudaBackend {
             return Some(out);
         }
         self.host_attention_block_hostonly(layer, h, li, abs_position)
+    }
+
+    /// Full-KV-upload decode attention — the fallback for the resident-KV
+    /// path (GPU-006) and the pre-GPU-006 behavior. Builds the full
+    /// `[total_len, kv_dim]` K/V from the host mirror prefix + the new row,
+    /// uploads it fresh, and attends. Used when
+    /// [`resident_kv_decode_attention`] returns `Ok(None)` (ineligible) or
+    /// `Err` (launch failure). `q_dev` is the resident post-RoPE Q (reused
+    /// from the device chain); only the full K/V is re-uploaded. Returns the
+    /// resident `[num_q * head_dim]` attention output (no sync/dtoh) so the O
+    /// projection consumes it on the same stream.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_attention_full_upload(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        li: usize,
+        q_dev: &CudaSlice<f32>,
+        k_new_row: &[f32],
+        v_new_row: &[f32],
+        prev: usize,
+        total_len: usize,
+        kv_dim: usize,
+        num_q: usize,
+        head_dim: usize,
+        reps: usize,
+        scale: f32,
+        softcap: Option<f32>,
+    ) -> Result<CudaSlice<f32>, ()> {
+        // Build the full KV [total_len, kv_dim] from the prior host mirror
+        // prefix + the new row (the host reference concatenates the same way).
+        // The mirror holds post-RoPE K / post-V-norm V.
+        let (k_full, v_full): (Vec<f32>, Vec<f32>) = {
+            let kv = self.lock_host_kv();
+            match kv.get(li) {
+                Some((k_cache, v_cache)) if prev > 0 => {
+                    let kc = k_cache.as_slice().unwrap_or(&[]);
+                    let vc = v_cache.as_slice().unwrap_or(&[]);
+                    let need = prev * kv_dim;
+                    if kc.len() < need || vc.len() < need {
+                        return Err(());
+                    }
+                    let mut k_full = Vec::with_capacity(total_len * kv_dim);
+                    let mut v_full = Vec::with_capacity(total_len * kv_dim);
+                    k_full.extend_from_slice(&kc[..need]);
+                    v_full.extend_from_slice(&vc[..need]);
+                    k_full.extend_from_slice(k_new_row);
+                    v_full.extend_from_slice(v_new_row);
+                    (k_full, v_full)
+                }
+                _ => (k_new_row.to_vec(), v_new_row.to_vec()),
+            }
+        };
+        let score_len = num_q.checked_mul(total_len).ok_or(())?;
+        let k_dev = runtime.upload_f32(&k_full).map_err(|_| ())?;
+        let v_dev = runtime.upload_f32(&v_full).map_err(|_| ())?;
+        // Kernel-write-only scratch: device-local zero alloc, no htod.
+        let mut scores_dev = runtime.alloc_zeros_f32(score_len).map_err(|_| ())?;
+        runtime
+            .launch_decode_attention_dev(
+                q_dev,
+                &k_dev,
+                &v_dev,
+                &mut scores_dev,
+                scale,
+                softcap,
+                num_q,
+                head_dim,
+                kv_dim,
+                reps,
+                total_len,
+            )
+            .map_err(|_| ())
     }
 
     /// Host-orchestrated decode-step attention block
