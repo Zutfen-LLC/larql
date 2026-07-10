@@ -595,12 +595,27 @@ pub fn make_test_q4k_weights() -> ModelWeights {
     make_test_q4k_weights_layers(Q4K_TEST_NUM_LAYERS)
 }
 
+/// Intermediate-width-parametrised sibling of [`make_test_q4k_weights`].
+/// `intermediate` must remain a multiple of the Q4_K 256-element super-block.
+pub fn make_test_q4k_weights_inter(intermediate: usize) -> ModelWeights {
+    make_test_q4k_weights_inter_layers(intermediate, Q4K_TEST_NUM_LAYERS)
+}
+
 /// Layer-parametrised sibling of [`make_test_q4k_weights`]. Identical
 /// arch / dims, but with `num_layers` decoder layers — for tests that
 /// need a depth-fraction layer index to land inside the model (e.g. the
 /// LQL FR3 relation resolver, whose probe layer clamps to ≥3, so it needs
 /// a model deeper than the default 2-layer fixture).
 pub fn make_test_q4k_weights_layers(num_layers: usize) -> ModelWeights {
+    make_test_q4k_weights_inter_layers(Q4K_TEST_INTER, num_layers)
+}
+
+/// Layer- and intermediate-width-parametrised Q4_K fixture.
+pub fn make_test_q4k_weights_inter_layers(intermediate: usize, num_layers: usize) -> ModelWeights {
+    assert!(
+        intermediate > 0 && intermediate.is_multiple_of(256),
+        "Q4_K fixture intermediate width must be a positive multiple of 256"
+    );
     let num_q = 4usize;
     let num_kv = 2usize;
     let head_dim = Q4K_TEST_HIDDEN / num_q;
@@ -609,7 +624,7 @@ pub fn make_test_q4k_weights_layers(num_layers: usize) -> ModelWeights {
         "model_type": "gemma3_text",
         "hidden_size": Q4K_TEST_HIDDEN,
         "num_hidden_layers": num_layers,
-        "intermediate_size": Q4K_TEST_INTER,
+        "intermediate_size": intermediate,
         "head_dim": head_dim,
         "num_attention_heads": num_q,
         "num_key_value_heads": num_kv,
@@ -617,7 +632,7 @@ pub fn make_test_q4k_weights_layers(num_layers: usize) -> ModelWeights {
         "hidden_activation": "gelu_pytorch_tanh",
         "rope_theta": 10000.0,
     });
-    q4k_test_weights_from_json(arch_json, num_layers)
+    q4k_test_weights_from_json(arch_json, num_layers, intermediate)
 }
 
 /// Rope-scaled sibling of [`make_test_q4k_weights`]: Gemma-3 arch at the
@@ -648,10 +663,14 @@ pub fn make_test_q4k_weights_rope_scaled() -> ModelWeights {
         "sliding_window": 512,
         "rope_scaling": {"rope_type": "linear", "factor": 8.0},
     });
-    q4k_test_weights_from_json(arch_json, num_layers)
+    q4k_test_weights_from_json(arch_json, num_layers, Q4K_TEST_INTER)
 }
 
-fn q4k_test_weights_from_json(arch_json: serde_json::Value, num_layers: usize) -> ModelWeights {
+fn q4k_test_weights_from_json(
+    arch_json: serde_json::Value,
+    num_layers: usize,
+    intermediate: usize,
+) -> ModelWeights {
     let num_q = 4usize;
     let num_kv = 2usize;
     let head_dim = Q4K_TEST_HIDDEN / num_q;
@@ -699,15 +718,15 @@ fn q4k_test_weights_from_json(arch_json: serde_json::Value, num_layers: usize) -
         );
         tensors.insert(
             arch.ffn_gate_key(layer),
-            rand_mat_seeded(Q4K_TEST_INTER, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+            rand_mat_seeded(intermediate, Q4K_TEST_HIDDEN, 0.05, next_seed()),
         );
         tensors.insert(
             arch.ffn_up_key(layer),
-            rand_mat_seeded(Q4K_TEST_INTER, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+            rand_mat_seeded(intermediate, Q4K_TEST_HIDDEN, 0.05, next_seed()),
         );
         tensors.insert(
             arch.ffn_down_key(layer),
-            rand_mat_seeded(Q4K_TEST_HIDDEN, Q4K_TEST_INTER, 0.05, next_seed()),
+            rand_mat_seeded(Q4K_TEST_HIDDEN, intermediate, 0.05, next_seed()),
         );
 
         vectors.insert(arch.input_layernorm_key(layer), vec![0.5; Q4K_TEST_HIDDEN]);
@@ -736,7 +755,7 @@ fn q4k_test_weights_from_json(arch_json: serde_json::Value, num_layers: usize) -
         arch,
         num_layers,
         hidden_size: Q4K_TEST_HIDDEN,
-        intermediate_size: Q4K_TEST_INTER,
+        intermediate_size: intermediate,
         vocab_size: Q4K_TEST_VOCAB,
         logical_vocab_size: None,
         head_dim,
@@ -1166,6 +1185,29 @@ mod tests {
             assert!(
                 v.abs() <= 0.1 + 1e-6,
                 "embed value outside [-0.1, 0.1]: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4k_fixture_supports_custom_intermediate_and_layer_count() {
+        let intermediate = 512;
+        let layers = 3;
+        let w = make_test_q4k_weights_inter_layers(intermediate, layers);
+        assert_eq!(w.intermediate_size, intermediate);
+        assert_eq!(w.num_layers, layers);
+        for layer in 0..layers {
+            assert_eq!(
+                w.tensors[&w.arch.ffn_gate_key(layer)].shape(),
+                &[intermediate, Q4K_TEST_HIDDEN]
+            );
+            assert_eq!(
+                w.tensors[&w.arch.ffn_up_key(layer)].shape(),
+                &[intermediate, Q4K_TEST_HIDDEN]
+            );
+            assert_eq!(
+                w.tensors[&w.arch.ffn_down_key(layer)].shape(),
+                &[Q4K_TEST_HIDDEN, intermediate]
             );
         }
     }

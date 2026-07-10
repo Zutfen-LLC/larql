@@ -30,6 +30,16 @@ pub struct CudaBackend {
     /// Thread-safe (atomic) so concurrent decode steps don't contend.
     resident_kv_decode_uses: std::sync::atomic::AtomicU64,
     resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64,
+    /// GPU-007 diagnostics: how many decode layers carried the hidden state
+    /// device-resident across the attention→FFN→next-layer chain (`true`) vs.
+    /// fell back to the host-orchestrated per-block path (`false`). Surfaced
+    /// via `device_info()` when `LARQL_GPU_DIAG=1`. Thread-safe (atomic).
+    resident_hidden_uses: std::sync::atomic::AtomicU64,
+    resident_hidden_fallbacks: std::sync::atomic::AtomicU64,
+    /// Test-only eligibility hook for exercising a resident → fallback →
+    /// resident transition without changing any layer math.
+    #[cfg(test)]
+    resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize,
 }
 
 impl CudaBackend {
@@ -47,6 +57,12 @@ impl CudaBackend {
                 host_kv: Mutex::new(Vec::new()),
                 resident_kv_decode_uses: std::sync::atomic::AtomicU64::new(0),
                 resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                resident_hidden_uses: std::sync::atomic::AtomicU64::new(0),
+                resident_hidden_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
+                    usize::MAX,
+                ),
             }),
             Err(err) if options.allow_cpu_delegate => Ok(Self {
                 options,
@@ -56,6 +72,12 @@ impl CudaBackend {
                 host_kv: Mutex::new(Vec::new()),
                 resident_kv_decode_uses: std::sync::atomic::AtomicU64::new(0),
                 resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                resident_hidden_uses: std::sync::atomic::AtomicU64::new(0),
+                resident_hidden_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(test)]
+                resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
+                    usize::MAX,
+                ),
             }),
             Err(err) => Err(BackendInitError::Unavailable(err.to_string())),
         }
@@ -298,6 +320,63 @@ impl CudaBackend {
         };
         Some(format!(
             "cuda resident-KV decode: uses={uses}, fallbacks={fallbacks}, resident_rate={rate}"
+        ))
+    }
+
+    /// Record one resident-hidden decode layer outcome for the `LARQL_GPU_DIAG`
+    /// surface (GPU-007). `resident = true` → the layer carried the hidden
+    /// state device-resident across attention→FFN→next-layer (no inter-block
+    /// / inter-layer hidden-state readback); `false` → fell back to the
+    /// host-orchestrated per-block path (the hidden state was read back to
+    /// host between the attention and FFN blocks, or between layers).
+    /// Thread-safe.
+    pub(crate) fn note_resident_hidden(&self, resident: bool) {
+        use std::sync::atomic::Ordering;
+        if resident {
+            self.resident_hidden_uses.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.resident_hidden_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Force one layer through the resident-hidden host fallback in tests.
+    /// This is intentionally backend-local and does not mutate the pipeline
+    /// layer, so the fallback and CPU reference retain identical semantics.
+    #[cfg(test)]
+    pub(crate) fn force_resident_hidden_fallback_layer_for_test(&self, layer: Option<usize>) {
+        use std::sync::atomic::Ordering;
+        self.resident_hidden_forced_fallback_layer
+            .store(layer.unwrap_or(usize::MAX), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_hidden_fallback_forced_for_test(&self, layer: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        self.resident_hidden_forced_fallback_layer
+            .load(Ordering::Relaxed)
+            == layer
+    }
+
+    /// A one-line diagnostic string for the resident-hidden decode usage, or
+    /// `None` when neither path has ever run (counters at zero). Surfaced
+    /// through `device_info()` when `LARQL_GPU_DIAG` is set. Mirrors
+    /// [`resident_kv_diag`] (GPU-006).
+    pub fn resident_hidden_diag(&self) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let uses = self.resident_hidden_uses.load(Ordering::Relaxed);
+        let fallbacks = self.resident_hidden_fallbacks.load(Ordering::Relaxed);
+        if uses == 0 && fallbacks == 0 {
+            return None;
+        }
+        let total = uses + fallbacks;
+        let rate = if total == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.1}%", (uses as f64 / total as f64) * 100.0)
+        };
+        Some(format!(
+            "cuda resident-hidden decode: uses={uses}, fallbacks={fallbacks}, resident_rate={rate}"
         ))
     }
 
