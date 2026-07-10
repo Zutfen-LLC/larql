@@ -148,7 +148,7 @@ Ordered by expected wall-clock impact; re-rank against the A4 profile.
        RTX 3090 (sm_86, NVRTC 12.4): 154/154 tests green with default settings
        (hardware_probe + ASTAB-001 decode parity + all 8 resident_kv), 21
        native kernels loaded. See bench/baselines/cuda-resident-kv-2026-07-09.md. -->
-  <!-- GPU-007 (2026-07-09): SCAFFOLD-VALIDATED, PENDING HARDWARE VALIDATION —
+  <!-- GPU-007 (2026-07-10): HARDWARE-VALIDATED on RTX 3090 (sm_86, NVRTC 12.4) —
        decode now threads the hidden state device-resident through eligible
        dense layers via host_decode_token_resident (+ host_attention_block_
        device_resident + host_ffn_block_device_resident), collapsing the
@@ -156,28 +156,27 @@ Ordered by expected wall-clock impact; re-rank against the A4 profile.
        loop pays. The input norm, post-attn norm+residual, and post-ffn
        norm+residual now run on device (launch_rms_norm_dev + the new
        launch_residual_add_dev — a thin wrapper over the existing
-       launch_elementwise_binary_dev; no new kernel). 6 runtime-gated tests
+       launch_elementwise_binary_dev; no new kernel). 7 runtime-gated tests
        added (single-token parity, multi-token parity, diag-surface, forced
-       fallback, KV-lockstep-unchanged, consecutive-layers). Fallback is
-       per-layer (MoE/PLE/remote/LayerNorm/sub-gate/non-kquant/padded-down
-       → host path) and counted (resident_hidden_uses/fallbacks under
-       LARQL_GPU_DIAG=1). 159/159 lib tests green on the no-CUDA scaffold
-       (153 prior + 6 new; all resident-hidden + resident_kv tests
-       scaffold-pass via early-return). NOT hardware-validated: the
-       implementing session had no CUDA device. B2 stays PENDING until an
-       RTX-class run confirms ASTAB-001 parity + the diag counters on real
-       hardware. lm-head-on-device, launch batching, and MoE/router polish
+       fallback, KV-lockstep-unchanged, consecutive-layers, mixed-eligibility
+       transitions). Fallback is per-layer (MoE/PLE/remote/LayerNorm/sub-gate/
+       non-kquant/padded-down → host path) and counted (resident_hidden_uses/
+       fallbacks under LARQL_GPU_DIAG=1). 160/160 lib tests green + 1
+       hardware_probe on RTX 3090 with default settings (no env overrides).
+       All 7 resident_hidden tests pass natively, including the
+       mixed-eligibility transition test (Host→Device→Host→Device→final Host).
+       Three-repeat stability confirmed. Release-mode focused tests pass.
+       See bench/baselines/cuda-cross-layer-residency-2026-07-10.md.
+       lm-head-on-device, launch batching, and MoE/router polish
        remain later slices. -->
-- B2. **Cross-layer residency** (1-2 sessions). Keep `h` resident across
-  blocks and layers within a decode step / prefill pass; read back once per
-  token (logits input) instead of once per block. The residual-add kernel
-  already exists; this is plumbing, not kernels. **SCAFFOLD-VALIDATED
-  (2026-07-09), PENDING HARDWARE VALIDATION** — see the GPU-007 comment above.
-- B2. **Cross-layer residency** (1-2 sessions). Keep `h` resident across
-  blocks and layers within a decode step / prefill pass; read back once per
-  token (logits input) instead of once per block. The residual-add kernel
-  already exists; this is plumbing, not kernels. **SCAFFOLD-VALIDATED,
-  PENDING HARDWARE VALIDATION.**
+- B2. **Cross-layer residency** ✅ **HARDWARE-VALIDATED (2026-07-10)**.
+  Keep `h` resident across blocks and layers within a decode step / prefill
+  pass; read back once per token (logits input) instead of once per block.
+  The residual-add kernel already exists; this is plumbing, not kernels.
+  Validated on RTX 3090 (sm_86, NVRTC 12.4): 161/161 tests green with default
+  settings, all 7 resident_hidden tests pass natively, three-repeat stability
+  confirmed, release-mode focused tests pass. See
+  bench/baselines/cuda-cross-layer-residency-2026-07-10.md.
 - B3. **Launch batching / graphization** (1-2 sessions, optional until A4 says
   launch overhead matters). Collapse per-op `launch → stream` calls into
   fewer submissions (CUDA Graphs via cudarc if exposed, else simple
