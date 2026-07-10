@@ -1986,6 +1986,33 @@ impl CudaRuntime {
         let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
             RuntimeError::context("allocating CUDA q4k_matvec_dev output buffer", err)
         })?;
+        self.launch_q4k_matvec_into(&w_dev, x_dev, &mut out_dev, num_rows, hidden)?;
+        Ok(out_dev)
+    }
+
+    /// Q4_K × f32 matvec into a pre-allocated stable output buffer (B3A-4).
+    ///
+    /// The graph-capture twin of [`launch_q4k_matvec_dev`]: takes an
+    /// already-resolved `w_dev` (from the weight cache — resolved before capture
+    /// so its device address is stable) and writes into `out_dev` (a stable
+    /// graph-owned buffer) instead of allocating a fresh `CudaSlice`. Shares the
+    /// kernel-arg layout + `LaunchConfig` with `_dev` so the two cannot drift;
+    /// the `_dev` launcher delegates here after its `alloc_zeros`.
+    #[allow(dead_code)]
+    pub(crate) fn launch_q4k_matvec_into(
+        &self,
+        w_dev: &std::sync::Arc<CudaSlice<u8>>,
+        x_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<(), RuntimeError> {
+        if num_rows == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(x_dev.len(), hidden);
+        debug_assert!(hidden.is_multiple_of(256));
+        debug_assert_eq!(out_dev.len(), num_rows);
         let threads_x = Q4K_MATVEC_KERNEL.geometry.threads_per_group[0];
         let n = num_rows as u32;
         let k = hidden as u32;
@@ -1996,15 +2023,29 @@ impl CudaRuntime {
         };
         let mut launch_args = self.stream.launch_builder(&self.q4k_matvec);
         launch_args
-            .arg(&*w_dev)
+            .arg(&**w_dev)
             .arg(x_dev)
-            .arg(&mut out_dev)
+            .arg(out_dev)
             .arg(&n)
             .arg(&k);
         unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA q4k_matvec_dev kernel", err))?;
+            .map_err(|err| RuntimeError::context("launching CUDA q4k_matvec_into kernel", err))?;
         self.note_launch();
-        Ok(out_dev)
+        Ok(())
+    }
+
+    /// Resolve a Q4_K weight matrix through the persistent weight cache,
+    /// returning the device-resident handle. Exposed so the graph-build path
+    /// (B3A-5) can warm the cache + hold the `Arc` before stream capture begins
+    /// (the captured kernel node binds the then-stable device address).
+    #[allow(dead_code)]
+    pub(crate) fn resolve_q4k_weight(
+        &self,
+        q4k_data: &[u8],
+    ) -> Result<std::sync::Arc<CudaSlice<u8>>, RuntimeError> {
+        self.weight_cache
+            .get_or_upload_bytes(&self.stream, q4k_data)
+            .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))
     }
 
     /// Q6_K × f32 matvec, device-resident twin of [`launch_q4k_matvec_dev`].
@@ -2049,6 +2090,28 @@ impl CudaRuntime {
         let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
             RuntimeError::context("allocating CUDA q6k_matvec_dev output buffer", err)
         })?;
+        self.launch_q6k_matvec_into(&w_dev, x_dev, &mut out_dev, num_rows, hidden)?;
+        Ok(out_dev)
+    }
+
+    /// Q6_K × f32 matvec into a pre-allocated stable output buffer (B3A-4).
+    /// Graph-capture twin of [`launch_q6k_matvec_dev`]; see
+    /// [`launch_q4k_matvec_into`] for the contract.
+    #[allow(dead_code)]
+    pub(crate) fn launch_q6k_matvec_into(
+        &self,
+        w_dev: &std::sync::Arc<CudaSlice<u8>>,
+        x_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<(), RuntimeError> {
+        if num_rows == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(x_dev.len(), hidden);
+        debug_assert!(hidden.is_multiple_of(256));
+        debug_assert_eq!(out_dev.len(), num_rows);
         let threads_x = Q6K_MATVEC_KERNEL.geometry.threads_per_group[0];
         let n = num_rows as u32;
         let k = hidden as u32;
@@ -2059,15 +2122,26 @@ impl CudaRuntime {
         };
         let mut launch_args = self.stream.launch_builder(&self.q6k_matvec);
         launch_args
-            .arg(&*w_dev)
+            .arg(&**w_dev)
             .arg(x_dev)
-            .arg(&mut out_dev)
+            .arg(out_dev)
             .arg(&n)
             .arg(&k);
         unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA q6k_matvec_dev kernel", err))?;
+            .map_err(|err| RuntimeError::context("launching CUDA q6k_matvec_into kernel", err))?;
         self.note_launch();
-        Ok(out_dev)
+        Ok(())
+    }
+
+    /// Resolve a Q6_K weight matrix through the persistent weight cache (B3A-5).
+    #[allow(dead_code)]
+    pub(crate) fn resolve_q6k_weight(
+        &self,
+        q6k_data: &[u8],
+    ) -> Result<std::sync::Arc<CudaSlice<u8>>, RuntimeError> {
+        self.weight_cache
+            .get_or_upload_bytes(&self.stream, q6k_data)
+            .map_err(|err| RuntimeError::context("uploading Q6_K weights to CUDA", err))
     }
 
     /// Device-resident GEGLU-SiLu: `out[i] = silu(gate[i]) * up[i]`. `gate_dev`
@@ -2157,7 +2231,112 @@ impl CudaRuntime {
         )
     }
 
-    /// Shared device-resident binary elementwise dispatch. `in_a` / `in_b` are
+    // ── B3A-4: into-buffer graph-capture twins of the elementwise launchers ──
+    //
+    // Each writes into a pre-allocated `&mut CudaSlice<f32>` (a stable
+    // graph-owned buffer) instead of allocating a fresh output. The graph
+    // build path (B3A-5) calls these during stream capture so the captured
+    // kernel nodes bind stable buffer addresses. They delegate to the shared
+    // `launch_elementwise_*_into` cores, so the arg layout + LaunchConfig
+    // cannot drift from the `_dev` twins.
+
+    /// GEGLU-SiLu into a stable buffer: `out[i] = silu(gate[i]) * up[i]`.
+    #[allow(dead_code)]
+    pub(crate) fn launch_geglu_silu_into(
+        &self,
+        gate_dev: &CudaSlice<f32>,
+        up_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary_into(
+            &self.geglu_silu,
+            gate_dev,
+            up_dev,
+            out_dev,
+            None,
+            n,
+            "geglu_silu",
+        )
+    }
+
+    /// GEGLU-GELU-tanh into a stable buffer.
+    #[allow(dead_code)]
+    pub(crate) fn launch_geglu_gelu_tanh_into(
+        &self,
+        gate_dev: &CudaSlice<f32>,
+        up_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary_into(
+            &self.geglu_gelu_tanh,
+            gate_dev,
+            up_dev,
+            out_dev,
+            None,
+            n,
+            "geglu_gelu_tanh",
+        )
+    }
+
+    /// Standard SiLU into a stable buffer: `out[i] = silu(x[i])`.
+    #[allow(dead_code)]
+    pub(crate) fn launch_activation_silu_into(
+        &self,
+        input_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_unary_into(
+            &self.activation_silu,
+            input_dev,
+            out_dev,
+            n,
+            "activation_silu",
+        )
+    }
+
+    /// Standard GELU-tanh into a stable buffer.
+    #[allow(dead_code)]
+    pub(crate) fn launch_activation_gelu_tanh_into(
+        &self,
+        input_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_unary_into(
+            &self.activation_gelu_tanh,
+            input_dev,
+            out_dev,
+            n,
+            "activation_gelu_tanh",
+        )
+    }
+
+    /// Residual add into a stable buffer: `out[i] = h_dev[i] + b_scale * x_dev[i]`.
+    /// Used by both the FFN graph (final residual into the arena's stable slot)
+    /// and — when the arena is active — the resident-attention block's final
+    /// residual into the stable post-attn buffer (B3A-3 ping-pong write-point).
+    #[allow(dead_code)]
+    pub(crate) fn launch_residual_add_into(
+        &self,
+        h_dev: &CudaSlice<f32>,
+        x_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+        b_scale: f32,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary_into(
+            &self.residual_add,
+            h_dev,
+            x_dev,
+            out_dev,
+            Some(b_scale),
+            n,
+            "residual_add",
+        )
+    }
     /// already on the device; the output is allocated and returned as a device
     /// buffer. No upload, no sync, no readback — the caller drives the chain
     /// and reads back once via [`sync_dtoh_f32`]. Mirrors the arg layout of
@@ -2192,24 +2371,51 @@ impl CudaRuntime {
             .stream
             .alloc_zeros::<f32>(n)
             .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
+        self.launch_elementwise_binary_into(func, in_a, in_b, &mut out_dev, extra_scalar, n, ctx)?;
+        Ok(out_dev)
+    }
+
+    /// Binary elementwise into a pre-allocated stable output buffer (B3A-4).
+    ///
+    /// The graph-capture core: writes into `out_dev` (a stable graph-owned
+    /// buffer) instead of allocating. Shares the kernel-arg layout +
+    /// `LaunchConfig` with the `_dev` twin so the two cannot drift; the `_dev`
+    /// launcher delegates here after its `alloc_zeros`.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn launch_elementwise_binary_into(
+        &self,
+        func: &CudaFunction,
+        in_a: &CudaSlice<f32>,
+        in_b: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        extra_scalar: Option<f32>,
+        n: usize,
+        ctx: &'static str,
+    ) -> Result<(), RuntimeError> {
+        if n == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(in_a.len(), n);
+        debug_assert_eq!(in_b.len(), n);
+        debug_assert_eq!(out_dev.len(), n);
         let threads_x = GEGGLU_SILU_KERNEL.geometry.threads_per_group[0];
         let n_u = n as u32;
-        let extra = extra_scalar;
         let cfg = LaunchConfig {
             grid_dim: (n_u.div_ceil(threads_x), 1, 1),
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut launch_args = self.stream.launch_builder(func);
-        launch_args.arg(in_a).arg(in_b).arg(&mut out_dev);
-        if let Some(ref scalar) = extra {
+        launch_args.arg(in_a).arg(in_b).arg(out_dev);
+        if let Some(ref scalar) = extra_scalar {
             launch_args.arg(scalar);
         }
         launch_args.arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
         self.note_launch();
-        Ok(out_dev)
+        Ok(())
     }
 
     /// Shared device-resident unary elementwise dispatch. Mirrors the arg layout
@@ -2242,6 +2448,26 @@ impl CudaRuntime {
             .stream
             .alloc_zeros::<f32>(n)
             .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
+        self.launch_elementwise_unary_into(func, input, &mut out_dev, n, ctx)?;
+        Ok(out_dev)
+    }
+
+    /// Unary elementwise into a pre-allocated stable output buffer (B3A-4).
+    /// Graph-capture core; see [`launch_elementwise_binary_into`].
+    #[allow(dead_code)]
+    fn launch_elementwise_unary_into(
+        &self,
+        func: &CudaFunction,
+        input: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+        ctx: &'static str,
+    ) -> Result<(), RuntimeError> {
+        if n == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(input.len(), n);
+        debug_assert_eq!(out_dev.len(), n);
         let threads_x = ACTIVATION_SILU_KERNEL.geometry.threads_per_group[0];
         let n_u = n as u32;
         let cfg = LaunchConfig {
@@ -2250,11 +2476,11 @@ impl CudaRuntime {
             shared_mem_bytes: 0,
         };
         let mut launch_args = self.stream.launch_builder(func);
-        launch_args.arg(input).arg(&mut out_dev).arg(&n_u);
+        launch_args.arg(input).arg(out_dev).arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
         self.note_launch();
-        Ok(out_dev)
+        Ok(())
     }
 
     // ── device-resident norm / RoPE / attention launch variants ──────────
@@ -2348,6 +2574,79 @@ impl CudaRuntime {
             .map_err(|err| RuntimeError::context("launching CUDA rms_norm_dev kernel", err))?;
         self.note_launch();
         Ok(out_dev)
+    }
+
+    /// Upload an RMSNorm weight vector once, returning a stable device handle
+    /// (B3A-4/B3A-5). The `_dev` launcher re-uploads the weight per call via
+    /// `clone_htod`; the graph path must hold a stable-address weight buffer for
+    /// the captured graph's lifetime, so the graph-build path uploads once and
+    /// passes the handle to [`launch_rms_norm_into`].
+    ///
+    /// `Some(w)` uploads the `[cols]` weight; `None` uploads the one-element
+    /// placeholder used by the parameter-free path (the kernel's `has_weight=0`
+    /// flag makes it ignore the pointer, but cudarc requires a non-empty slice).
+    #[allow(dead_code)]
+    pub(crate) fn upload_rms_norm_weight(
+        &self,
+        weight: Option<&[f32]>,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let placeholder = [0.0f32];
+        let slice: &[f32] = match weight {
+            Some(w) => w,
+            None => &placeholder[..],
+        };
+        self.stream
+            .clone_htod(slice)
+            .map_err(|err| RuntimeError::context("uploading rms_norm weight to CUDA", err))
+    }
+
+    /// RMSNorm into a pre-allocated stable output buffer with a device-resident
+    /// weight (B3A-4). Graph-capture twin of [`launch_rms_norm_dev`]: `weight_dev`
+    /// is a pre-uploaded stable weight buffer (from [`upload_rms_norm_weight`]),
+    /// and the output writes into `out_dev` (a stable graph-owned buffer) instead
+    /// of allocating. `has_weight` is `1` when a real weight was uploaded, `0`
+    /// for the parameter-free placeholder path. Shares the kernel-arg layout +
+    /// `LaunchConfig` with `_dev`.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub(crate) fn launch_rms_norm_into(
+        &self,
+        x_dev: &CudaSlice<f32>,
+        weight_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        eps: f64,
+        offset: f32,
+        has_weight: i32,
+    ) -> Result<(), RuntimeError> {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(x_dev.len(), rows * cols);
+        debug_assert_eq!(out_dev.len(), rows * cols);
+        let block_dim = 1024u32;
+        let rows_u = rows as u32;
+        let cols_u = cols as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows_u, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.rms_norm);
+        launch_args
+            .arg(x_dev)
+            .arg(weight_dev)
+            .arg(out_dev)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&eps)
+            .arg(&offset)
+            .arg(&has_weight);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA rms_norm_into kernel", err))?;
+        self.note_launch();
+        Ok(())
     }
 
     /// Device-resident per-head RMSNorm twin of [`launch_rms_norm_dev`].
