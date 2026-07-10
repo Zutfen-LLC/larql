@@ -725,3 +725,102 @@ Baseline report: `bench/baselines/cuda-cross-layer-residency-2026-07-10.md`.
 
 Remaining Phase 4 surface: B3 (launch batching / graphization), PLE/remote-FFN
 trait-surface work, `KvDispatch` bridge, then Vulkan Phase 5, then hardware CI.
+
+---
+
+## Session 28 (2026-07-10): LARQL-GPU-B3A — CUDA Graph replay for the resident decode FFN (IN PROGRESS)
+
+**B3A is mid-implementation on `feat/cuda-resident-ffn-graph` (base `6ed40296`).**
+The infrastructure (smoke test, plan contract, into-buffer launchers, arena,
+graph state, cache, counters) is committed and tested; the pipeline integration
+(B3A-5: build + replay in the decode loop) is the remaining piece.
+
+### Completed (7 commits, all RTX 3060-validated where GPU-dependent)
+
+- **B3A-SMOKE** (`1f7a5d1e`): minimal native CUDA Graph smoke test —
+  capture/instantiate/replay/teardown on a dedicated stream with the real
+  `residual_add` kernel. **PASS on RTX 3060.** Surfaced two critical findings:
+  (1) the NULL default stream cannot be captured (`STREAM_CAPTURE_UNSUPPORTED`)
+  — graph capture requires a dedicated non-NULL stream via `new_stream()`;
+  (2) cudarc's per-slice CudaEvent tracking injects `cuStreamWaitEvent` during
+  capture → `STREAM_CAPTURE_ISOLATION` — event tracking must be disabled for
+  graph buffers. The test validates stable-pointer replay (in-place
+  `memcpy_htod` mutating buffer contents changes the replay output — the core
+  ping-pong invariant) + a 3-cycle create→replay→reset→rebuild→drop lifecycle.
+
+- **B3A-0**: post-D6 baseline recorded on the fresh binary (Q4_K_M,
+  `LARQL_CUDA_GRAPHS=0`, instrumented): `launches=599.2/tok, htod=3.3/tok,
+  dtoh=78.1/tok, syncs=78.1/tok, hidden_readback=2.31ms/tok, p50=130.3ms/tok,
+  7.64 tok/s`. Confirms resident-KV + resident-hidden 100% active on the
+  default Q4_K_M. FFN chain = 7 kernels/layer × 36 = 252 host submissions/token
+  (the graph-replay target → 36 graph submissions = ~34% structural reduction).
+
+- **B3A-1**: cudarc 0.19.8 graph API audited — full lifecycle (begin_capture →
+  end_capture → CudaGraph::launch → Drop) available via the safe API. No
+  upgrade, no RAII wrapper, no sys binding needed.
+
+- **B3A-2** (`b33a7505`): `ffn_graph.rs` — the pure plan contract +
+  generation identity. `GraphGenerationId`, `ResidentFfnPlan` +
+  `ResidentFfnPlanKey`, `plan_graph_eligible`, `GraphMode` +
+  `graph_mode_from_env`. Cache key = `(generation, layer_index, plan)` — NOT
+  host pointer/len (review point 6). 26 host-runnable tests PASS.
+
+- **B3A-4** (`0e5c2777`): into-buffer launch primitives — `*_into` variants of
+  the 7 FFN kernels (q4k/q6k matvec, geglu/activation, residual_add, rms_norm)
+  that write into pre-allocated `&mut CudaSlice<f32>`. The `*_dev` launchers
+  delegate to `*_into` (parity-preserving — 200 tests PASS). Norm weights get
+  `upload_rms_norm_weight` (stable device address for capture).
+
+- **B3A-3/6** (`9e35345e`): `ffn_graph_state.rs` — `ResidentDecodeArena`
+  (ping-pong hidden_a/hidden_b + dedicated capture stream, event-tracking
+  disabled), `ResidentFfnGraph` (graph + scratch + retained weights with
+  explicit Drop ordering: exec graph → scratch → weights), and the explicit
+  `Send+Sync` asserts (CudaGraph isn't internally synchronized, but LARQL's
+  single-threaded decode + Mutex access provides the external serialization).
+
+- **B3A-7** (`69641643` + `88995dd8`): per-backend `graph_mode` field +
+  `GraphProfileCounters` (7 capture-aware counters: graph_submissions,
+  graph_builds, captured_kernel_nodes, logical_graph_kernel_executions,
+  graph_failures, graph_fallbacks, d2d_submissions) + the generation-scoped
+  graph cache + arena wired onto CudaBackend. `reset_kv_cache_native` extended
+  with the B3A-6 teardown order (graphs destroyed → arena dropped → weight
+  cache flushed → generation advanced). 200 tests PASS.
+
+### Remaining work
+
+- **B3A-5** (the critical piece): integrate the graph build + replay into the
+  decode loop. The method `host_ffn_block_device_resident_graph` slots in at
+  pipeline.rs:430 (where `host_ffn_block_device_resident` is called). It must:
+  (1) build the graph on token 1 (capture the 7 `*_into` launches into stable
+  scratch + the arena output buffer on the cap_stream); (2) launch token 1
+  (review point 1); (3) replay on subsequent tokens; (4) handle the
+  **cross-stream sync** (attention runs on the NULL stream, the graph replays
+  on cap_stream — a D2D copy seeds the arena input, a stream-wait before
+  replay, a stream-wait after, a D2D copy reads the output); (5) fall back to
+  the existing resident device FFN chain on any failure (never CPU, never
+  double-appending KV). An incomplete scaffold was written and reverted — the
+  cross-stream sync mechanics + the actual `capture_ffn_chain` kernel launches
+  are the open work.
+
+- **B3A-8**: correctness + lifecycle tests (single-token parity < 1e-3,
+  multi-token no-drift, build/replay count assertions, reset/rebuild,
+  forced-failure fallback, unsupported-layer, repeated create→replay→reset
+  stress). Depends on B3A-5.
+
+- **B3A-9/10/11**: full RTX 3060 regression (graphs=0 and =1 suites),
+  same-day main-vs-feature benchmark, performance decision gate (≥25%
+  submission reduction, ≥1% median improvement, build amortization within
+  ~64 tokens). Depend on B3A-5.
+
+### Key design constraints (from B3A review + smoke-test findings)
+
+- **Dedicated capture stream** (NULL stream can't be captured); event tracking
+  disabled for graph buffers.
+- **Zero-D2D on the happy path** is the goal (ping-pong arena: attention
+  writes B, FFN graph reads B / writes A), but the current scaffold uses D2D
+  copies at the layer boundary (seed input + read output) — these are counted
+  in `d2d_submissions` and honest against the ≥25% gate. The true zero-D2D
+  design (attention's residual-add writes directly into the arena via
+  `launch_residual_add_into`) is a refinement once the basic replay works.
+- **Default graph mode = Disabled** until B3A-11's performance gate passes;
+  opt-in via `LARQL_CUDA_GRAPHS=1`.
