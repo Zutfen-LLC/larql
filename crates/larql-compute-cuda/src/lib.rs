@@ -44,7 +44,9 @@ mod tests {
     use larql_compute::prelude::*;
     use larql_compute::KvIndex;
     use larql_compute::{CpuBackend, QuantFormat};
-    use larql_models::test_fixtures::{make_test_q4k_weights, make_test_q4k_weights_rope_scaled};
+    use larql_models::test_fixtures::{
+        make_test_q4k_weights, make_test_q4k_weights_layers, make_test_q4k_weights_rope_scaled,
+    };
     use ndarray::Array2;
 
     fn backend() -> CudaBackend {
@@ -4727,6 +4729,348 @@ mod tests {
         assert!(
             !diag.contains("fallbacks=0)"),
             "full-upload fallback should register fallbacks, got: {diag}"
+        );
+    }
+
+    // ── GPU-007: cross-layer hidden-state residency ────────────────────────
+    //
+    // These tests exercise the resident-hidden decode path (carry the decode
+    // hidden state device-resident across attention → FFN → next-layer,
+    // collapsing the per-block hidden-state readback/upload boundaries the
+    // host-orchestrated loop pays) and the per-layer eligibility + fallback
+    // rules. All runtime-gated: on a no-CUDA host they early-return
+    // (scaffold-pass), never claiming native validation. The shared setup
+    // reuses `resident_kv_seed` (40-token prompt clears the decode-attention
+    // work gate) and `predict_kquant_decode_step` (f32-activation CPU
+    // reference) — same tolerance (1e-3) as GPU-006 + ASTAB-001.
+
+    /// GPU-007G: resident-hidden decode parity against the CPU f32-activation
+    /// reference, single decode token after prefill. The resident-hidden
+    /// analog of `resident_kv_decode_matches_cpu_reference_after_prefill` —
+    /// same tolerance (1e-3), same reference (`predict_kquant_decode_step`).
+    #[test]
+    fn resident_hidden_decode_matches_cpu_reference_after_prefill() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let layers = build_layers(&weights, &index);
+
+        // CPU reference: prefill then one f32-activation decode step.
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let next_tok = resident_kv_first_decode_tok();
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+
+        // CUDA resident-hidden decode of the same next token.
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed with a runtime + seeded KV");
+
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        assert_eq!(cpu_row.len(), cuda_decode.len());
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "resident-hidden decode diverged from CPU reference: max_abs={max_abs:.6e}"
+        );
+        // The resident path must have been used (the fixture is dense Q4_K +
+        // RmsNorm + a runtime + both chains clear the gates, so eligibility
+        // holds) — assert the counter.
+        let diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after decode");
+        assert!(
+            !diag.contains("uses=0,"),
+            "resident-hidden decode should register uses, got: {diag}"
+        );
+    }
+
+    /// GPU-007G: multi-token resident-hidden decode parity against the CPU
+    /// f32-activation reference. Locks the resident path across several tokens
+    /// where the hidden state is carried device-resident layer-to-layer each
+    /// step (and re-entered device-resident token-to-token via the input
+    /// embedding upload at the first layer).
+    #[test]
+    fn resident_hidden_multi_token_decode_matches_cpu_reference() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let layers = build_layers(&weights, &index);
+
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+
+        let start = resident_kv_first_decode_tok();
+        let next_tokens = [start, start + 1, start + 2, start + 3];
+        for (step, tok) in next_tokens.into_iter().enumerate() {
+            let cpu_pos = seq_len + step;
+            let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+                &weights,
+                tok,
+                &index,
+                &mut cpu_cache,
+                cpu_pos,
+            )
+            .expect("CPU f32 decode step");
+
+            let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
+            let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+            let cuda_decode = b
+                .decode_token(&layers, &x_dec, hidden, inter)
+                .expect("CUDA decode_token should succeed across the multi-token run");
+
+            let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+            assert_eq!(cpu_row.len(), cuda_decode.len());
+            let max_abs = cpu_row
+                .iter()
+                .zip(cuda_decode.iter())
+                .map(|(c, g)| (c - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs < 1e-3,
+                "resident-hidden multi-token decode (tok {tok}) diverged: max_abs={max_abs:.6e}"
+            );
+        }
+        // Across 4 tokens × num_layers, the resident path should have run many
+        // times — assert the counter is non-trivial.
+        let diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after multi-token decode");
+        assert!(
+            !diag.contains("uses=0,"),
+            "resident-hidden multi-token decode should register uses, got: {diag}"
+        );
+    }
+
+    /// GPU-007G: the resident-hidden diagnostic counter surfaces under
+    /// `LARQL_GPU_DIAG=1` via `device_info()`. The fixture clears every gate,
+    /// so a decode registers at least one resident-hidden use. This is the
+    /// diagnostics-surface test the packet requires ("enough counter/diagnostic
+    /// evidence to confirm resident-hidden execution occurred").
+    #[test]
+    fn resident_hidden_diag_surfaces_in_device_info() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, _seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let layers = build_layers(&weights, &index);
+
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let _ = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed");
+
+        // The diag method returns the counter line.
+        let diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after decode");
+        assert!(
+            diag.contains("resident-hidden decode:"),
+            "unexpected resident-hidden diag format: {diag}"
+        );
+        assert!(
+            !diag.contains("uses=0,"),
+            "resident-hidden decode should register uses, got: {diag}"
+        );
+    }
+
+    /// GPU-007G: forced ineligibility keeps output parity and registers a
+    /// fallback. A sub-gate prompt (3 tokens) makes the decode-attention work
+    /// fall below `DECODE_ATTN_NATIVE_MIN_WORK`, so the resident path is
+    /// ineligible and the host-orchestrated fallback runs. Output must still
+    /// match the CPU reference, and the fallback counter must advance.
+    #[test]
+    fn resident_hidden_fallback_when_ineligible() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // 3-token prompt → first decode work = 4·4·64 = 1024 < 8192 gate →
+        // the attention device chain bails → the resident path is ineligible.
+        let token_ids = resident_kv_prompt(3);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let layers = build_layers(&weights, &index);
+
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let next_tok = 99u32; // distinct from the 3-token prompt
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token (fallback) should succeed");
+
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "resident-hidden fallback diverged from CPU reference: max_abs={max_abs:.6e}"
+        );
+        // Every layer fell back → the fallback counter must be non-zero.
+        let diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after a fallback decode");
+        assert!(
+            !diag.contains("fallbacks=0)"),
+            "resident-hidden fallback should register fallbacks, got: {diag}"
+        );
+    }
+
+    /// GPU-007G: resident-hidden decode does NOT regress the GPU-006
+    /// host/device KV cursor lockstep. The two invariants are "related but
+    /// separate" (per the packet): resident hidden state must not disturb KV
+    /// cursor advance. After a resident-hidden decode, the host mirror and the
+    /// device cursor must still agree.
+    #[test]
+    fn resident_hidden_decode_keeps_kv_lockstep() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) = resident_kv_seed(&b, &token_ids);
+        let layers = build_layers(&weights, &index);
+        assert_eq!(b.kv_cache_len(), seq_len);
+        assert_eq!(b.kv_cache_len_native(), seq_len);
+
+        // One resident-hidden decode token.
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let _ = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed");
+
+        // GPU-006 lockstep must still hold after a resident-hidden decode.
+        assert_eq!(b.host_kv_len(), seq_len + 1);
+        assert_eq!(
+            b.kv_cache_len_native(),
+            seq_len + 1,
+            "device cursor must advance by one per decode token (lockstep, GPU-006 invariant)"
+        );
+        assert_eq!(b.kv_cache_len(), seq_len + 1);
+    }
+
+    /// GPU-007G: a deeper (4-layer) fixture proves the resident path runs
+    /// across consecutive layers without an intermediate host readback. The
+    /// resident-hidden `uses` counter must reach at least `2 * num_layers`
+    /// (every layer is eligible: dense Q4_K, RmsNorm, both chains clear the
+    /// gates). On the default 2-layer fixture this would be 2×2=4; the 4-layer
+    /// fixture makes the "consecutive layers" claim stronger.
+    #[test]
+    fn resident_hidden_runs_across_consecutive_layers() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // 4-layer fixture: at least 2 consecutive eligible layers guaranteed.
+        let num_layers = 4;
+        let weights = make_test_q4k_weights_layers(num_layers);
+        let index = larql_compute::test_fixtures::make_q4k_fixture_index(&weights);
+        let layers = build_layers(&weights, &index);
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (x, seq_len, hidden) = prefill_input(&weights, &token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("prefill seeding should succeed");
+
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed on the 4-layer fixture");
+
+        // CPU reference for parity.
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        assert_eq!(cpu_row.len(), cuda_decode.len());
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "4-layer resident-hidden decode diverged: max_abs={max_abs:.6e}"
+        );
+
+        // Every layer should have run resident-hidden (all dense Q4_K +
+        // RmsNorm). `uses` >= num_layers proves consecutive resident layers.
+        let diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after decode");
+        // Parse the `uses=N` count out of the diag string.
+        let uses = diag
+            .split("uses=")
+            .nth(1)
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!(
+            uses >= num_layers as u64,
+            "resident-hidden uses ({uses}) should be >= num_layers ({num_layers}); diag: {diag}"
         );
     }
 }

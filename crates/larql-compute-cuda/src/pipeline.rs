@@ -58,6 +58,70 @@ use cudarc::driver::CudaSlice;
 /// Grown by `push_kv_row` during prefill/decode; reset by `clear`.
 type HostKv = Vec<(Array2<f32>, Array2<f32>)>;
 
+/// The decode hidden state for one token, in one of two residency states.
+/// GPU-007 (cross-layer hidden-state residency): threaded through the
+/// decode layer loop so eligible layers carry `h` device-resident across
+/// the attention→FFN→next-layer chain, collapsing the per-block hidden-state
+/// readback/upload boundaries the host-orchestrated loop pays.
+///
+/// Ownership + synchronization discipline (mirrors the existing
+/// device-resident chains): the `Device` variant holds a `CudaSlice` produced
+/// by a chain kernel (a fresh allocation — no aliasing); any prior host copy
+/// is **stale** and must not be read without a fresh [`Self::ensure_host`].
+/// The host path (state dump / fallback / final logits handoff) calls
+/// `ensure_host` to materialize the host copy exactly once.
+enum DecodeHiddenState {
+    /// Host-resident `[1, hidden]`. The reference/fallback/state-dump path —
+    /// also the entry state (the input embedding is host-side).
+    Host(Array2<f32>),
+    /// Device-resident `[hidden]` (flattened; decode is single-token). The
+    /// host copy is absent/stale; `ensure_host` materializes it via a single
+    /// `sync_dtoh_f32`.
+    Device { dev: CudaSlice<f32>, hidden: usize },
+}
+
+impl DecodeHiddenState {
+    /// The hidden dim (the column count of the `[1, hidden]` state).
+    fn hidden(&self) -> usize {
+        match self {
+            Self::Host(arr) => arr.shape()[1],
+            Self::Device { hidden, .. } => *hidden,
+        }
+    }
+
+    /// Materialize the host copy if currently device-resident, transitioning
+    /// to `Host`. One `sync_dtoh_f32` per transition (idempotent thereafter).
+    /// Returns `false` if the device readback fails (caller should bail to
+    /// `None` so the engine re-runs on CPU, mirroring every other native
+    /// dispatch's `Err → None` contract).
+    fn ensure_host(&mut self, runtime: &crate::backend::CudaRuntime) -> bool {
+        match self {
+            Self::Host(_) => true,
+            Self::Device { dev, hidden } => match runtime.sync_dtoh_f32(dev) {
+                Ok(v) if v.len() == *hidden => {
+                    *self = Self::Host(
+                        Array2::from_shape_vec((1, *hidden), v).expect("decode hidden state shape"),
+                    );
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// Borrow the host `[1, hidden]` array (the caller has already called
+    /// `ensure_host`). Panics if currently `Device` — the resident loop must
+    /// materialize the host copy before any host-only branch reads it.
+    fn as_host(&self) -> &Array2<f32> {
+        match self {
+            Self::Host(arr) => arr,
+            Self::Device { .. } => {
+                panic!("DecodeHiddenState::as_host called on a Device variant — ensure_host first")
+            }
+        }
+    }
+}
+
 impl CudaBackend {
     /// Borrow the host KV mirror (allocate-empty on first access).
     pub(crate) fn lock_host_kv(&self) -> std::sync::MutexGuard<'_, HostKv> {
@@ -192,6 +256,329 @@ impl CudaBackend {
         }
 
         h.row(0).to_vec().into()
+    }
+
+    /// Decode one token through all layers, threading the hidden state
+    /// device-resident across eligible layers (GPU-007: cross-layer
+    /// hidden-state residency). The resident-hidden twin of
+    /// [`host_decode_token`].
+    ///
+    /// For each eligible dense Q4_K/Q6_K decode layer, the post-attention
+    /// residual output of the attention chain and the post-FFN residual output
+    /// of the FFN chain stay device-resident, so the layer→next-layer handoff
+    /// doesn't pay a hidden-state readback+re-upload. The per-block
+    /// readback/upload the host-orchestrated loop pays between (a) the O
+    /// projection and the post-attn residual, (b) the down projection and the
+    /// post-FFN residual, and (c) the layer output and the next layer's
+    /// attention input — are collapsed into a single readback at the final
+    /// decode output.
+    ///
+    /// The host path stays the parity oracle + the state-dump path: a state
+    /// dump (`StateDumpMask != None`) forces the host-orchestrated
+    /// [`host_decode_token`] (explicit host sync at every dump point). When a
+    /// layer is ineligible (MoE, PLE, remote-FFN, LayerNorm, sub-gate work,
+    /// non-Q4_K/Q6_K, padded down, or any chained launch returns `Err`), the
+    /// resident loop converts the device hidden state back to host exactly
+    /// once (`ensure_host`) and continues through the existing
+    /// `host_attention_block` + `host_ffn_block` for the rest of that layer —
+    /// the next eligible layer can re-enter the resident path. Eligibility is
+    /// counted (`note_resident_hidden`) for the `LARQL_GPU_DIAG` surface.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn host_decode_token_resident(
+        &self,
+        layers: &[FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        abs_position: usize,
+    ) -> Option<Vec<f32>> {
+        // State dump forces the host path (explicit host sync at dump points).
+        // No runtime → defer to the host path (which itself returns `None` on
+        // the scaffold, so `decode_token` falls back to the CPU reference).
+        if !self.native_runtime_available() {
+            return self.host_decode_token(
+                layers,
+                x,
+                hidden,
+                inter,
+                abs_position,
+                None,
+                StateDumpMask::None,
+            );
+        }
+
+        let num_layers = layers.len();
+        if x.len() != hidden {
+            return None;
+        }
+        // Ensure the host KV mirror has one slot per layer.
+        {
+            let mut kv = self.lock_host_kv();
+            if kv.len() != num_layers {
+                kv.clear();
+                kv.resize_with(num_layers, || {
+                    (Array2::zeros((0, 0)), Array2::zeros((0, 0)))
+                });
+            }
+        }
+
+        let runtime = self.runtime()?;
+        let mut h = DecodeHiddenState::Host(Array2::from_shape_vec((1, hidden), x.to_vec()).ok()?);
+
+        for (li, layer) in layers.iter().enumerate() {
+            // PLE / remote-FFN bail (same rationale as `host_decode_token`):
+            // these paths are host-shaped and have no resident-hidden twin.
+            if layer.ple_input_gate.is_some() || layer.ffn_is_remote {
+                return None;
+            }
+
+            // Resident path: device-resident hidden state through attention →
+            // (K/V host mirror append) → FFN, producing a device-resident
+            // post-layer hidden state. MoE layers stay host-shaped (the dense
+            // slab + outer combine is host-orchestrated), so resident hidden
+            // state is dense-only for this slice.
+            let resident_ok = layer.moe.is_none()
+                && h.hidden() == hidden
+                && self.resident_hidden_layer_eligible(layer, hidden, inter, li);
+
+            if resident_ok {
+                if let Some((h_post_attn_dev, k_new_row, v_new_row)) =
+                    self.host_attention_block_device_resident(runtime, layer, &h, li, abs_position)
+                {
+                    // Append the new K/V row to the host mirror (the parity
+                    // oracle + truncate/state-dump source — GPU-006 invariant:
+                    // the host mirror append happens between attention and FFN,
+                    // exactly as in `host_decode_token`).
+                    {
+                        let mut kv = self.lock_host_kv();
+                        if let Some((k_cache, v_cache)) = kv.get_mut(li) {
+                            let kv_dim = layer.num_kv_heads * layer.head_dim;
+                            let prev = k_cache.shape()[0];
+                            let mut k_new = Array2::zeros((prev + 1, kv_dim));
+                            let mut v_new = Array2::zeros((prev + 1, kv_dim));
+                            if prev > 0 {
+                                k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
+                                v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                            }
+                            k_new.slice_mut(ndarray::s![prev..prev + 1, ..]).assign(
+                                &Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec())
+                                    .expect("k_new_row shape"),
+                            );
+                            v_new.slice_mut(ndarray::s![prev..prev + 1, ..]).assign(
+                                &Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec())
+                                    .expect("v_new_row shape"),
+                            );
+                            *k_cache = k_new;
+                            *v_cache = v_new;
+                        }
+                    }
+
+                    // FFN chain consumes the device-resident post-attn state.
+                    if let Some(h_post_ffn_dev) = self.host_ffn_block_device_resident(
+                        runtime,
+                        layer,
+                        &h_post_attn_dev,
+                        hidden,
+                        inter,
+                    ) {
+                        // Per-layer scalar (Gemma 4). Skip 0.0 (absent) and
+                        // 1.0 (identity). When present and non-identity
+                        // (rare), apply on host: read back the device post-FFN
+                        // state once, scale, and carry host-side. The next
+                        // eligible layer re-uploads via its input norm (one
+                        // extra boundary in the rare scalar case — the common
+                        // `scalar == 1.0` path stays fully device-resident).
+                        let scalar = layer.layer_scalar;
+                        if scalar != 0.0 && scalar != 1.0 {
+                            let mut hh = DecodeHiddenState::Device {
+                                dev: h_post_ffn_dev,
+                                hidden,
+                            };
+                            if !hh.ensure_host(runtime) {
+                                self.note_resident_hidden(false);
+                                return None;
+                            }
+                            let mut scaled = hh.as_host().clone();
+                            scaled.mapv_inplace(|v| v * scalar);
+                            self.note_resident_hidden(true);
+                            h = DecodeHiddenState::Host(scaled);
+                            continue;
+                        }
+                        self.note_resident_hidden(true);
+                        h = DecodeHiddenState::Device {
+                            dev: h_post_ffn_dev,
+                            hidden,
+                        };
+                        continue;
+                    }
+                    // FFN resident path bailed AFTER the resident attention
+                    // already appended K/V to the host mirror. Re-running the
+                    // full host attention (the generic fallback below) would
+                    // double-append K/V, so instead run ONLY the host FFN
+                    // block on the device post-attn output (read back once).
+                    // The host FFN path is the parity oracle + handles MoE /
+                    // padded-down / sub-gate activation.
+                    let mut h_post_attn_hs = DecodeHiddenState::Device {
+                        dev: h_post_attn_dev,
+                        hidden,
+                    };
+                    if !h_post_attn_hs.ensure_host(runtime) {
+                        self.note_resident_hidden(false);
+                        return None;
+                    }
+                    let h_post_attn = h_post_attn_hs.as_host().clone();
+                    let mut h_post_ffn = if layer.moe.is_some() {
+                        self.host_ffn_block_moe_decode(layer, &h_post_attn, hidden, inter)?
+                    } else {
+                        self.host_ffn_block(layer, &h_post_attn, hidden, inter)?
+                    };
+                    let scalar = layer.layer_scalar;
+                    if scalar != 0.0 && scalar != 1.0 {
+                        h_post_ffn.mapv_inplace(|v| v * scalar);
+                    }
+                    // The attention ran resident (counted as a use); only the
+                    // FFN fell back. Count the layer as a fallback so the diag
+                    // reflects the partial residency.
+                    self.note_resident_hidden(false);
+                    h = DecodeHiddenState::Host(h_post_ffn);
+                    continue;
+                }
+                // Resident attention bailed → fall through to the host path
+                // (which runs attention + FFN + appends K/V exactly once).
+            }
+
+            // Fallback: ensure host, run the existing host-orchestrated
+            // attention + FFN blocks for this layer. The device hidden state
+            // (if any) is read back exactly once here.
+            if !h.ensure_host(runtime) {
+                self.note_resident_hidden(false);
+                return None;
+            }
+            let h_host = h.as_host().clone();
+
+            let (h_post_attn, k_new_row, v_new_row) =
+                self.host_attention_block(layer, &h_host, li, abs_position)?;
+            // Append the new K/V row to the host mirror (same as above).
+            {
+                let mut kv = self.lock_host_kv();
+                if let Some((k_cache, v_cache)) = kv.get_mut(li) {
+                    let kv_dim = layer.num_kv_heads * layer.head_dim;
+                    let prev = k_cache.shape()[0];
+                    let mut k_new = Array2::zeros((prev + 1, kv_dim));
+                    let mut v_new = Array2::zeros((prev + 1, kv_dim));
+                    if prev > 0 {
+                        k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
+                        v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                    }
+                    k_new
+                        .slice_mut(ndarray::s![prev..prev + 1, ..])
+                        .assign(&Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec()).ok()?);
+                    v_new
+                        .slice_mut(ndarray::s![prev..prev + 1, ..])
+                        .assign(&Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec()).ok()?);
+                    *k_cache = k_new;
+                    *v_cache = v_new;
+                }
+            }
+
+            let mut h_post_ffn = if layer.moe.is_some() {
+                self.host_ffn_block_moe_decode(layer, &h_post_attn, hidden, inter)?
+            } else {
+                self.host_ffn_block(layer, &h_post_attn, hidden, inter)?
+            };
+            let scalar = layer.layer_scalar;
+            if scalar != 0.0 && scalar != 1.0 {
+                h_post_ffn.mapv_inplace(|v| v * scalar);
+            }
+            self.note_resident_hidden(false);
+            h = DecodeHiddenState::Host(h_post_ffn);
+        }
+
+        // Final decode output: ensure host, return the `[hidden]` vector.
+        if !h.ensure_host(runtime) {
+            return None;
+        }
+        Some(h.as_host().row(0).to_vec())
+    }
+
+    /// Eligibility gate for the resident-hidden decode path (GPU-007). Pure
+    /// (no device touch) so the eligibility logic is testable on every host.
+    /// Returns `true` when the layer can run its attention + FFN blocks with
+    /// the hidden state carried device-resident across both. The gates mirror
+    /// the per-block device-chain gates ([`host_attention_block_device`] and
+    /// [`host_ffn_block_device`]) plus the resident-specific gates:
+    /// RmsNorm-only (no LayerNorm device kernel) and `NormType` uniformity.
+    fn resident_hidden_layer_eligible(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        hidden: usize,
+        inter: usize,
+        li: usize,
+    ) -> bool {
+        let head_dim = layer.head_dim;
+        let num_q = layer.num_q_heads;
+        let num_kv = layer.num_kv_heads;
+        if num_kv == 0 || head_dim == 0 {
+            return false;
+        }
+        // Decode-attention work gate (same proxy as the attention device chain).
+        let prev = self
+            .lock_host_kv()
+            .get(li)
+            .map(|(k, _)| k.shape()[0])
+            .unwrap_or(0);
+        let total_len = prev + 1;
+        let attn_work = num_q.saturating_mul(total_len).saturating_mul(head_dim);
+        if !Self::native_decode_attention_worthwhile(attn_work) {
+            return false;
+        }
+        // Activation work gate (same proxy as the FFN device chain).
+        if !Self::native_activation_worthwhile(inter) {
+            return false;
+        }
+        // All seven projections must be a k-quant the device matvec/matmul
+        // handles (Q/K/V/O + gate/up/down).
+        let k_quant = |f: QuantFormat| matches!(f, QuantFormat::Q4_K | QuantFormat::Q6_K);
+        if !(k_quant(layer.wq.format)
+            && k_quant(layer.wk.format)
+            && k_quant(layer.wv.format)
+            && k_quant(layer.wo.format)
+            && k_quant(layer.gate.format)
+            && k_quant(layer.up.format)
+            && k_quant(layer.down.format))
+        {
+            return false;
+        }
+        // The gate/up + down formats must match (the device FFN chain requires
+        // a uniform k-quant triple — mirrors `host_ffn_block_device`).
+        if !matches!(
+            (layer.gate.format, layer.up.format, layer.down.format),
+            (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K)
+                | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
+        ) {
+            return false;
+        }
+        // Down stored width must equal inter (no device-side zero-pad step).
+        match down_stored_cols(layer, hidden, inter) {
+            Some(stored_cols) if stored_cols == inter => {}
+            _ => return false,
+        }
+        // Only RmsNorm has a device kernel (LayerNorm falls back to host).
+        // This gates both the input norm and the post-attn / post-ffn norms.
+        if layer.norm_type != NormType::RmsNorm {
+            return false;
+        }
+        // Only Gated/Standard SiLu + GeluTanh activations have device chains.
+        if !matches!(
+            (layer.ffn_type, layer.activation),
+            (larql_compute::FfnType::Gated, Activation::Silu)
+                | (larql_compute::FfnType::Gated, Activation::GeluTanh)
+                | (larql_compute::FfnType::Standard, Activation::Silu)
+                | (larql_compute::FfnType::Standard, Activation::GeluTanh)
+        ) {
+            return false;
+        }
+        true
     }
 
     /// Multi-position prefill with KV-cache population. Runs the prompt
@@ -1246,6 +1633,268 @@ impl CudaBackend {
         Some((h_post_attn, k_new_row, v_new_row))
     }
 
+    /// Device-resident decode attention block — the cross-layer residency twin
+    /// of [`host_attention_block_device`] (GPU-007C). Consumes a
+    /// device-resident input hidden state and produces a device-resident
+    /// post-attention residual, so the FFN block (and the next layer) can
+    /// consume it without an inter-block / inter-layer hidden-state readback.
+    ///
+    /// The chain mirrors [`host_attention_block_device`] up to the O projection
+    /// (input norm → Q/K/V → QK-norm/V-norm → RoPE → resident-KV attention →
+    /// O, all on the device), but:
+    /// - The input norm runs **on device** via [`CudaRuntime::launch_rms_norm_dev`]
+    ///   (the input is already resident; the norm weight is a small f32 slice
+    ///   uploaded per-call). This is parity-safe: the device `rms_norm` kernel
+    ///   is the same kernel the host-readback path uses, parity-tested. Gated
+    ///   to RmsNorm only (no LayerNorm device kernel).
+    /// - The O projection output stays resident (no `sync_dtoh_f32` readback).
+    /// - The post-attention norm + residual run **on device** via
+    ///   [`CudaRuntime::launch_rms_norm_dev`] + [`CudaRuntime::launch_residual_add_dev`]
+    ///   (the residual base is the resident input `h`).
+    ///
+    /// `h` must be a `Device` variant (the caller uploads the input once at
+    /// the first eligible layer). The K/V row readback remains (the host mirror
+    /// append + GPU-006 invariant — see `host_attention_block_device`). Returns
+    /// `None` (caller falls back to the host path) when `h` isn't
+    /// device-resident, the norm path bails, or any chained launch returns `Err`.
+    #[allow(clippy::too_many_arguments)]
+    fn host_attention_block_device_resident(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        layer: &FullPipelineLayer<'_>,
+        h: &DecodeHiddenState,
+        li: usize,
+        abs_position: usize,
+    ) -> Option<(CudaSlice<f32>, Vec<f32>, Vec<f32>)> {
+        // The resident path needs the device-resident input hidden state.
+        let hidden = h.hidden();
+        let h_dev = match h {
+            DecodeHiddenState::Device { dev, .. } => dev,
+            DecodeHiddenState::Host(_) => return None,
+        };
+        if h_dev.len() != hidden {
+            return None;
+        }
+        // RmsNorm-only (no LayerNorm device kernel) — the eligibility gate
+        // already enforces this, but keep the defensive check.
+        if layer.norm_type != NormType::RmsNorm {
+            return None;
+        }
+        let head_dim = layer.head_dim;
+        let num_q = layer.num_q_heads;
+        let num_kv = layer.num_kv_heads;
+        let reps = num_q.checked_div(num_kv)?;
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        let scale = layer.attn_scale as f64;
+        let softcap_opt: Option<f32> = None;
+
+        let prev = self
+            .lock_host_kv()
+            .get(li)
+            .map(|(k, _)| k.shape()[0])
+            .unwrap_or(0);
+        let total_len = prev + 1;
+        let work = num_q.saturating_mul(total_len).saturating_mul(head_dim);
+        if !Self::native_decode_attention_worthwhile(work) {
+            return None;
+        }
+        let qf = layer.wq.format;
+        let kf = layer.wk.format;
+        let vf = layer.wv.format;
+        let of = layer.wo.format;
+        let k_quant = |f: QuantFormat| matches!(f, QuantFormat::Q4_K | QuantFormat::Q6_K);
+        if !(k_quant(qf) && k_quant(kf) && k_quant(vf) && k_quant(of)) {
+            return None;
+        }
+
+        // Input norm on device (the input is already resident; the norm weight
+        // is uploaded per-call). The device `rms_norm` kernel is parity-tested
+        // against the host `rms_norm_eps` reference.
+        let h_norm_dev = runtime
+            .launch_rms_norm_dev(
+                h_dev,
+                Some(layer.input_norm),
+                1,
+                hidden,
+                layer.eps as f64,
+                layer.norm_offset,
+            )
+            .ok()?;
+
+        // RoPE inv_freq (shared substrate helper — single source of truth).
+        let frac = rope_fraction(layer);
+        let pos_div = layer.rope_position_divisor as f64;
+        let llama3 = layer.rope_llama3_scaling;
+        let (_rotary_dim, half_rotary, inv_freq) =
+            build_rope_inv_freq(layer.rope_base as f64, head_dim, frac, llama3);
+        let qk_eps = larql_compute::residual::DEFAULT_EPS;
+        let qk_off = layer.qk_norm_offset;
+
+        // Drive the device chain (mirrors `host_attention_block_device`). Any
+        // launch error maps to `None` (the host path is the fallback). All
+        // launches run on the same stream (stream-ordered); intermediates are
+        // distinct bindings kept alive until the block-end K/V readback.
+        let (o_dev, k_new_row, v_new_row): (CudaSlice<f32>, Vec<f32>, Vec<f32>) = {
+            // Q/K/V projections share the normed input resident.
+            let q_proj =
+                matvec_dev_by_fmt(runtime, qf, layer.wq.data, &h_norm_dev, q_dim, hidden).ok()?;
+            let k_proj =
+                matvec_dev_by_fmt(runtime, kf, layer.wk.data, &h_norm_dev, kv_dim, hidden).ok()?;
+            let v_proj =
+                matvec_dev_by_fmt(runtime, vf, layer.wv.data, &h_norm_dev, kv_dim, hidden).ok()?;
+            // QK-norm / V-norm (seq_len = 1 decode).
+            let q_normed = match layer.q_norm_weight {
+                Some(w) => runtime
+                    .launch_rms_norm_heads_dev(&q_proj, Some(w), 1, num_q, head_dim, qk_eps, qk_off)
+                    .ok()?,
+                None => q_proj,
+            };
+            let k_normed = match layer.k_norm_weight {
+                Some(w) => runtime
+                    .launch_rms_norm_heads_dev(
+                        &k_proj,
+                        Some(w),
+                        1,
+                        num_kv,
+                        head_dim,
+                        qk_eps,
+                        qk_off,
+                    )
+                    .ok()?,
+                None => k_proj,
+            };
+            let v_normed = if layer.has_v_norm {
+                runtime
+                    .launch_rms_norm_heads_dev(&v_proj, None, 1, num_kv, head_dim, qk_eps, 0.0)
+                    .ok()?
+            } else {
+                v_proj
+            };
+            // RoPE on Q and K at `abs_position`.
+            let inv_freq_dev = runtime.upload_f64(&inv_freq).ok()?;
+            let q_rope = runtime
+                .launch_rope_dev_with_invfreq(
+                    &inv_freq_dev,
+                    &q_normed,
+                    1,
+                    num_q,
+                    head_dim,
+                    half_rotary,
+                    abs_position,
+                    pos_div,
+                )
+                .ok()?;
+            let k_rope = runtime
+                .launch_rope_dev_with_invfreq(
+                    &inv_freq_dev,
+                    &k_normed,
+                    1,
+                    num_kv,
+                    head_dim,
+                    half_rotary,
+                    abs_position,
+                    pos_div,
+                )
+                .ok()?;
+            // Read back the new K/V row (host mirror append + state dump +
+            // GPU-006 invariant — unchanged from `host_attention_block_device`).
+            let k_new_row = runtime.sync_dtoh_f32(&k_rope).ok()?;
+            let v_new_row = runtime.sync_dtoh_f32(&v_normed).ok()?;
+            if k_new_row.len() != kv_dim || v_new_row.len() != kv_dim {
+                return None;
+            }
+            // GPU-006: prefer the resident-KV device path (unchanged).
+            let resident = self.resident_kv_decode_attention(
+                runtime,
+                li,
+                &q_rope,
+                &k_new_row,
+                &v_new_row,
+                prev,
+                scale as f32,
+                softcap_opt,
+                num_q,
+                num_kv,
+                head_dim,
+                kv_dim,
+                reps,
+            );
+            let attn_dev = match resident {
+                Ok(Some(out)) => {
+                    self.note_resident_kv_decode(true);
+                    out
+                }
+                Ok(None) => {
+                    self.note_resident_kv_decode(false);
+                    self.decode_attention_full_upload(
+                        runtime,
+                        li,
+                        &q_rope,
+                        &k_new_row,
+                        &v_new_row,
+                        prev,
+                        total_len,
+                        kv_dim,
+                        num_q,
+                        head_dim,
+                        reps,
+                        scale as f32,
+                        softcap_opt,
+                    )
+                    .ok()?
+                }
+                Err(_) => {
+                    self.note_resident_kv_decode(false);
+                    self.decode_attention_full_upload(
+                        runtime,
+                        li,
+                        &q_rope,
+                        &k_new_row,
+                        &v_new_row,
+                        prev,
+                        total_len,
+                        kv_dim,
+                        num_q,
+                        head_dim,
+                        reps,
+                        scale as f32,
+                        softcap_opt,
+                    )
+                    .ok()?
+                }
+            };
+            // O projection: resident attention output → [hidden], stays resident.
+            let o_dev =
+                matvec_dev_by_fmt(runtime, of, layer.wo.data, &attn_dev, hidden, q_dim).ok()?;
+            (o_dev, k_new_row, v_new_row)
+        };
+
+        // Post-attention norm + residual on device (the resident-hidden
+        // collapse: the residual base `h_dev` is resident, so no readback).
+        let res_mult = layer.residual_multiplier;
+        let h_post_attn_dev = if layer.has_post_norms {
+            let normed_dev = runtime
+                .launch_rms_norm_dev(
+                    &o_dev,
+                    Some(layer.post_attn_norm),
+                    1,
+                    hidden,
+                    layer.eps as f64,
+                    layer.norm_offset,
+                )
+                .ok()?;
+            runtime
+                .launch_residual_add_dev(h_dev, &normed_dev, hidden, res_mult)
+                .ok()?
+        } else {
+            runtime
+                .launch_residual_add_dev(h_dev, &o_dev, hidden, res_mult)
+                .ok()?
+        };
+        Some((h_post_attn_dev, k_new_row, v_new_row))
+    }
+
     /// One attention block for a single decode step:
     /// norm → Q/K/V proj → QK-norm → RoPE → GQA attend → O proj → residual.
     /// Returns `(h_post_attn, k_new_row, v_new_row)`. Tries the device-resident
@@ -1741,6 +2390,185 @@ impl CudaBackend {
         // Post-FFN norm + residual on the host — shared with the host-only
         // path via `apply_post_ffn_residual` so the two can't drift.
         Some(self.apply_post_ffn_residual(layer, h_post_attn, &out))
+    }
+
+    /// Device-resident decode FFN block — the cross-layer residency twin of
+    /// [`host_ffn_block_device`] (GPU-007D). Consumes a device-resident
+    /// post-attention hidden state and produces a device-resident post-FFN
+    /// hidden state, so the next layer's attention block can consume it
+    /// without an inter-layer hidden-state readback/upload.
+    ///
+    /// The chain mirrors [`host_ffn_block_device`] up to the down projection
+    /// (pre-ffn norm → gate/up → activation → down, all on device), but:
+    /// - The pre-FFN norm runs **on device** via [`CudaRuntime::launch_rms_norm_dev`]
+    ///   (the input is already resident). Parity-safe: same kernel as the
+    ///   host-readback path. Gated to RmsNorm-only (no LayerNorm device kernel).
+    /// - The down projection output stays resident (no `sync_dtoh_f32`).
+    /// - The post-FFN norm + residual run **on device** via
+    ///   [`CudaRuntime::launch_rms_norm_dev`] + [`CudaRuntime::launch_residual_add_dev`]
+    ///   — the residual base is `h_post_attn_dev` (the same resident input),
+    ///   matching `apply_post_ffn_residual`'s `h + res_mult * normed(out)`.
+    ///
+    /// Returns `None` (caller falls back to the host path) when the norm path
+    /// bails (non-RmsNorm, `None`-weight pre-ffn norm under `!has_post_norms`
+    /// without a weight to upload) or any chained launch returns `Err`. The
+    /// eligibility gates (Q4_K/Q6_K, `inter` ≥ activation gate, `stored_cols ==
+    /// inter`) are enforced by [`resident_hidden_layer_eligible`] before this
+    /// is called, but the defensive checks stay for direct-call safety.
+    fn host_ffn_block_device_resident(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn_dev: &CudaSlice<f32>,
+        hidden: usize,
+        inter: usize,
+    ) -> Option<CudaSlice<f32>> {
+        if h_post_attn_dev.len() != hidden {
+            return None;
+        }
+        if !Self::native_activation_worthwhile(inter) {
+            return None;
+        }
+        let gate_fmt = layer.gate.format;
+        let up_fmt = layer.up.format;
+        let down_fmt = layer.down.format;
+        if !matches!(
+            (gate_fmt, up_fmt, down_fmt),
+            (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K)
+                | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
+        ) {
+            return None;
+        }
+        let stored_cols = down_stored_cols(layer, hidden, inter)?;
+        if stored_cols != inter {
+            return None;
+        }
+        // RmsNorm-only (the resident pre-ffn / post-ffn norms use the device
+        // `rms_norm` kernel; LayerNorm has no device twin). The eligibility
+        // gate enforces this, but keep the defensive check for direct calls.
+        if layer.norm_type != NormType::RmsNorm {
+            return None;
+        }
+        // Pre-FFN norm on device. When `has_post_norms`, use `pre_ffn_norm`;
+        // otherwise reuse `post_attn_norm` (matches `host_ffn_block_device`).
+        // The `None`-weight pre-ffn path (no `pre_ffn_norm` + `!has_post_norms`
+        // + no `post_attn_norm`) is rare on Gemma; bail to the host path when
+        // there's no weight to upload (the device `launch_rms_norm_dev`
+        // `None`-weight arm exists, but the resident eligibility gate didn't
+        // account for it — bail rather than risk a parity drift).
+        let pre_norm_w = if layer.has_post_norms {
+            layer.pre_ffn_norm
+        } else {
+            Some(layer.post_attn_norm)
+        };
+        let h_norm_dev = match pre_norm_w {
+            Some(w) => runtime
+                .launch_rms_norm_dev(
+                    h_post_attn_dev,
+                    Some(w),
+                    1,
+                    hidden,
+                    layer.eps as f64,
+                    layer.norm_offset,
+                )
+                .ok()?,
+            None => {
+                // The no-weight RMSNorm device path (`has_weight = 0`, w = 1.0).
+                runtime
+                    .launch_rms_norm_dev(
+                        h_post_attn_dev,
+                        None,
+                        1,
+                        hidden,
+                        layer.eps as f64,
+                        layer.norm_offset,
+                    )
+                    .ok()?
+            }
+        };
+
+        // Drive the device chain (mirrors `host_ffn_block_device`). The down
+        // output stays resident — no `sync_dtoh_f32` readback.
+        let down_dev = {
+            let gate_dev = matvec_dev_by_fmt(
+                runtime,
+                gate_fmt,
+                layer.gate.data,
+                &h_norm_dev,
+                inter,
+                hidden,
+            )
+            .ok()?;
+            let up_dev =
+                matvec_dev_by_fmt(runtime, up_fmt, layer.up.data, &h_norm_dev, inter, hidden)
+                    .ok()?;
+            let act_dev = match layer.ffn_type {
+                larql_compute::FfnType::Gated => match layer.activation {
+                    Activation::Silu => runtime
+                        .launch_geglu_silu_dev(&gate_dev, &up_dev, inter)
+                        .ok()?,
+                    Activation::GeluTanh => runtime
+                        .launch_geglu_gelu_tanh_dev(&gate_dev, &up_dev, inter)
+                        .ok()?,
+                    _ => return None,
+                },
+                larql_compute::FfnType::Standard => match layer.activation {
+                    Activation::Silu => runtime.launch_activation_silu_dev(&up_dev, inter).ok()?,
+                    Activation::GeluTanh => runtime
+                        .launch_activation_gelu_tanh_dev(&up_dev, inter)
+                        .ok()?,
+                    _ => return None,
+                },
+            };
+            matvec_dev_by_fmt(
+                runtime,
+                down_fmt,
+                layer.down.data,
+                &act_dev,
+                hidden,
+                stored_cols,
+            )
+            .ok()?
+        };
+
+        // Post-FFN norm + residual on device — the resident-hidden collapse.
+        // Matches `apply_post_ffn_residual`: `out = h_post_attn + res_mult *
+        // normed(down)` when `has_post_norms`, else `out = h_post_attn +
+        // res_mult * down`. The residual base is the resident input.
+        let res_mult = layer.residual_multiplier;
+        let h_post_ffn_dev = if layer.has_post_norms {
+            let norm_w = layer.post_ffn_norm;
+            let normed_dev = match norm_w {
+                Some(w) => runtime
+                    .launch_rms_norm_dev(
+                        &down_dev,
+                        Some(w),
+                        1,
+                        hidden,
+                        layer.eps as f64,
+                        layer.norm_offset,
+                    )
+                    .ok()?,
+                None => runtime
+                    .launch_rms_norm_dev(
+                        &down_dev,
+                        None,
+                        1,
+                        hidden,
+                        layer.eps as f64,
+                        layer.norm_offset,
+                    )
+                    .ok()?,
+            };
+            runtime
+                .launch_residual_add_dev(h_post_attn_dev, &normed_dev, hidden, res_mult)
+                .ok()?
+        } else {
+            runtime
+                .launch_residual_add_dev(h_post_attn_dev, &down_dev, hidden, res_mult)
+                .ok()?
+        };
+        Some(h_post_ffn_dev)
     }
 
     /// Hybrid-MoE FFN block for a single decode token (Gemma 4 26B-A4B

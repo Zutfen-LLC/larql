@@ -359,9 +359,16 @@ impl DecodeBackend for CudaBackend {
         // (`kv_cache_len_native`) is only advanced by `prefill_kquant`, NOT
         // by decode — so using it here would freeze the position at the
         // post-prefill length and garble multi-token RoPE. The host mirror
-        // is grown by one row per decode step inside `host_decode_token`.
+        // is grown by one row per decode step inside `host_decode_token` /
+        // `host_decode_token_resident`.
+        //
+        // GPU-007: the non-state-dump path threads the hidden state
+        // device-resident through eligible layers via
+        // `host_decode_token_resident` (which falls back per-layer to
+        // `host_decode_token`'s host-orchestrated path). The state-dump
+        // variants below keep the host path (exact dump points).
         let pos = self.host_kv_len();
-        self.host_decode_token(layers, x, hidden, inter, pos, None, StateDumpMask::None)
+        self.host_decode_token_resident(layers, x, hidden, inter, pos)
     }
 
     fn decode_token_with_state_dump(
@@ -462,6 +469,10 @@ impl ComputeBackend for CudaBackend {
                 info.push_str(&diag);
             }
             if let Some(diag) = self.resident_kv_diag() {
+                info.push('\n');
+                info.push_str(&diag);
+            }
+            if let Some(diag) = self.resident_hidden_diag() {
                 info.push('\n');
                 info.push_str(&diag);
             }

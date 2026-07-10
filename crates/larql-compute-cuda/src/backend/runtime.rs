@@ -2059,6 +2059,33 @@ impl CudaRuntime {
         )
     }
 
+    /// Device-resident residual add: `out[i] = h_dev[i] + b_scale * x_dev[i]`.
+    /// The device twin of [`launch_residual_add`]: `h_dev` is the residual base
+    /// (the pre-block hidden state carried across blocks/layers by GPU-007),
+    /// `x_dev` is the new projection output (post-attention O or post-FFN down),
+    /// and `b_scale` is the layer's `residual_multiplier`. No upload, no sync,
+    /// no readback — the caller chains it on the same stream and reads back
+    /// once. Routes through the same `residual_add` kernel + arg layout
+    /// (`extra_scalar = Some(b_scale)`) the host-readback launcher uses, so the
+    /// two can't drift on the kernel contract. Used by the cross-layer
+    /// hidden-state residency chain (GPU-007C/D).
+    pub(crate) fn launch_residual_add_dev(
+        &self,
+        h_dev: &CudaSlice<f32>,
+        x_dev: &CudaSlice<f32>,
+        n: usize,
+        b_scale: f32,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        self.launch_elementwise_binary_dev(
+            &self.residual_add,
+            h_dev,
+            x_dev,
+            Some(b_scale),
+            n,
+            "residual_add",
+        )
+    }
+
     /// Shared device-resident binary elementwise dispatch. `in_a` / `in_b` are
     /// already on the device; the output is allocated and returned as a device
     /// buffer. No upload, no sync, no readback — the caller drives the chain
