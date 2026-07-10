@@ -476,8 +476,21 @@ impl ComputeBackend for CudaBackend {
                 info.push('\n');
                 info.push_str(&diag);
             }
+            // LARQL-GPU-PROFILE-001: launch/copy/sync/mirror decomposition.
+            // Only populated when LARQL_GPU_PROFILE=1 (otherwise the recorders
+            // are no-ops and this returns None).
+            if let Some(diag) = self.profile_diag() {
+                info.push('\n');
+                info.push_str(&diag);
+            }
         }
         info
+    }
+
+    fn take_profile_counters(&self) -> Option<larql_compute::ProfileCountersSnapshot> {
+        // Delegate to the inherent CUDA snapshot, then convert into the
+        // substrate-level type so the bench harness stays backend-agnostic.
+        self.cuda_profile_counters().map(Into::into)
     }
 
     fn supports(&self, cap: Capability) -> bool {

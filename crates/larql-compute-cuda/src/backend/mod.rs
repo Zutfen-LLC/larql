@@ -36,10 +36,90 @@ pub struct CudaBackend {
     /// via `device_info()` when `LARQL_GPU_DIAG=1`. Thread-safe (atomic).
     resident_hidden_uses: std::sync::atomic::AtomicU64,
     resident_hidden_fallbacks: std::sync::atomic::AtomicU64,
+    /// LARQL-GPU-PROFILE-001 gated decomposition counters. All zeroed at
+    /// construction; only mutated when `LARQL_GPU_PROFILE=1` is set (the
+    /// recorder methods short-circuit otherwise). Surfaced via
+    /// `profile_diag()` / `take_profile_counters()`.
+    profile: ProfileCounters,
     /// Test-only eligibility hook for exercising a resident → fallback →
     /// resident transition without changing any layer math.
     #[cfg(test)]
     resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize,
+}
+
+/// Internal atomic storage for the LARQL-GPU-PROFILE-001 decomposition
+/// counters (see [`CudaBackend::profile`]). All fields are `AtomicU64` with
+/// `Ordering::Relaxed` — the decode hot path is single-threaded per token, so
+/// relaxed ordering is sufficient and avoids any fence cost. The recorder
+/// methods on `CudaBackend` gate on `gpu_profile_enabled()` before touching
+/// any of these, so normal decode never increments them.
+#[derive(Default)]
+struct ProfileCounters {
+    mirror_append_ns: std::sync::atomic::AtomicU64,
+    mirror_rows_copied: std::sync::atomic::AtomicU64,
+    hidden_readback_ns: std::sync::atomic::AtomicU64,
+}
+
+/// A consumed snapshot of the profile counters, returned by
+/// [`CudaBackend::take_profile_counters`] (the inherent method). Plain values
+/// (the atomics have been reset to zero). Distinct from the trait-level
+/// [`larql_compute::ProfileCountersSnapshot`] so the CUDA crate doesn't
+/// re-export a type into the shared substrate; the trait impl converts.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CudaProfileSnapshot {
+    pub launches: u64,
+    pub htod_copies: u64,
+    pub htod_bytes: u64,
+    pub dtoh_copies: u64,
+    pub dtoh_bytes: u64,
+    pub syncs: u64,
+    pub mirror_append_ns: u64,
+    pub mirror_rows_copied: u64,
+    pub hidden_readback_ns: u64,
+}
+
+impl From<CudaProfileSnapshot> for larql_compute::ProfileCountersSnapshot {
+    fn from(c: CudaProfileSnapshot) -> Self {
+        Self {
+            launches: c.launches,
+            htod_copies: c.htod_copies,
+            htod_bytes: c.htod_bytes,
+            dtoh_copies: c.dtoh_copies,
+            dtoh_bytes: c.dtoh_bytes,
+            syncs: c.syncs,
+            mirror_append_ns: c.mirror_append_ns,
+            mirror_rows_copied: c.mirror_rows_copied,
+            hidden_readback_ns: c.hidden_readback_ns,
+        }
+    }
+}
+
+/// Atomic launch/copy/sync counters held by [`CudaRuntime`] (every kernel
+/// launch and every host↔device copy flows through the runtime's single
+/// stream). Mirrors [`ProfileCounters`] but lives on the `Arc`-shared runtime
+/// rather than the per-request `CudaBackend`, so the `*_dev` device-resident
+/// chains (which call `launch_*_dev` directly, bypassing the `native_*`
+/// wrappers) are counted too.
+#[derive(Default, Debug)]
+pub(crate) struct RuntimeProfile {
+    launches: std::sync::atomic::AtomicU64,
+    htod_copies: std::sync::atomic::AtomicU64,
+    htod_bytes: std::sync::atomic::AtomicU64,
+    dtoh_copies: std::sync::atomic::AtomicU64,
+    dtoh_bytes: std::sync::atomic::AtomicU64,
+    syncs: std::sync::atomic::AtomicU64,
+}
+
+/// Consumed snapshot of [`RuntimeProfile`], returned by
+/// [`CudaRuntime::take_profile_counters`].
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RuntimeProfileSnapshot {
+    pub launches: u64,
+    pub htod_copies: u64,
+    pub htod_bytes: u64,
+    pub dtoh_copies: u64,
+    pub dtoh_bytes: u64,
+    pub syncs: u64,
 }
 
 impl CudaBackend {
@@ -59,6 +139,7 @@ impl CudaBackend {
                 resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_uses: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                profile: ProfileCounters::default(),
                 #[cfg(test)]
                 resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
                     usize::MAX,
@@ -74,6 +155,7 @@ impl CudaBackend {
                 resident_kv_decode_fallbacks: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_uses: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                profile: ProfileCounters::default(),
                 #[cfg(test)]
                 resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
                     usize::MAX,
@@ -378,6 +460,111 @@ impl CudaBackend {
         Some(format!(
             "cuda resident-hidden decode: uses={uses}, fallbacks={fallbacks}, resident_rate={rate}"
         ))
+    }
+
+    // ── LARQL-GPU-PROFILE-001 gated decomposition counters ───────────────
+    //
+    // The backend owns the two host-side counters that the runtime cannot see:
+    // the host KV mirror append cost (pipeline.rs) and the final hidden-state
+    // readback. The launch/copy/sync counters live on `CudaRuntime` (every
+    // device op flows through its single stream). Each recorder is a no-op
+    // when `LARQL_GPU_PROFILE` is unset, so normal decode is untouched.
+
+    /// Record host KV mirror append cost: `nanos` spent reallocating + copying
+    /// the `[len, kv_dim]` Array2 pair for one layer, and `rows_copied` prior
+    /// rows copied (the O(seq_len) term). No-op unless `LARQL_GPU_PROFILE=1`.
+    pub(crate) fn note_mirror_append(&self, nanos: u64, rows_copied: usize) {
+        if crate::options::gpu_profile_enabled() {
+            self.profile
+                .mirror_append_ns
+                .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+            self.profile
+                .mirror_rows_copied
+                .fetch_add(rows_copied as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record final hidden-state readback cost (`nanos`). No-op unless
+    /// `LARQL_GPU_PROFILE=1`.
+    pub(crate) fn note_hidden_readback(&self, nanos: u64) {
+        if crate::options::gpu_profile_enabled() {
+            self.profile
+                .hidden_readback_ns
+                .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A multi-line diagnostic string summarising the profile counters, or
+    /// `None` when nothing has been recorded (counters at zero). Surfaced
+    /// through `device_info()` when `LARQL_GPU_DIAG` is set. Reads the
+    /// runtime-side atomics directly (non-destructive); use
+    /// [`take_profile_counters`] for a consuming snapshot.
+    pub fn profile_diag(&self) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        // Runtime-side (relaxed loads — diagnostic only, never on the hot path).
+        let (launches, htod_copies, htod_bytes, dtoh_copies, dtoh_bytes, syncs) = self
+            .runtime
+            .as_ref()
+            .map(|r| {
+                (
+                    r.profile.launches.load(Ordering::Relaxed),
+                    r.profile.htod_copies.load(Ordering::Relaxed),
+                    r.profile.htod_bytes.load(Ordering::Relaxed),
+                    r.profile.dtoh_copies.load(Ordering::Relaxed),
+                    r.profile.dtoh_bytes.load(Ordering::Relaxed),
+                    r.profile.syncs.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, 0, 0));
+        let mirror_ns = self.profile.mirror_append_ns.load(Ordering::Relaxed);
+        let mirror_rows = self.profile.mirror_rows_copied.load(Ordering::Relaxed);
+        let readback_ns = self.profile.hidden_readback_ns.load(Ordering::Relaxed);
+        if launches == 0 && mirror_ns == 0 && readback_ns == 0 {
+            return None;
+        }
+        Some(format!(
+            "cuda profile: launches={launches}, htod={htod_copies}/{htod_bytes}B, \
+             dtoh={dtoh_copies}/{dtoh_bytes}B, syncs={syncs}, \
+             mirror_append={:.3}ms/{}rows, hidden_readback={:.3}ms",
+            mirror_ns as f64 / 1e6,
+            mirror_rows,
+            readback_ns as f64 / 1e6,
+        ))
+    }
+
+    /// Consume and reset all profile counters, returning the snapshot. Used
+    /// by the bench harness to read per-run deltas. Returns `None` when no
+    /// profiling has been enabled (counters at zero). Modeled on Metal's
+    /// `take_split_timings`. Merges the runtime-side launch/copy/sync
+    /// counters with the backend-side mirror/readback counters.
+    pub fn cuda_profile_counters(&self) -> Option<CudaProfileSnapshot> {
+        use std::sync::atomic::Ordering;
+        // Runtime-side (launches/copies/syncs). May be None when the backend
+        // has no runtime (CPU-delegate scaffold) or when profiling is off.
+        let rt = self
+            .runtime
+            .as_ref()
+            .and_then(|r| r.take_profile_counters());
+        // Backend-side (mirror/readback). These are zero unless pipeline.rs
+        // recorded them during a decode_token call.
+        let mirror_append_ns = self.profile.mirror_append_ns.swap(0, Ordering::Relaxed);
+        let mirror_rows_copied = self.profile.mirror_rows_copied.swap(0, Ordering::Relaxed);
+        let hidden_readback_ns = self.profile.hidden_readback_ns.swap(0, Ordering::Relaxed);
+        if rt.is_none() && mirror_append_ns == 0 && hidden_readback_ns == 0 {
+            return None;
+        }
+        let rt = rt.unwrap_or_default();
+        Some(CudaProfileSnapshot {
+            launches: rt.launches,
+            htod_copies: rt.htod_copies,
+            htod_bytes: rt.htod_bytes,
+            dtoh_copies: rt.dtoh_copies,
+            dtoh_bytes: rt.dtoh_bytes,
+            syncs: rt.syncs,
+            mirror_append_ns,
+            mirror_rows_copied,
+            hidden_readback_ns,
+        })
     }
 
     /// Native RMSNorm (body norm) — the device twin of

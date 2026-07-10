@@ -9,14 +9,14 @@ use super::row::BenchRow;
 const WIRE_COL_WIDTH: usize = 100;
 const PLAIN_COL_WIDTH: usize = 85;
 
-pub(super) fn print_table(rows: &[BenchRow]) {
-    for line in render_table(rows) {
+pub(super) fn print_table(rows: &[BenchRow], warmup: usize) {
+    for line in render_table(rows, warmup) {
         println!("{line}");
     }
 }
 
 /// Pure renderer: returns the full table as a sequence of lines.
-pub(super) fn render_table(rows: &[BenchRow]) -> Vec<String> {
+pub(super) fn render_table(rows: &[BenchRow], warmup: usize) -> Vec<String> {
     let has_wire = rows.iter().any(|r| r.wire_bytes_per_tok.is_some());
     let mut out = Vec::new();
     out.push(format_header_line(has_wire));
@@ -25,6 +25,7 @@ pub(super) fn render_table(rows: &[BenchRow]) -> Vec<String> {
         out.push(format_data_row(r, has_wire));
     }
     out.extend(format_stage_breakdown(rows));
+    out.extend(format_profile_breakdown(rows, warmup));
     out.extend(format_remote_ffn_breakdown(rows));
     out.extend(format_metal_vs_ollama_summary(rows));
     out
@@ -143,6 +144,45 @@ pub(super) fn format_stage_breakdown(rows: &[BenchRow]) -> Vec<String> {
     out
 }
 
+/// LARQL-GPU-PROFILE-001: print the per-token decomposition counters when
+/// `LARQL_GPU_PROFILE=1` was set for the run (CUDA only). Normalised by the
+/// measured window (`r.n_steps` + warmup, matching the JSON emission).
+pub(super) fn format_profile_breakdown(rows: &[BenchRow], warmup: usize) -> Vec<String> {
+    let Some(r) = rows.iter().find(|r| r.profile.is_some()) else {
+        return Vec::new();
+    };
+    let p = r.profile.unwrap();
+    let n = (r.n_steps.max(warmup)) as f64;
+    if n == 0.0 {
+        return Vec::new();
+    }
+    vec![
+        String::new(),
+        format!("  GPU profile ({}):", r.backend),
+        format!("    launches    {:>7.1}/tok", p.launches as f64 / n),
+        format!(
+            "    htod        {:>7.1}/tok  {:>6.3}MiB/tok",
+            p.htod_copies as f64 / n,
+            p.htod_bytes as f64 / n / (1024.0 * 1024.0)
+        ),
+        format!(
+            "    dtoh        {:>7.1}/tok  {:>6.3}MiB/tok",
+            p.dtoh_copies as f64 / n,
+            p.dtoh_bytes as f64 / n / (1024.0 * 1024.0)
+        ),
+        format!("    syncs       {:>7.1}/tok", p.syncs as f64 / n),
+        format!(
+            "    KV mirror   {:>7.3}ms/tok  {:>7.1}rows/tok",
+            p.mirror_append_ns as f64 / 1e6 / n,
+            p.mirror_rows_copied as f64 / n
+        ),
+        format!(
+            "    hidden rdback {:>5.3}ms/tok",
+            p.hidden_readback_ns as f64 / 1e6 / n
+        ),
+    ]
+}
+
 pub(super) fn format_remote_ffn_breakdown(rows: &[BenchRow]) -> Vec<String> {
     let Some(r) = rows.iter().find(|r| r.ffn_rtt_ms.is_some()) else {
         return Vec::new();
@@ -223,6 +263,7 @@ mod tests {
             p99_ms: 0.0,
             tok_per_s: tok,
             stages: None,
+            profile: None,
             ffn_rtt_ms: None,
             attn_ms: None,
             wire_bytes_per_tok: None,
@@ -447,7 +488,7 @@ mod tests {
     #[test]
     fn render_table_includes_header_separator_and_all_rows() {
         let rows = vec![empty_row("a", 1.0), empty_row("b", 2.0)];
-        let lines = render_table(&rows);
+        let lines = render_table(&rows, 0);
         // header + separator + 2 rows = 4 lines minimum
         assert!(lines.len() >= 4);
         assert!(lines[0].contains("Backend"));

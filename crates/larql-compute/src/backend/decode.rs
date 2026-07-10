@@ -125,6 +125,31 @@ pub struct ProfileTimings {
     pub down_ms: f64,
 }
 
+/// LARQL-GPU-PROFILE-001 decomposition-counter snapshot, backend-agnostic.
+/// Returned by [`crate::ComputeBackend::take_profile_counters`] when the
+/// backend recorded launch/copy/sync/mirror/readback activity during the
+/// preceding decode window (CUDA only, gated on `LARQL_GPU_PROFILE=1`).
+/// Fields are consumed-and-reset values for the window since the last read.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProfileCountersSnapshot {
+    /// Total CUDA kernel launches across the window.
+    pub launches: u64,
+    /// Host→device copy count + total bytes.
+    pub htod_copies: u64,
+    pub htod_bytes: u64,
+    /// Device→host copy count + total bytes.
+    pub dtoh_copies: u64,
+    pub dtoh_bytes: u64,
+    /// Explicit stream synchronizations.
+    pub syncs: u64,
+    /// Host KV mirror realloc+copy: nanoseconds + prior rows copied (the
+    /// O(seq_len) term that grows with context).
+    pub mirror_append_ns: u64,
+    pub mirror_rows_copied: u64,
+    /// Final hidden-state device→host readback: nanoseconds.
+    pub hidden_readback_ns: u64,
+}
+
 impl ProfileTimings {
     /// Sum across the three buckets — the whole-token cost.
     pub fn total_ms(&self) -> f64 {

@@ -114,7 +114,7 @@ pub use pipeline::{
 
 pub use backend::{
     dot_proj_gpu, matmul_gpu, Capability, ComputeBackend, DecodeBackend, DecodeStateDump, MatMul,
-    MatMulOp, ProfileTimings, QuantMatVec, StateDumpMask,
+    MatMulOp, ProfileCountersSnapshot, ProfileTimings, QuantMatVec, StateDumpMask,
 };
 
 /// Bring every backend sub-trait into scope at once.

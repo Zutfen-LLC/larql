@@ -244,24 +244,37 @@ impl CudaBackend {
 
             // Append the new K/V row to the host mirror.
             {
-                let mut kv = self.lock_host_kv();
-                if let Some((k_cache, v_cache)) = kv.get_mut(li) {
-                    let kv_dim = layer.num_kv_heads * layer.head_dim;
-                    let prev = k_cache.shape()[0];
-                    let mut k_new = Array2::zeros((prev + 1, kv_dim));
-                    let mut v_new = Array2::zeros((prev + 1, kv_dim));
-                    if prev > 0 {
-                        k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
-                        v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                let prof = crate::options::gpu_profile_enabled();
+                let mt0 = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let mut rows_copied = 0usize;
+                {
+                    let mut kv = self.lock_host_kv();
+                    if let Some((k_cache, v_cache)) = kv.get_mut(li) {
+                        let kv_dim = layer.num_kv_heads * layer.head_dim;
+                        let prev = k_cache.shape()[0];
+                        rows_copied = prev;
+                        let mut k_new = Array2::zeros((prev + 1, kv_dim));
+                        let mut v_new = Array2::zeros((prev + 1, kv_dim));
+                        if prev > 0 {
+                            k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
+                            v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                        }
+                        k_new
+                            .slice_mut(ndarray::s![prev..prev + 1, ..])
+                            .assign(&Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec()).ok()?);
+                        v_new
+                            .slice_mut(ndarray::s![prev..prev + 1, ..])
+                            .assign(&Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec()).ok()?);
+                        *k_cache = k_new;
+                        *v_cache = v_new;
                     }
-                    k_new
-                        .slice_mut(ndarray::s![prev..prev + 1, ..])
-                        .assign(&Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec()).ok()?);
-                    v_new
-                        .slice_mut(ndarray::s![prev..prev + 1, ..])
-                        .assign(&Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec()).ok()?);
-                    *k_cache = k_new;
-                    *v_cache = v_new;
+                }
+                if let Some(t0) = mt0 {
+                    self.note_mirror_append(t0.elapsed().as_nanos() as u64, rows_copied);
                 }
             }
 
@@ -377,26 +390,39 @@ impl CudaBackend {
                     // the host mirror append happens between attention and FFN,
                     // exactly as in `host_decode_token`).
                     {
-                        let mut kv = self.lock_host_kv();
-                        if let Some((k_cache, v_cache)) = kv.get_mut(li) {
-                            let kv_dim = layer.num_kv_heads * layer.head_dim;
-                            let prev = k_cache.shape()[0];
-                            let mut k_new = Array2::zeros((prev + 1, kv_dim));
-                            let mut v_new = Array2::zeros((prev + 1, kv_dim));
-                            if prev > 0 {
-                                k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
-                                v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                        let prof = crate::options::gpu_profile_enabled();
+                        let mt0 = if prof {
+                            Some(std::time::Instant::now())
+                        } else {
+                            None
+                        };
+                        let mut rows_copied = 0usize;
+                        {
+                            let mut kv = self.lock_host_kv();
+                            if let Some((k_cache, v_cache)) = kv.get_mut(li) {
+                                let kv_dim = layer.num_kv_heads * layer.head_dim;
+                                let prev = k_cache.shape()[0];
+                                rows_copied = prev;
+                                let mut k_new = Array2::zeros((prev + 1, kv_dim));
+                                let mut v_new = Array2::zeros((prev + 1, kv_dim));
+                                if prev > 0 {
+                                    k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
+                                    v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                                }
+                                k_new.slice_mut(ndarray::s![prev..prev + 1, ..]).assign(
+                                    &Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec())
+                                        .expect("k_new_row shape"),
+                                );
+                                v_new.slice_mut(ndarray::s![prev..prev + 1, ..]).assign(
+                                    &Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec())
+                                        .expect("v_new_row shape"),
+                                );
+                                *k_cache = k_new;
+                                *v_cache = v_new;
                             }
-                            k_new.slice_mut(ndarray::s![prev..prev + 1, ..]).assign(
-                                &Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec())
-                                    .expect("k_new_row shape"),
-                            );
-                            v_new.slice_mut(ndarray::s![prev..prev + 1, ..]).assign(
-                                &Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec())
-                                    .expect("v_new_row shape"),
-                            );
-                            *k_cache = k_new;
-                            *v_cache = v_new;
+                        }
+                        if let Some(t0) = mt0 {
+                            self.note_mirror_append(t0.elapsed().as_nanos() as u64, rows_copied);
                         }
                     }
 
@@ -487,24 +513,37 @@ impl CudaBackend {
                 self.host_attention_block(layer, &h_host, li, abs_position)?;
             // Append the new K/V row to the host mirror (same as above).
             {
-                let mut kv = self.lock_host_kv();
-                if let Some((k_cache, v_cache)) = kv.get_mut(li) {
-                    let kv_dim = layer.num_kv_heads * layer.head_dim;
-                    let prev = k_cache.shape()[0];
-                    let mut k_new = Array2::zeros((prev + 1, kv_dim));
-                    let mut v_new = Array2::zeros((prev + 1, kv_dim));
-                    if prev > 0 {
-                        k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
-                        v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                let prof = crate::options::gpu_profile_enabled();
+                let mt0 = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let mut rows_copied = 0usize;
+                {
+                    let mut kv = self.lock_host_kv();
+                    if let Some((k_cache, v_cache)) = kv.get_mut(li) {
+                        let kv_dim = layer.num_kv_heads * layer.head_dim;
+                        let prev = k_cache.shape()[0];
+                        rows_copied = prev;
+                        let mut k_new = Array2::zeros((prev + 1, kv_dim));
+                        let mut v_new = Array2::zeros((prev + 1, kv_dim));
+                        if prev > 0 {
+                            k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
+                            v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                        }
+                        k_new
+                            .slice_mut(ndarray::s![prev..prev + 1, ..])
+                            .assign(&Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec()).ok()?);
+                        v_new
+                            .slice_mut(ndarray::s![prev..prev + 1, ..])
+                            .assign(&Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec()).ok()?);
+                        *k_cache = k_new;
+                        *v_cache = v_new;
                     }
-                    k_new
-                        .slice_mut(ndarray::s![prev..prev + 1, ..])
-                        .assign(&Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec()).ok()?);
-                    v_new
-                        .slice_mut(ndarray::s![prev..prev + 1, ..])
-                        .assign(&Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec()).ok()?);
-                    *k_cache = k_new;
-                    *v_cache = v_new;
+                }
+                if let Some(t0) = mt0 {
+                    self.note_mirror_append(t0.elapsed().as_nanos() as u64, rows_copied);
                 }
             }
 
@@ -522,8 +561,19 @@ impl CudaBackend {
         }
 
         // Final decode output: ensure host, return the `[hidden]` vector.
+        // LARQL-GPU-PROFILE-001: time the single end-of-token hidden-state
+        // readback (the device→host copy that returns the decode output). This
+        // is the cost B4 (device lm-head) would eliminate.
+        let rt0 = if crate::options::gpu_profile_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         if !h.ensure_host(runtime) {
             return None;
+        }
+        if let Some(t0) = rt0 {
+            self.note_hidden_readback(t0.elapsed().as_nanos() as u64);
         }
         Some(h.as_host().row(0).to_vec())
     }

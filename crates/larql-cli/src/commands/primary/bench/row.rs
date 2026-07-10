@@ -13,6 +13,9 @@ pub(crate) struct BenchRow {
     pub p99_ms: f64,
     pub tok_per_s: f64,
     pub stages: Option<larql_inference::layer_graph::generate::StageTimings>,
+    /// LARQL-GPU-PROFILE-001 decomposition counters (CUDA, gated). None for
+    /// CPU or when profiling is off. Accumulated over warmup + measured window.
+    pub profile: Option<larql_compute::ProfileCountersSnapshot>,
     /// Remote FFN path breakdown: average FFN round-trip ms per token.
     pub ffn_rtt_ms: Option<f64>,
     /// Estimated local attention+norm+lmhead ms per token (= decode - ffn_rtt).
@@ -50,6 +53,8 @@ pub(crate) struct BenchJsonRow {
     pub shard_efficiency: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stages: Option<BenchJsonStages>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<BenchJsonProfile>,
     pub n_steps: usize,
     pub note: String,
 }
@@ -77,6 +82,48 @@ pub(crate) struct BenchJsonStages {
 
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
+}
+
+/// LARQL-GPU-PROFILE-001 decomposition counters (CUDA), normalised per decode
+/// token. Emitted only when `LARQL_GPU_PROFILE=1` was set for the run.
+#[derive(serde::Serialize)]
+pub(crate) struct BenchJsonProfile {
+    /// Kernel launches per token.
+    pub launches_per_tok: f64,
+    /// HtoD copies + MiB per token.
+    pub htod_per_tok: f64,
+    pub htod_mib_per_tok: f64,
+    /// DtoH copies + MiB per token.
+    pub dtoh_per_tok: f64,
+    pub dtoh_mib_per_tok: f64,
+    /// Syncs per token.
+    pub syncs_per_tok: f64,
+    /// Host KV mirror append: ms + rows copied per token.
+    pub mirror_ms_per_tok: f64,
+    pub mirror_rows_per_tok: f64,
+    /// Final hidden readback: ms per token.
+    pub hidden_readback_ms_per_tok: f64,
+}
+
+impl BenchJsonProfile {
+    /// Normalise a window-accumulated snapshot to per-token values.
+    pub(crate) fn from_snapshot(
+        s: larql_compute::ProfileCountersSnapshot,
+        n_tokens: usize,
+    ) -> Self {
+        let n = n_tokens.max(1) as f64;
+        Self {
+            launches_per_tok: s.launches as f64 / n,
+            htod_per_tok: s.htod_copies as f64 / n,
+            htod_mib_per_tok: s.htod_bytes as f64 / n / (1024.0 * 1024.0),
+            dtoh_per_tok: s.dtoh_copies as f64 / n,
+            dtoh_mib_per_tok: s.dtoh_bytes as f64 / n / (1024.0 * 1024.0),
+            syncs_per_tok: s.syncs as f64 / n,
+            mirror_ms_per_tok: s.mirror_append_ns as f64 / 1e6 / n,
+            mirror_rows_per_tok: s.mirror_rows_copied as f64 / n,
+            hidden_readback_ms_per_tok: s.hidden_readback_ns as f64 / 1e6 / n,
+        }
+    }
 }
 
 impl From<larql_inference::layer_graph::generate::StageTimings> for BenchJsonStages {

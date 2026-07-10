@@ -16,7 +16,9 @@ use super::ollama::run_ollama;
 use super::output::print_table;
 use super::remote_ffn_runtime::run_concurrent_ffn;
 use super::remote_moe_runtime::run_concurrent_moe;
-use super::row::{BenchJsonLatency, BenchJsonResult, BenchJsonRow, BenchJsonStages, BenchRow};
+use super::row::{
+    BenchJsonLatency, BenchJsonProfile, BenchJsonResult, BenchJsonRow, BenchJsonStages, BenchRow,
+};
 use larql_inference::ComputeBackendKind;
 
 pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -364,7 +366,7 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    print_table(&rows);
+    print_table(&rows, args.warmup);
 
     // JSON output (ADR-0012).
     let want_json = args
@@ -388,6 +390,9 @@ pub fn run(mut args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 wire_bytes_per_tok: r.wire_bytes_per_tok,
                 shard_efficiency: r.shard_efficiency,
                 stages: r.stages.map(BenchJsonStages::from),
+                profile: r
+                    .profile
+                    .map(|p| BenchJsonProfile::from_snapshot(p, r.n_steps.max(args.warmup))),
                 n_steps: r.n_steps,
                 note: r.note.clone(),
             })

@@ -72,6 +72,17 @@ pub(super) fn run_larql(
             &cached_layers,
             0..num_layers,
         );
+        // After pre-warm, surface the backend's diagnostic surface
+        // (LARQL_GPU_DIAG): weight-cache, resident-KV/hidden rates, and the
+        // LARQL-GPU-PROFILE counters if enabled. This is the only place the
+        // CLI bench path prints device_info(), so the resident-path activity
+        // is visible without a separate probe.
+        if args.verbose {
+            eprintln!("[bench] device_info after pre-warm:");
+            for line in backend.device_info().lines() {
+                eprintln!("  {line}");
+            }
+        }
     }
 
     // NOTE: `--profile` enables engine-side stage timers
@@ -105,7 +116,19 @@ pub(super) fn run_larql(
             "{}",
             format_q4k_cache_log(backend_name_for(backend_kind), slots, bytes)
         );
+        // device_info() after the full measured window: the resident-KV and
+        // resident-hidden use/fallback counters are cumulative (not consumed
+        // by take_profile_counters), so this reflects the whole run.
+        eprintln!("[bench] device_info after measured window:");
+        for line in backend.device_info().lines() {
+            eprintln!("  {line}");
+        }
     }
+
+    // LARQL-GPU-PROFILE-001: consume the decomposition counters accumulated
+    // across warmup + measured window (CUDA only, gated on LARQL_GPU_PROFILE).
+    // Normalised per-token in the output formatter.
+    let profile_counters = backend.take_profile_counters();
 
     let n_warm = args.warmup.min(result.decode_ms.len());
     let measured = &result.decode_ms[n_warm..];
@@ -133,6 +156,7 @@ pub(super) fn run_larql(
         p99_ms,
         tok_per_s,
         stages,
+        profile: profile_counters,
         ffn_rtt_ms: None,
         attn_ms: None,
         wire_bytes_per_tok: None,

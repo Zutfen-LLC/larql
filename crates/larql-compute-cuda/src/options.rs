@@ -87,6 +87,15 @@ const ENV_GEMV_FLOP_THRESHOLD: &str = "LARQL_CUDA_GEMV_FLOP_THRESHOLD";
 /// backend stays quiet.
 pub const ENV_GPU_DIAG: &str = "LARQL_GPU_DIAG";
 
+/// Env var (presence-as-truth) that enables per-token decomposition counters
+/// (CUDA launches, HtoD/DtoH copies + bytes, syncs, host KV mirror append
+/// time, final hidden readback) for the post-residency bottleneck profile
+/// (LARQL-GPU-PROFILE-001). Off by default so the decode hot path is
+/// untouched. Read via [`gpu_profile_enabled`]; recorder methods short-circuit
+/// to a no-op when this is unset, so there is **zero overhead** in normal
+/// execution (no atomics, no `Instant::now`).
+pub const ENV_GPU_PROFILE: &str = "LARQL_GPU_PROFILE";
+
 /// The seven env-tunable native-path crossover gates. Resolved once from the
 /// process env at first use (see [`native_thresholds`]); fields are the values
 /// the gate predicates compare against.
@@ -193,6 +202,14 @@ pub fn native_thresholds() -> &'static NativeThresholds {
 /// `device_info()` call rather than spelling the literal everywhere.
 pub fn gpu_diag_enabled() -> bool {
     std::env::var_os(ENV_GPU_DIAG).is_some()
+}
+
+/// True when the gated decomposition counters should be recorded
+/// (presence-as-truth, `LARQL_GPU_PROFILE=1`). Recorder methods in
+/// `backend/mod.rs` read this once per call; when false they are a no-op
+/// branch the branch predictor learns to skip, so normal decode is untouched.
+pub fn gpu_profile_enabled() -> bool {
+    std::env::var_os(ENV_GPU_PROFILE).is_some()
 }
 
 #[cfg(test)]

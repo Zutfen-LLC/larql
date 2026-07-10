@@ -242,6 +242,7 @@ pub(super) fn run_engine(
         p99_ms: summary.p99_ms,
         tok_per_s: summary.tok_per_s,
         stages: None,
+        profile: None,
         ffn_rtt_ms: None,
         attn_ms: None,
         wire_bytes_per_tok: None,
