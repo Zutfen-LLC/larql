@@ -461,6 +461,10 @@ impl ComputeBackend for CudaBackend {
                 info.push('\n');
                 info.push_str(&diag);
             }
+            if let Some(diag) = self.resident_kv_diag() {
+                info.push('\n');
+                info.push_str(&diag);
+            }
         }
         info
     }
