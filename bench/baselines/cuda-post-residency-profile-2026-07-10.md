@@ -3,6 +3,19 @@
 > **Status: COMPLETE on RTX 3060 (NOT the packet-required RTX 3090). Roadmap
 > recommendation marked 3060-evidence, pending 3090 re-validation.**
 
+> **Policy addendum (2026-07-10, post-D6):** the RTX 3060 development system
+> is now the **accepted canonical CUDA implementation, correctness, regression,
+> and performance-validation host** for this and future LARQL CUDA slices.
+> The D6 slice (resident-hidden Q4_K_M eligibility) was validated entirely on
+> the RTX 3060: full 172-test CUDA suite green, real-model engagement 0%→100%,
+> and a same-day A/B benchmark. **RTX 3090 re-validation is no longer
+> required.** Historical RTX 3090 reports (GPU-006, GPU-007) remain valid
+> historical records and are not rewritten. Absolute throughput numbers are
+> specific to the RTX 3060; correctness, kernel compatibility, eligibility
+> behavior, and relative before/after measurements are accepted as final
+> project evidence. See
+> [cuda-q4km-resident-hidden-2026-07-10.md](cuda-q4km-resident-hidden-2026-07-10.md).
+
 ## ⚠️ Environment caveat (read first)
 
 This profile was produced on **RTX 3060 (12 GB, sm_86, driver 610.43.03,
