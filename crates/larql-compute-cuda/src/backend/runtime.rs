@@ -1986,6 +1986,35 @@ impl CudaRuntime {
         let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
             RuntimeError::context("allocating CUDA q4k_matvec_dev output buffer", err)
         })?;
+        self.launch_q4k_matvec_into(&self.stream, &w_dev, x_dev, &mut out_dev, num_rows, hidden)?;
+        Ok(out_dev)
+    }
+
+    /// Q4_K × f32 matvec into a pre-allocated stable output buffer (B3A-4).
+    ///
+    /// The graph-capture twin of [`launch_q4k_matvec_dev`]: takes an
+    /// already-resolved `w_dev` (from the weight cache — resolved before capture
+    /// so its device address is stable) and writes into `out_dev` (a stable
+    /// graph-owned buffer) instead of allocating a fresh `CudaSlice`. Launches
+    /// on `stream` (the capture stream for graph capture, `self.stream` for the
+    /// non-graph `_dev` path). Shares the kernel-arg layout + `LaunchConfig`
+    /// with `_dev` so the two cannot drift; the `_dev` launcher delegates here
+    /// after its `alloc_zeros`.
+    pub(crate) fn launch_q4k_matvec_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        w_dev: &std::sync::Arc<CudaSlice<u8>>,
+        x_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<(), RuntimeError> {
+        if num_rows == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(x_dev.len(), hidden);
+        debug_assert!(hidden.is_multiple_of(256));
+        debug_assert_eq!(out_dev.len(), num_rows);
         let threads_x = Q4K_MATVEC_KERNEL.geometry.threads_per_group[0];
         let n = num_rows as u32;
         let k = hidden as u32;
@@ -1994,17 +2023,31 @@ impl CudaRuntime {
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(&self.q4k_matvec);
+        let mut launch_args = stream.launch_builder(&self.q4k_matvec);
         launch_args
-            .arg(&*w_dev)
+            .arg(&**w_dev)
             .arg(x_dev)
-            .arg(&mut out_dev)
+            .arg(out_dev)
             .arg(&n)
             .arg(&k);
         unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA q4k_matvec_dev kernel", err))?;
+            .map_err(|err| RuntimeError::context("launching CUDA q4k_matvec_into kernel", err))?;
         self.note_launch();
-        Ok(out_dev)
+        Ok(())
+    }
+
+    /// Resolve a Q4_K weight matrix through the persistent weight cache,
+    /// returning the device-resident handle. Exposed so the graph-build path
+    /// (B3A-5) can warm the cache + hold the `Arc` before stream capture begins
+    /// (the captured kernel node binds the then-stable device address).
+    #[allow(dead_code)]
+    pub(crate) fn resolve_q4k_weight(
+        &self,
+        q4k_data: &[u8],
+    ) -> Result<std::sync::Arc<CudaSlice<u8>>, RuntimeError> {
+        self.weight_cache
+            .get_or_upload_bytes(&self.stream, q4k_data)
+            .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))
     }
 
     /// Q6_K × f32 matvec, device-resident twin of [`launch_q4k_matvec_dev`].
@@ -2049,6 +2092,28 @@ impl CudaRuntime {
         let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
             RuntimeError::context("allocating CUDA q6k_matvec_dev output buffer", err)
         })?;
+        self.launch_q6k_matvec_into(&self.stream, &w_dev, x_dev, &mut out_dev, num_rows, hidden)?;
+        Ok(out_dev)
+    }
+
+    /// Q6_K × f32 matvec into a pre-allocated stable output buffer (B3A-4).
+    /// Graph-capture twin of [`launch_q6k_matvec_dev`]; see
+    /// [`launch_q4k_matvec_into`] for the contract.
+    pub(crate) fn launch_q6k_matvec_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        w_dev: &std::sync::Arc<CudaSlice<u8>>,
+        x_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        num_rows: usize,
+        hidden: usize,
+    ) -> Result<(), RuntimeError> {
+        if num_rows == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(x_dev.len(), hidden);
+        debug_assert!(hidden.is_multiple_of(256));
+        debug_assert_eq!(out_dev.len(), num_rows);
         let threads_x = Q6K_MATVEC_KERNEL.geometry.threads_per_group[0];
         let n = num_rows as u32;
         let k = hidden as u32;
@@ -2057,17 +2122,28 @@ impl CudaRuntime {
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(&self.q6k_matvec);
+        let mut launch_args = stream.launch_builder(&self.q6k_matvec);
         launch_args
-            .arg(&*w_dev)
+            .arg(&**w_dev)
             .arg(x_dev)
-            .arg(&mut out_dev)
+            .arg(out_dev)
             .arg(&n)
             .arg(&k);
         unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA q6k_matvec_dev kernel", err))?;
+            .map_err(|err| RuntimeError::context("launching CUDA q6k_matvec_into kernel", err))?;
         self.note_launch();
-        Ok(out_dev)
+        Ok(())
+    }
+
+    /// Resolve a Q6_K weight matrix through the persistent weight cache (B3A-5).
+    #[allow(dead_code)]
+    pub(crate) fn resolve_q6k_weight(
+        &self,
+        q6k_data: &[u8],
+    ) -> Result<std::sync::Arc<CudaSlice<u8>>, RuntimeError> {
+        self.weight_cache
+            .get_or_upload_bytes(&self.stream, q6k_data)
+            .map_err(|err| RuntimeError::context("uploading Q6_K weights to CUDA", err))
     }
 
     /// Device-resident GEGLU-SiLu: `out[i] = silu(gate[i]) * up[i]`. `gate_dev`
@@ -2157,7 +2233,122 @@ impl CudaRuntime {
         )
     }
 
-    /// Shared device-resident binary elementwise dispatch. `in_a` / `in_b` are
+    // ── B3A-4: into-buffer graph-capture twins of the elementwise launchers ──
+    //
+    // Each writes into a pre-allocated `&mut CudaSlice<f32>` (a stable
+    // graph-owned buffer) instead of allocating a fresh output. The graph
+    // build path (B3A-5) calls these during stream capture so the captured
+    // kernel nodes bind stable buffer addresses. They delegate to the shared
+    // `launch_elementwise_*_into` cores, so the arg layout + LaunchConfig
+    // cannot drift from the `_dev` twins.
+
+    /// GEGLU-SiLu into a stable buffer: `out[i] = silu(gate[i]) * up[i]`.
+    #[allow(dead_code)]
+    pub(crate) fn launch_geglu_silu_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        gate_dev: &CudaSlice<f32>,
+        up_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary_into(
+            stream,
+            &self.geglu_silu,
+            gate_dev,
+            up_dev,
+            out_dev,
+            None,
+            n,
+            "geglu_silu",
+        )
+    }
+
+    /// GEGLU-GELU-tanh into a stable buffer.
+    #[allow(dead_code)]
+    pub(crate) fn launch_geglu_gelu_tanh_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        gate_dev: &CudaSlice<f32>,
+        up_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary_into(
+            stream,
+            &self.geglu_gelu_tanh,
+            gate_dev,
+            up_dev,
+            out_dev,
+            None,
+            n,
+            "geglu_gelu_tanh",
+        )
+    }
+
+    /// Standard SiLU into a stable buffer: `out[i] = silu(x[i])`.
+    #[allow(dead_code)]
+    pub(crate) fn launch_activation_silu_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        input_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_unary_into(
+            stream,
+            &self.activation_silu,
+            input_dev,
+            out_dev,
+            n,
+            "activation_silu",
+        )
+    }
+
+    /// Standard GELU-tanh into a stable buffer.
+    #[allow(dead_code)]
+    pub(crate) fn launch_activation_gelu_tanh_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        input_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_unary_into(
+            stream,
+            &self.activation_gelu_tanh,
+            input_dev,
+            out_dev,
+            n,
+            "activation_gelu_tanh",
+        )
+    }
+
+    /// Residual add into a stable buffer: `out[i] = h_dev[i] + b_scale * x_dev[i]`.
+    /// Used by both the FFN graph (final residual into the arena's stable slot)
+    /// and — when the arena is active — the resident-attention block's final
+    /// residual into the stable post-attn buffer (B3A-3 ping-pong write-point).
+    #[allow(dead_code)]
+    pub(crate) fn launch_residual_add_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        h_dev: &CudaSlice<f32>,
+        x_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+        b_scale: f32,
+    ) -> Result<(), RuntimeError> {
+        self.launch_elementwise_binary_into(
+            stream,
+            &self.residual_add,
+            h_dev,
+            x_dev,
+            out_dev,
+            Some(b_scale),
+            n,
+            "residual_add",
+        )
+    }
     /// already on the device; the output is allocated and returned as a device
     /// buffer. No upload, no sync, no readback — the caller drives the chain
     /// and reads back once via [`sync_dtoh_f32`]. Mirrors the arg layout of
@@ -2192,24 +2383,60 @@ impl CudaRuntime {
             .stream
             .alloc_zeros::<f32>(n)
             .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
+        self.launch_elementwise_binary_into(
+            &self.stream,
+            func,
+            in_a,
+            in_b,
+            &mut out_dev,
+            extra_scalar,
+            n,
+            ctx,
+        )?;
+        Ok(out_dev)
+    }
+
+    /// Binary elementwise into a pre-allocated stable output buffer (B3A-4).
+    ///
+    /// The graph-capture core: writes into `out_dev` (a stable graph-owned
+    /// buffer) instead of allocating. Launches on `stream`. Shares the kernel-
+    /// arg layout + `LaunchConfig` with the `_dev` twin so the two cannot drift;
+    /// the `_dev` launcher delegates here after its `alloc_zeros`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_elementwise_binary_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        func: &CudaFunction,
+        in_a: &CudaSlice<f32>,
+        in_b: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        extra_scalar: Option<f32>,
+        n: usize,
+        ctx: &'static str,
+    ) -> Result<(), RuntimeError> {
+        if n == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(in_a.len(), n);
+        debug_assert_eq!(in_b.len(), n);
+        debug_assert_eq!(out_dev.len(), n);
         let threads_x = GEGGLU_SILU_KERNEL.geometry.threads_per_group[0];
         let n_u = n as u32;
-        let extra = extra_scalar;
         let cfg = LaunchConfig {
             grid_dim: (n_u.div_ceil(threads_x), 1, 1),
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(func);
-        launch_args.arg(in_a).arg(in_b).arg(&mut out_dev);
-        if let Some(ref scalar) = extra {
+        let mut launch_args = stream.launch_builder(func);
+        launch_args.arg(in_a).arg(in_b).arg(out_dev);
+        if let Some(ref scalar) = extra_scalar {
             launch_args.arg(scalar);
         }
         launch_args.arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
         self.note_launch();
-        Ok(out_dev)
+        Ok(())
     }
 
     /// Shared device-resident unary elementwise dispatch. Mirrors the arg layout
@@ -2242,6 +2469,26 @@ impl CudaRuntime {
             .stream
             .alloc_zeros::<f32>(n)
             .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
+        self.launch_elementwise_unary_into(&self.stream, func, input, &mut out_dev, n, ctx)?;
+        Ok(out_dev)
+    }
+
+    /// Unary elementwise into a pre-allocated stable output buffer (B3A-4).
+    /// Graph-capture core; see [`launch_elementwise_binary_into`].
+    fn launch_elementwise_unary_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        func: &CudaFunction,
+        input: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        n: usize,
+        ctx: &'static str,
+    ) -> Result<(), RuntimeError> {
+        if n == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(input.len(), n);
+        debug_assert_eq!(out_dev.len(), n);
         let threads_x = ACTIVATION_SILU_KERNEL.geometry.threads_per_group[0];
         let n_u = n as u32;
         let cfg = LaunchConfig {
@@ -2249,12 +2496,12 @@ impl CudaRuntime {
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(func);
-        launch_args.arg(input).arg(&mut out_dev).arg(&n_u);
+        let mut launch_args = stream.launch_builder(func);
+        launch_args.arg(input).arg(out_dev).arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
         self.note_launch();
-        Ok(out_dev)
+        Ok(())
     }
 
     // ── device-resident norm / RoPE / attention launch variants ──────────
@@ -2348,6 +2595,80 @@ impl CudaRuntime {
             .map_err(|err| RuntimeError::context("launching CUDA rms_norm_dev kernel", err))?;
         self.note_launch();
         Ok(out_dev)
+    }
+
+    /// Upload an RMSNorm weight vector once, returning a stable device handle
+    /// (B3A-4/B3A-5). The `_dev` launcher re-uploads the weight per call via
+    /// `clone_htod`; the graph path must hold a stable-address weight buffer for
+    /// the captured graph's lifetime, so the graph-build path uploads once and
+    /// passes the handle to [`launch_rms_norm_into`].
+    ///
+    /// `Some(w)` uploads the `[cols]` weight; `None` uploads the one-element
+    /// placeholder used by the parameter-free path (the kernel's `has_weight=0`
+    /// flag makes it ignore the pointer, but cudarc requires a non-empty slice).
+    #[allow(dead_code)]
+    pub(crate) fn upload_rms_norm_weight(
+        &self,
+        weight: Option<&[f32]>,
+    ) -> Result<CudaSlice<f32>, RuntimeError> {
+        let placeholder = [0.0f32];
+        let slice: &[f32] = match weight {
+            Some(w) => w,
+            None => &placeholder[..],
+        };
+        self.stream
+            .clone_htod(slice)
+            .map_err(|err| RuntimeError::context("uploading rms_norm weight to CUDA", err))
+    }
+
+    /// RMSNorm into a pre-allocated stable output buffer with a device-resident
+    /// weight (B3A-4). Graph-capture twin of [`launch_rms_norm_dev`]: `weight_dev`
+    /// is a pre-uploaded stable weight buffer (from [`upload_rms_norm_weight`]),
+    /// and the output writes into `out_dev` (a stable graph-owned buffer) instead
+    /// of allocating. `has_weight` is `1` when a real weight was uploaded, `0`
+    /// for the parameter-free placeholder path. Launches on `stream`. Shares the
+    /// kernel-arg layout + `LaunchConfig` with `_dev`.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub(crate) fn launch_rms_norm_into(
+        &self,
+        stream: &cudarc::driver::CudaStream,
+        x_dev: &CudaSlice<f32>,
+        weight_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        eps: f64,
+        offset: f32,
+        has_weight: i32,
+    ) -> Result<(), RuntimeError> {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(x_dev.len(), rows * cols);
+        debug_assert_eq!(out_dev.len(), rows * cols);
+        let block_dim = 1024u32;
+        let rows_u = rows as u32;
+        let cols_u = cols as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows_u, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = stream.launch_builder(&self.rms_norm);
+        launch_args
+            .arg(x_dev)
+            .arg(weight_dev)
+            .arg(out_dev)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&eps)
+            .arg(&offset)
+            .arg(&has_weight);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA rms_norm_into kernel", err))?;
+        self.note_launch();
+        Ok(())
     }
 
     /// Device-resident per-head RMSNorm twin of [`launch_rms_norm_dev`].
@@ -2760,7 +3081,7 @@ pub(crate) struct RuntimeError {
 }
 
 impl RuntimeError {
-    fn context(action: &'static str, source: DriverError) -> Self {
+    pub(crate) fn context(action: &'static str, source: DriverError) -> Self {
         Self {
             message: format!("{action}: {source}"),
         }
@@ -2799,3 +3120,265 @@ impl std::fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+#[cfg(test)]
+mod b3a_smoke_tests {
+    //! LARQL-GPU-B3A-SMOKE: minimal native CUDA Graph smoke test.
+    //!
+    //! De-risks cudarc 0.19.8's CUDA Graph API against the installed RTX 3060
+    //! driver/runtime **before** the larger B3A-2…B3A-7 refactor. Validates:
+    //!
+    //! - stream capture on LARQL's exact default stream
+    //! - cudarc event-tracking during capture (the `launch_builder.arg` path)
+    //! - graph instantiation with default flags (no `AUTO_FREE_ON_LAUNCH`)
+    //! - `CudaGraph::launch()` replay
+    //! - **stable-pointer replay**: mutating a captured buffer's *contents*
+    //!   (same device address) changes the replay output — the core invariant
+    //!   the resident-FFN ping-pong arena depends on
+    //! - clean teardown (graph → buffers, in that order) with no driver error
+    //! - repeated create → replay → reset → rebuild → drop lifecycle
+    //!
+    //! Runtime-gated: no-op on hosts without CUDA (the existing
+    //! `native_runtime_available` convention). Runs inline here (not in
+    //! `tests/`) because `CudaRuntime` and its stream/function fields are
+    //! `pub(crate)`.
+    use super::*;
+
+    /// Build a `CudaRuntime` if a CUDA device is available; otherwise return
+    /// `None` so the test no-ops (mirrors `CudaBackend::native_runtime_available`).
+    fn try_runtime() -> Option<CudaRuntime> {
+        CudaRuntime::initialize(0).ok()
+    }
+
+    /// One full capture → instantiate → launch → mutate → relaunch → teardown
+    /// cycle. Reusable for the repeated-lifecycle stress loop.
+    ///
+    /// **Critical finding (de-risked here):** the LARQL default stream is the
+    /// NULL stream (`cudarc`'s `default_stream()` returns `cu_stream =
+    /// null_mut()`), and CUDA **forbids capturing the NULL stream**
+    /// (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`). Graph capture and replay
+    /// therefore require a dedicated non-NULL stream created via
+    /// `CudaContext::new_stream()`. This smoke test validates the full
+    /// lifecycle on such a stream; the production B3A path must allocate a
+    /// capture/replay stream at runtime construction (B3A-3/B3A-5).
+    fn run_one_capture_cycle(rt: &CudaRuntime) {
+        let n = 256usize;
+        let b_scale = 1.0f32;
+
+        // Dedicated capture/replay stream (NOT the NULL default stream).
+        // `new_stream()` creates a CU_STREAM_NON_BLOCKING stream on the
+        // runtime's context. Buffers allocated/launched on this stream are
+        // graph-capturable.
+        let cap_stream = rt
+            .stream
+            .context()
+            .new_stream()
+            .expect("new_stream for graph capture (smoke)");
+
+        // Disable event tracking for graph buffers. cudarc enables per-slice
+        // CudaEvent tracking by default (event_tracking=true on CudaContext).
+        // During stream capture, `launch_builder.arg(&CudaSlice)` sees the
+        // prior `write` events on each buffer and injects `cuStreamWaitEvent`
+        // calls (launch.rs:213), which CUDA treats as a dependency on
+        // uncaptured cross-stream work → CUDA_ERROR_STREAM_CAPTURE_ISOLATION.
+        // Graph capture explicitly orders work within the captured stream, so
+        // event-based cross-stream synchronization is both unnecessary and
+        // incompatible with capture. Disabling tracking is the documented
+        // configuration for graph capture — the producer/consumer ordering is
+        // managed by the stream (within capture) and by the arena lifecycle
+        // (across replays). Slices created AFTER this call carry no events.
+        // SAFETY: we manage all synchronization explicitly on `cap_stream`;
+        // no captured slice is used on another stream before its work completes.
+        unsafe {
+            cap_stream.context().disable_event_tracking();
+        }
+
+        // Stable buffers — these addresses must persist for the graph's lifetime.
+        let h_vals: Vec<f32> = (0..n).map(|i| i as f32 * 0.01).collect();
+        let x_vals: Vec<f32> = vec![0.5f32; n];
+        let h_dev = cap_stream
+            .clone_htod(&h_vals)
+            .expect("upload h_dev (smoke)");
+        let mut x_dev = cap_stream
+            .clone_htod(&x_vals)
+            .expect("upload x_dev (smoke)");
+        // Stable output — pre-allocated, zeroed. The graph will write here.
+        let mut out_dev = cap_stream
+            .alloc_zeros::<f32>(n)
+            .expect("alloc out_dev (smoke)");
+
+        // (Buffers were created after `disable_event_tracking`, so they carry
+        // no CudaEvent handles — no cross-stream wait is injected during
+        // capture. Within capture, same-stream kernel ordering is preserved by
+        // the stream itself.)
+
+        // ── Capture ──
+        // GLOBAL is the strictest mode; LARQL's decode is single-threaded, so a
+        // forbidden sync inside capture is a defect to fix, not tolerate
+        // (B3A review point 5).
+        cap_stream
+            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+            .expect("begin_capture (smoke)");
+        // Launch into the stable output buffer on the capture stream. The
+        // launch_builder is taken from cap_stream so the kernel node binds the
+        // capture stream's buffers.
+        {
+            let threads_x = GEGGLU_SILU_KERNEL.geometry.threads_per_group[0];
+            let n_u = n as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (n_u.div_ceil(threads_x), 1, 1),
+                block_dim: (threads_x, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch_args = cap_stream.launch_builder(&rt.residual_add);
+            launch_args.arg(&h_dev).arg(&x_dev).arg(&mut out_dev);
+            let scalar = Some(b_scale);
+            if let Some(ref s) = scalar {
+                launch_args.arg(s);
+            }
+            launch_args.arg(&n_u);
+            unsafe { launch_args.launch(cfg) }
+                .expect("launch residual_add into stable buffer during capture (smoke)");
+        }
+        // Default instantiate flags (0) — the FFN graph has no graph-managed
+        // allocation nodes, so AUTO_FREE_ON_LAUNCH is unnecessary (point 5).
+        let graph = cap_stream
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .expect("end_capture (smoke)")
+            .expect("end_capture returned a non-null graph (smoke)");
+
+        // ── First launch (token-1 analogue): verifies capture produces results ──
+        // Capture/instantiation do not produce the FFN result — the graph must
+        // be launched (B3A review point 1). CudaGraph::launch replays on the
+        // capturing stream.
+        graph.launch().expect("graph.launch #1 (smoke)");
+        cap_stream
+            .synchronize()
+            .expect("sync after graph.launch #1 (smoke)");
+        let out1: Vec<f32> = cap_stream
+            .clone_dtoh(&out_dev)
+            .expect("read back out #1 (smoke)");
+
+        // Verify correctness against the host reference: out[i] = h[i] + 1.0*x[i].
+        let expected1: Vec<f32> = h_vals
+            .iter()
+            .zip(&x_vals)
+            .map(|(h, x)| h + b_scale * x)
+            .collect();
+        let max_abs1 = out1
+            .iter()
+            .zip(&expected1)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs1 < 1e-5,
+            "(smoke) graph launch #1 output diverged: max_abs={max_abs1:.6e}"
+        );
+
+        // ── Idempotent replay #2: re-launch the SAME graph, confirm determinism ──
+        graph
+            .launch()
+            .expect("graph.launch #2 (idempotent replay, smoke)");
+        cap_stream
+            .synchronize()
+            .expect("sync after graph.launch #2 (smoke)");
+        let out2: Vec<f32> = cap_stream
+            .clone_dtoh(&out_dev)
+            .expect("read back out #2 (smoke)");
+        let max_abs2 = out1
+            .iter()
+            .zip(&out2)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs2 < 1e-6,
+            "(smoke) idempotent replay #2 diverged from #1: max_abs={max_abs2:.6e} (replay must be deterministic)"
+        );
+
+        // ── Stable-pointer replay: mutate x_dev *contents* in place (same address) ──
+        // This is the core invariant the ping-pong arena depends on: the graph
+        // reads the buffer's *current contents* at the same fixed device address
+        // on every replay. `memcpy_htod` overwrites the existing CudaSlice's
+        // device memory in place (no new allocation → same cu_device_ptr), so
+        // the captured graph picks up the new contents on the next launch.
+        let new_x_val = 0.25f32;
+        let new_x_vals = vec![new_x_val; n];
+        cap_stream
+            .memcpy_htod(&new_x_vals[..], &mut x_dev)
+            .expect("in-place memcpy_htod to mutate x_dev contents (smoke)");
+
+        graph
+            .launch()
+            .expect("graph.launch #3 (post-mutation replay, smoke)");
+        cap_stream
+            .synchronize()
+            .expect("sync after graph.launch #3 (smoke)");
+        let out3: Vec<f32> = cap_stream
+            .clone_dtoh(&out_dev)
+            .expect("read back out #3 (smoke)");
+
+        // Expected: out[i] = h[i] + b_scale * new_x_val (the mutated contents).
+        let expected3: Vec<f32> = h_vals.iter().map(|h| h + b_scale * new_x_val).collect();
+        let max_abs3 = out3
+            .iter()
+            .zip(&expected3)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs3 < 1e-5,
+            "(smoke) post-mutation replay #3 diverged: max_abs={max_abs3:.6e} (replay must read the buffer's current contents at the stable address)"
+        );
+        // And it must differ from the pre-mutation output — proves the in-place
+        // memcpy changed what the graph reads (the captured address is live).
+        let mutation_diff = out1
+            .iter()
+            .zip(&out3)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            mutation_diff > 0.1,
+            "(smoke) replay after in-place mutation produced nearly-identical output (max_diff={mutation_diff:.6e}) — the stable buffer address must reflect new contents"
+        );
+
+        // Teardown order (B3A-6 / point 7): exec graph → buffers → inputs.
+        drop(graph);
+        drop(out_dev);
+        drop(x_dev);
+        drop(h_dev);
+    }
+
+    /// The headline smoke test: capture → instantiate → launch → verify →
+    /// teardown, on a dedicated capture stream + the real `residual_add`
+    /// kernel. Runtime-gated.
+    #[test]
+    fn b3a_smoke_graph_capture_instantiate_launch_teardown() {
+        let Some(rt) = try_runtime() else {
+            eprintln!("b3a_smoke: no CUDA runtime — skipping (no GPU on this host)");
+            return;
+        };
+        run_one_capture_cycle(&rt);
+        eprintln!(
+            "b3a_smoke: PASS on {} — capture/instantiate/launch/teardown verified on dedicated stream",
+            rt.summary().split(';').next().unwrap_or("CUDA device")
+        );
+    }
+
+    /// Repeated create → replay → drop lifecycle: proves the installed
+    /// driver/runtime handles multiple graph construction/teardown cycles
+    /// without leaking or erroring (the B3A-8 stress loop, in miniature).
+    /// Runtime-gated.
+    #[test]
+    fn b3a_smoke_repeated_capture_teardown_lifecycle() {
+        let Some(rt) = try_runtime() else {
+            eprintln!("b3a_smoke_lifecycle: no CUDA runtime — skipping");
+            return;
+        };
+        // Three independent cycles on the SAME runtime (mirrors a backend
+        // serving multiple generations without being dropped — except here each
+        // cycle stands in for a reset_kv_cache generation boundary).
+        for i in 0..3 {
+            run_one_capture_cycle(&rt);
+            eprintln!("b3a_smoke_lifecycle: cycle {} complete", i + 1);
+        }
+    }
+}

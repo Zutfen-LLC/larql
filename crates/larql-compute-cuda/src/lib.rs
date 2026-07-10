@@ -14,6 +14,8 @@ pub mod async_compute_backend_impl;
 pub mod backend;
 pub mod buffers;
 pub mod decode;
+pub mod ffn_graph;
+pub mod ffn_graph_state;
 pub mod kernels;
 pub mod kv_cache;
 pub mod kv_dispatch_impl;
@@ -5579,5 +5581,206 @@ mod tests {
             num_layers as u64,
             "ineligible mixed-Q4_K_M fallbacks must equal num_layers: {rh_diag}"
         );
+    }
+
+    // ── B3A-8: CUDA Graph replay tests ──────────────────────────────────
+    //
+    // These tests verify the graph build/replay counters, reset/rebuild
+    // lifecycle, and that graph-mode-disabled behaves identically to the
+    // pre-B3A path. They require `LARQL_CUDA_GRAPHS=1` to exercise the graph
+    // path; without it (the default), the graph diag is absent and these
+    // assertions verify the disabled contract instead.
+
+    /// B3A-8: a single-token decode through the Q4_K_M fixture with graph mode
+    /// enabled produces exact graph counters: builds == num_layers (one per
+    /// eligible layer), submissions == num_layers (token 1 launches), and the
+    /// graph diag is present.
+    #[test]
+    fn graph_q4km_single_token_build_and_launch_counts() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        if !crate::ffn_graph::graph_mode_from_env().enabled() {
+            eprintln!(
+                "graph_q4km_counts: LARQL_CUDA_GRAPHS not set — skipping graph counter assertions"
+            );
+            return;
+        }
+        let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, _seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let _ = b.decode_token(&layers, &x_dec, hidden, inter);
+
+        let g_diag = b
+            .graph_diag()
+            .expect("graph diag must be present after a graph-mode decode");
+        eprintln!("graph diag: {g_diag}");
+        // Token 1: builds == num_layers (one graph per eligible layer).
+        assert_eq!(
+            parse_diag_count(&g_diag, "builds="),
+            num_layers as u64,
+            "graph builds must equal num_layers on token 1: {g_diag}"
+        );
+        // Token 1: submissions == num_layers (each graph launched once).
+        assert_eq!(
+            parse_diag_count(&g_diag, "submissions="),
+            num_layers as u64,
+            "graph submissions must equal num_layers on token 1: {g_diag}"
+        );
+        // No failures or fallbacks on the happy path.
+        assert_eq!(
+            parse_diag_count(&g_diag, "failures="),
+            0,
+            "graph failures must be zero on the happy path: {g_diag}"
+        );
+        assert_eq!(
+            parse_diag_count(&g_diag, "fallbacks="),
+            0,
+            "graph fallbacks must be zero on the happy path: {g_diag}"
+        );
+    }
+
+    /// B3A-8: multi-token decode with graph mode produces
+    /// submissions == num_layers * n_tokens and replays (submissions - builds)
+    /// grow with tokens. Token 2+ must NOT rebuild (builds stays at num_layers).
+    #[test]
+    fn graph_q4km_multi_token_replay_no_rebuild() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        if !crate::ffn_graph::graph_mode_from_env().enabled() {
+            eprintln!("graph_multi_token: LARQL_CUDA_GRAPHS not set — skipping");
+            return;
+        }
+        let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, _seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+
+        let n_tokens = 4usize;
+        for t in 0..n_tokens {
+            let next_tok = resident_kv_first_decode_tok() + t as u32;
+            let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+            let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+            let _ = b.decode_token(&layers, &x_dec, hidden, inter);
+        }
+
+        let g_diag = b
+            .graph_diag()
+            .expect("graph diag must be present after multi-token graph decode");
+        eprintln!("graph diag ({} tokens): {g_diag}", n_tokens);
+        // builds stays at num_layers (built once on token 1, not rebuilt).
+        assert_eq!(
+            parse_diag_count(&g_diag, "builds="),
+            num_layers as u64,
+            "graph builds must equal num_layers (no rebuild on tokens 2+): {g_diag}"
+        );
+        // submissions == num_layers * n_tokens (every token replays).
+        assert_eq!(
+            parse_diag_count(&g_diag, "submissions="),
+            (num_layers * n_tokens) as u64,
+            "graph submissions must equal num_layers * n_tokens: {g_diag}"
+        );
+        // replays (warm) = submissions - builds.
+        let replays = parse_diag_count(&g_diag, "replays=");
+        assert_eq!(
+            replays,
+            (num_layers * (n_tokens - 1)) as u64,
+            "graph replays must equal num_layers * (n_tokens - 1): {g_diag}"
+        );
+    }
+
+    /// B3A-8: after reset_kv_cache, a new generation rebuilds the graphs (the
+    /// generation advances, stale graphs are destroyed, and the first decode
+    /// token of the new generation builds fresh). This proves the generation-
+    /// scoped cache invalidation works.
+    #[test]
+    fn graph_q4km_reset_rebuilds_on_new_generation() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        if !crate::ffn_graph::graph_mode_from_env().enabled() {
+            eprintln!("graph_reset: LARQL_CUDA_GRAPHS not set — skipping");
+            return;
+        }
+        let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, _seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+
+        // Generation 1: one decode token (builds num_layers graphs).
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let _ = b.decode_token(&layers, &x_dec, hidden, inter);
+        let g1 = b.graph_diag().expect("graph diag after gen 1");
+        assert_eq!(parse_diag_count(&g1, "builds="), num_layers as u64);
+
+        // Reset (new generation): graphs destroyed, generation advanced.
+        b.reset_kv_cache();
+
+        // Generation 2: rebuild (builds must increase to 2 * num_layers).
+        let (_weights2, index2, _seq_len2, _hidden2, _inter2, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers2 = build_layers(&weights, &index2);
+        let h_tok2 = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec2: Vec<f32> = h_tok2.row(0).to_vec();
+        let _ = b.decode_token(&layers2, &x_dec2, hidden, inter);
+        let g2 = b.graph_diag().expect("graph diag after gen 2");
+        eprintln!("graph diag after reset+rebuild: {g2}");
+        // Cumulative builds now 2 * num_layers (rebuilt on the new generation).
+        assert_eq!(
+            parse_diag_count(&g2, "builds="),
+            (num_layers * 2) as u64,
+            "graph must rebuild after reset (2 * num_layers cumulative builds): {g2}"
+        );
+    }
+
+    /// B3A-8: with graph mode DISABLED (LARQL_CUDA_GRAPHS=0 or unset), the
+    /// graph diag is absent and the decode path behaves exactly as before B3A
+    /// (resident-hidden 100%, zero graph activity). This is the always-runs
+    /// contract test — it pins the disabled-mode behaviour.
+    #[test]
+    fn graph_disabled_produces_no_graph_activity() {
+        // This test always runs regardless of LARQL_CUDA_GRAPHS. When graphs
+        // are enabled it no-ops (covered by the graph_* tests above); when
+        // disabled it verifies the graph diag is absent.
+        if crate::ffn_graph::graph_mode_from_env().enabled() {
+            eprintln!("graph_disabled: LARQL_CUDA_GRAPHS=1 — skipping disabled-mode assertion");
+            return;
+        }
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, _seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let _ = b.decode_token(&layers, &x_dec, hidden, inter);
+
+        // Graph diag must be absent (no graph activity when disabled).
+        assert!(
+            b.graph_diag().is_none(),
+            "graph diag must be absent when graph mode is disabled"
+        );
+        // But resident-hidden must still be 100% active.
+        let rh = b.resident_hidden_diag().expect("resident-hidden diag");
+        assert_eq!(parse_diag_count(&rh, "fallbacks="), 0);
     }
 }

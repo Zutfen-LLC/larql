@@ -202,15 +202,31 @@ Ordered by expected wall-clock impact; re-rank against the A4 profile.
   all green; release-mode D6 green. RTX 3060 validation is final per the
   verification policy — no RTX 3090 rerun required. See
   bench/baselines/cuda-q4km-resident-hidden-2026-07-10.md.
-- B3. **Launch batching / graphization** (1-2 sessions, optional until A4 says
-  launch overhead matters). Collapse per-op `launch → stream` calls into
-  fewer submissions (CUDA Graphs via cudarc if exposed, else simple
-  multi-launch batching before the single sync). Mirrors Metal's
-  single-command-buffer `decode/mod.rs` shape.
-  <!-- LARQL-GPU-PROFILE-001 (2026-07-10, RTX 3060): measured 571 launches/tok
-       on Q4_K_M (resident-hidden OFF). Launch latency not directly measured
-       (no Nsight); inferred reducible cost is medium-confidence. Rank #2 after
-       D6. See bench/baselines/cuda-post-residency-profile-2026-07-10.md. -->
+- B3A. **Launch batching / graphization — FFN graph replay** (IMPLEMENTED,
+  opt-in). The resident decode FFN chain is captured into a `CudaGraph` per
+  eligible layer and replayed (one `graph.launch()` replacing 7 individual
+  host launches). cudarc 0.19.8's safe Graph API is used directly (no upgrade,
+  no wrapper). **Result: 36.6% host submission reduction (599→380/tok), but
+  no wall-clock improvement (−0.18%, within noise) due to the cross-stream
+  sync overhead (2 synchronize/layer = 72/token). Stays opt-in
+  (`LARQL_CUDA_GRAPHS=1`, default Disabled) per the performance gate.**
+  204/204 tests pass in both modes. See
+  bench/baselines/cuda-resident-ffn-graph-2026-07-10.md.
+  <!-- LARQL-GPU-B3A (2026-07-10, RTX 3060): structural gate met (36.6% ≥ 25%),
+       wall-clock gate not met (-0.18% < 1%). Two critical findings: the NULL
+       default stream cannot be captured (STREAM_CAPTURE_UNSUPPORTED), and
+       cudarc's event tracking must be disabled for graph buffers
+       (STREAM_CAPTURE_ISOLATION). B3B (attention graphization or event-based
+       cross-stream sync) is the path to the ≥1% wall-clock gate. -->
+- B3B. **Attention graphization / event-based sync** (1 session, follow-on to
+  B3A). Either graph the dynamic attention chain (harder — dynamic total_len +
+  KV cursor state) or replace the B3A explicit `synchronize()` cross-stream
+  sync with `CudaEvent` record/wait pairs (avoids the pipeline stall that
+  offset B3A's launch savings). Target: ≥1% wall-clock improvement.
+- B4. **lm-head on device** (1 session). Revisit the Session 8b decision that
+  gated `f32_gemv`/`topk1` off the native path: with the weight cache (the
+  re-upload concern is gone) land a fused GEMV+argmax (`f16_gemv_topk1`)
+  kernel so greedy decode never reads back the full logits row.
 - B4. **lm-head on device** (1 session). Revisit the Session 8b decision that
   gated `f32_gemv`/`topk1` off the native path: with the weight cache (the
   re-upload concern is gone) land a fused GEMV+argmax (`f16_gemv_topk1`)

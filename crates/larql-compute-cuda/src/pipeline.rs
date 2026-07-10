@@ -44,7 +44,7 @@ use larql_compute::residual::{
     layer_norm_eps, rms_norm_eps, rms_norm_heads, rms_norm_heads_no_weight,
 };
 use larql_compute::{
-    Activation, DecodeStateDump, FullPipelineLayer, NormType, QuantFormat, QuantMatVec,
+    Activation, DecodeStateDump, FfnType, FullPipelineLayer, NormType, QuantFormat, QuantMatVec,
     StateDumpMask,
 };
 use larql_models::quant::ggml::Q4_K_BLOCK_ELEMS;
@@ -427,13 +427,31 @@ impl CudaBackend {
                     }
 
                     // FFN chain consumes the device-resident post-attn state.
-                    if let Some(h_post_ffn_dev) = self.host_ffn_block_device_resident(
+                    // B3A-5: try the CUDA-Graph replay path first (opt-in via
+                    // LARQL_CUDA_GRAPHS=1). On `None` (disabled / ineligible /
+                    // build-or-replay failure), fall back to the existing
+                    // resident device FFN chain — never directly to CPU.
+                    let h_post_ffn_dev_opt = self.host_ffn_block_device_resident_graph(
                         runtime,
                         layer,
                         &h_post_attn_dev,
                         hidden,
                         inter,
-                    ) {
+                        li,
+                        layers.len(),
+                    );
+                    let h_post_ffn_dev_opt = if h_post_ffn_dev_opt.is_some() {
+                        h_post_ffn_dev_opt
+                    } else {
+                        self.host_ffn_block_device_resident(
+                            runtime,
+                            layer,
+                            &h_post_attn_dev,
+                            hidden,
+                            inter,
+                        )
+                    };
+                    if let Some(h_post_ffn_dev) = h_post_ffn_dev_opt {
                         // Per-layer scalar (Gemma 4). Skip 0.0 (absent) and
                         // 1.0 (identity). When present and non-identity
                         // (rare), apply on host: read back the device post-FFN
@@ -2648,6 +2666,442 @@ impl CudaBackend {
         Some(h_post_ffn_dev)
     }
 
+    /// B3A-5: try the CUDA-Graph replay path for this layer's resident FFN.
+    ///
+    /// On the first decode token of a generation: captures the 7-kernel FFN
+    /// chain into a `CudaGraph` on the arena's dedicated capture stream, then
+    /// **launches it** (token 1 must execute the graph after construction —
+    /// review point 1). On subsequent tokens: replays the existing executable
+    /// (one `graph.launch()` submission replaces 7 individual host launches).
+    /// Returns the post-FFN device-resident hidden state.
+    ///
+    /// **Cross-stream handoff**: attention ran on `runtime.stream` (the NULL
+    /// stream), producing `h_post_attn_dev`. The graph replays on the arena's
+    /// `cap_stream`. The handoff is: copy `h_post_attn_dev` into the arena's
+    /// stable input buffer (D2D, on the runtime stream) → `cap_stream` waits →
+    /// graph replay → runtime stream waits → copy the arena output out (D2D).
+    /// Each D2D is counted in `d2d_submissions` for honest accounting.
+    ///
+    /// **Fallback** (review point 10): any build/replay failure falls back to
+    /// [`host_ffn_block_device_resident`] (the existing resident device chain)
+    /// for this layer — never to CPU, never re-running attention or
+    /// double-appending KV. Returns `None` only when the graph path is disabled
+    /// or ineligible (so the caller proceeds exactly as before).
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
+    fn host_ffn_block_device_resident_graph(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn_dev: &CudaSlice<f32>,
+        hidden: usize,
+        inter: usize,
+        li: usize,
+        num_layers: usize,
+    ) -> Option<CudaSlice<f32>> {
+        // Gate 1: graph mode must be enabled (per-backend field, not env).
+        if !self.graph_mode().enabled() {
+            return None;
+        }
+        // Gate 2: plan eligibility (reuse the existing checks so the graph path
+        // is a strict subset of the resident path — they can't diverge).
+        if h_post_attn_dev.len() != hidden {
+            return None;
+        }
+        if !Self::native_activation_worthwhile(inter) {
+            return None;
+        }
+        let gate_fmt = layer.gate.format;
+        let up_fmt = layer.up.format;
+        let down_fmt = layer.down.format;
+        if !supported_resident_ffn_triple(gate_fmt, up_fmt, down_fmt) {
+            return None;
+        }
+        let stored_cols = down_stored_cols(layer, hidden, inter)?;
+        if stored_cols != inter || layer.norm_type != NormType::RmsNorm {
+            return None;
+        }
+
+        // ── Ensure the arena is allocated for this generation ──
+        let gen = {
+            let cache = self.graph_cache.lock().ok()?;
+            cache.generation
+        };
+        {
+            let mut arena_guard = self.arena.lock().ok()?;
+            let need_alloc = arena_guard
+                .as_ref()
+                .map(|a| a.generation != gen)
+                .unwrap_or(true);
+            if need_alloc {
+                let arena =
+                    crate::ffn_graph_state::ResidentDecodeArena::new(runtime, hidden, gen).ok()?;
+                *arena_guard = Some(arena);
+            }
+        }
+        // Ensure the graph cache has a slot for this layer.
+        {
+            let mut cache = self.graph_cache.lock().ok()?;
+            cache.ensure_capacity(num_layers);
+        }
+
+        // ── Replay path (token 2+) ──
+        let already_built = {
+            let cache = self.graph_cache.lock().ok()?;
+            cache.get(li).is_some()
+        };
+        if already_built {
+            return self.replay_ffn_graph(runtime, layer, h_post_attn_dev, hidden, li);
+        }
+
+        // ── Build path (token 1) ──
+        self.build_and_launch_ffn_graph(runtime, layer, h_post_attn_dev, hidden, inter, li, gen)
+    }
+
+    /// Replay an already-built FFN graph for one layer (B3A-5, token 2+).
+    fn replay_ffn_graph(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        _layer: &FullPipelineLayer<'_>,
+        h_post_attn_dev: &CudaSlice<f32>,
+        hidden: usize,
+        li: usize,
+    ) -> Option<CudaSlice<f32>> {
+        let mut arena_guard = self.arena.lock().ok()?;
+        let arena = arena_guard.as_mut()?;
+        let flip = li % 2 == 1;
+        let cap_stream = arena.cap_stream.clone();
+
+        // The post-attn state was produced on the runtime stream; sync before
+        // cap_stream reads it.
+        runtime.stream().synchronize().ok()?;
+        // Seed the arena input buffer from h_post_attn_dev (D2D on cap_stream).
+        cap_stream
+            .memcpy_dtod(h_post_attn_dev, arena.input_mut(flip))
+            .ok()?;
+        self.note_graph_d2d();
+        let _ = hidden;
+
+        // Replay (one submission replaces 7 host launches).
+        let replay_result = {
+            let cache = self.graph_cache.lock().ok()?;
+            let graph = cache.get(li)?;
+            graph.replay()
+        };
+        match replay_result {
+            Ok(()) => {
+                self.note_graph_submission();
+                // The graph wrote into the arena output on cap_stream. Sync
+                // before the runtime stream reads it.
+                cap_stream.synchronize().ok()?;
+                let out = runtime.stream().clone_dtod(arena.output(flip)).ok()?;
+                self.note_graph_d2d();
+                drop(arena_guard);
+                Some(out)
+            }
+            Err(_) => {
+                self.note_graph_fallback();
+                None // caller falls back to host_ffn_block_device_resident
+            }
+        }
+    }
+
+    /// Build (capture) the FFN graph for one layer and launch it for token 1
+    /// (B3A-5, review point 1).
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
+    fn build_and_launch_ffn_graph(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        layer: &FullPipelineLayer<'_>,
+        h_post_attn_dev: &CudaSlice<f32>,
+        hidden: usize,
+        inter: usize,
+        li: usize,
+        gen: crate::ffn_graph::GraphGenerationId,
+    ) -> Option<CudaSlice<f32>> {
+        let gate_fmt = layer.gate.format;
+        let up_fmt = layer.up.format;
+        let down_fmt = layer.down.format;
+
+        // ── Warm the weight cache so captured nodes bind stable addresses ──
+        let gate_w = self
+            .resolve_weight_by_fmt(runtime, gate_fmt, layer.gate.data)
+            .ok()?;
+        let up_w = self
+            .resolve_weight_by_fmt(runtime, up_fmt, layer.up.data)
+            .ok()?;
+        let down_w = self
+            .resolve_weight_by_fmt(runtime, down_fmt, layer.down.data)
+            .ok()?;
+
+        // ── Upload norm weights once (stable device addresses) ──
+        let pre_norm_slice = if layer.has_post_norms {
+            layer.pre_ffn_norm
+        } else {
+            Some(layer.post_attn_norm)
+        };
+        let pre_norm_dev = runtime.upload_rms_norm_weight(pre_norm_slice).ok()?;
+        let post_norm_dev = if layer.has_post_norms {
+            Some(runtime.upload_rms_norm_weight(layer.post_ffn_norm).ok()?)
+        } else {
+            None
+        };
+
+        let mut arena_guard = self.arena.lock().ok()?;
+        let arena = arena_guard.as_mut()?;
+        let cap_stream = arena.cap_stream.clone();
+        let flip = li % 2 == 1;
+
+        // ── Allocate scratch buffers on cap_stream (event tracking disabled) ──
+        let mut normed_input = cap_stream.alloc_zeros::<f32>(hidden).ok()?;
+        let mut gate_out = cap_stream.alloc_zeros::<f32>(inter).ok()?;
+        let mut up_out = cap_stream.alloc_zeros::<f32>(inter).ok()?;
+        let mut act = cap_stream.alloc_zeros::<f32>(inter).ok()?;
+        let mut down_out = cap_stream.alloc_zeros::<f32>(hidden).ok()?;
+        let mut post_norm_out = if layer.has_post_norms {
+            Some(cap_stream.alloc_zeros::<f32>(hidden).ok()?)
+        } else {
+            None
+        };
+
+        // Seed the arena input buffer from h_post_attn_dev (D2D on cap_stream).
+        runtime.stream().synchronize().ok()?;
+        cap_stream
+            .memcpy_dtod(h_post_attn_dev, arena.input_mut(flip))
+            .ok()?;
+        self.note_graph_d2d();
+        // Sync cap_stream before capture (drain the seed copy + ensure the
+        // input is visible).
+        cap_stream.synchronize().ok()?;
+
+        let (input_buf, output_buf_slot) = arena.input_output_mut(flip);
+
+        // ── Capture ──
+        // GLOBAL: the strictest mode. A forbidden sync inside capture is a
+        // defect (review point 5), not something to tolerate via RELAXED.
+        cap_stream
+            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+            .ok()?;
+
+        // The 7 *_into launches, each writing into a stable scratch/output
+        // buffer. These are the exact same kernel-arg layouts the _dev path
+        // uses (validated by B3A-4's 200 passing parity tests).
+        let eps = layer.eps as f64;
+        let offset = layer.norm_offset;
+        let res_mult = layer.residual_multiplier;
+        let capture_ok = (|| {
+            // 1. Pre-FFN RMSNorm → normed_input.
+            runtime.launch_rms_norm_into(
+                &cap_stream,
+                input_buf,
+                &pre_norm_dev,
+                &mut normed_input,
+                1,
+                hidden,
+                eps,
+                offset,
+                if pre_norm_slice.is_some() { 1 } else { 0 },
+            )?;
+            // 2. Gate matvec → gate_out.
+            match gate_fmt {
+                QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
+                    &cap_stream,
+                    &gate_w,
+                    &normed_input,
+                    &mut gate_out,
+                    inter,
+                    hidden,
+                )?,
+                QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
+                    &cap_stream,
+                    &gate_w,
+                    &normed_input,
+                    &mut gate_out,
+                    inter,
+                    hidden,
+                )?,
+                _ => unreachable!("gate fmt checked above"),
+            }
+            // 3. Up matvec → up_out.
+            match up_fmt {
+                QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
+                    &cap_stream,
+                    &up_w,
+                    &normed_input,
+                    &mut up_out,
+                    inter,
+                    hidden,
+                )?,
+                QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
+                    &cap_stream,
+                    &up_w,
+                    &normed_input,
+                    &mut up_out,
+                    inter,
+                    hidden,
+                )?,
+                _ => unreachable!("up fmt checked above"),
+            }
+            // 4. Activation → act.
+            match (layer.ffn_type, layer.activation) {
+                (FfnType::Gated, Activation::Silu) => runtime.launch_geglu_silu_into(
+                    &cap_stream,
+                    &gate_out,
+                    &up_out,
+                    &mut act,
+                    inter,
+                )?,
+                (FfnType::Gated, Activation::GeluTanh) => runtime.launch_geglu_gelu_tanh_into(
+                    &cap_stream,
+                    &gate_out,
+                    &up_out,
+                    &mut act,
+                    inter,
+                )?,
+                (FfnType::Standard, Activation::Silu) => {
+                    runtime.launch_activation_silu_into(&cap_stream, &up_out, &mut act, inter)?
+                }
+                (FfnType::Standard, Activation::GeluTanh) => runtime
+                    .launch_activation_gelu_tanh_into(&cap_stream, &up_out, &mut act, inter)?,
+                _ => unreachable!("activation checked by plan_graph_eligible"),
+            }
+            // 5. Down matvec → down_out.
+            match down_fmt {
+                QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
+                    &cap_stream,
+                    &down_w,
+                    &act,
+                    &mut down_out,
+                    hidden,
+                    inter,
+                )?,
+                QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
+                    &cap_stream,
+                    &down_w,
+                    &act,
+                    &mut down_out,
+                    hidden,
+                    inter,
+                )?,
+                _ => unreachable!("down fmt checked above"),
+            }
+            // 6. Optional post-FFN RMSNorm → post_norm_out.
+            // 7. Residual add → output_buf.
+            if layer.has_post_norms {
+                let pno = post_norm_out.as_mut().unwrap();
+                runtime.launch_rms_norm_into(
+                    &cap_stream,
+                    &down_out,
+                    post_norm_dev.as_ref().unwrap(),
+                    pno,
+                    1,
+                    hidden,
+                    eps,
+                    offset,
+                    if layer.post_ffn_norm.is_some() { 1 } else { 0 },
+                )?;
+                runtime.launch_residual_add_into(
+                    &cap_stream,
+                    input_buf,
+                    pno,
+                    output_buf_slot,
+                    hidden,
+                    res_mult,
+                )
+            } else {
+                runtime.launch_residual_add_into(
+                    &cap_stream,
+                    input_buf,
+                    &down_out,
+                    output_buf_slot,
+                    hidden,
+                    res_mult,
+                )
+            }
+        })();
+
+        // The mutable borrows of the arena (input_buf, output_buf_slot) end
+        // here at the close of the closure scope. The graph captured the
+        // device addresses; the Rust handles are no longer needed.
+
+        let graph = match cap_stream.end_capture(
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        ) {
+            Ok(Some(g)) => g,
+            _ => {
+                self.note_graph_failure();
+                return None;
+            }
+        };
+        if capture_ok.is_err() {
+            self.note_graph_failure();
+            return None;
+        }
+        let _ = graph.upload(); // pre-stage the first launch
+
+        // ── Token 1: launch the just-built graph (review point 1) ──
+        let entry = crate::ffn_graph_state::ResidentFfnGraph {
+            graph: Some(graph),
+            scratch: Some(crate::ffn_graph_state::ResidentFfnGraphScratch {
+                normed_input,
+                gate_out,
+                up_out,
+                act,
+                down_out,
+                post_norm_out,
+            }),
+            weights: Some(crate::ffn_graph_state::RetainedWeights {
+                gate: gate_w,
+                up: up_w,
+                down: down_w,
+                pre_norm_weight: pre_norm_dev,
+                post_norm_weight: post_norm_dev,
+            }),
+        };
+        match entry.replay() {
+            Ok(()) => {
+                // Counters: build + submission + captured nodes + logical exec.
+                self.note_graph_build();
+                self.note_graph_submission();
+                let node_count = resident_ffn_node_count(layer.has_post_norms);
+                self.note_graph_captured_nodes(node_count);
+                self.note_graph_logical_exec(node_count);
+                // Sync cap_stream before reading the output on the runtime stream.
+                cap_stream.synchronize().ok()?;
+                let out = runtime.stream().clone_dtod(arena.output(flip)).ok()?;
+                self.note_graph_d2d();
+                // Store the entry for future replays (only if gen unchanged).
+                if let Ok(mut cache) = self.graph_cache.lock() {
+                    if cache.generation == gen && li < cache.layers.len() {
+                        cache.layers[li] = Some(entry);
+                    }
+                }
+                Some(out)
+            }
+            Err(_) => {
+                self.note_graph_failure();
+                None
+            }
+        }
+    }
+
+    /// Resolve a quant weight through the cache by format (B3A-5 helper).
+    fn resolve_weight_by_fmt(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        fmt: QuantFormat,
+        data: &[u8],
+    ) -> Result<std::sync::Arc<CudaSlice<u8>>, crate::backend::RuntimeError> {
+        match fmt {
+            QuantFormat::Q4_K => runtime.resolve_q4k_weight(data),
+            QuantFormat::Q6_K => runtime.resolve_q6k_weight(data),
+            _ => Err(crate::backend::RuntimeError::usage(format!(
+                "resolve_weight_by_fmt: unsupported format {fmt:?}"
+            ))),
+        }
+    }
+
     /// Hybrid-MoE FFN block for a single decode token (Gemma 4 26B-A4B
     /// shape). Runs the dense slab via the existing [`host_ffn_block`]
     /// (native quant matvec projections + host elementwise + post-FFN
@@ -3952,6 +4406,19 @@ fn supported_resident_ffn_triple(gate: QuantFormat, up: QuantFormat, down: Quant
             | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
             | (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q6_K)
     )
+}
+
+/// Number of physical kernel nodes in a captured resident-FFN graph (B3A-5).
+/// The chain is: pre-norm + gate + up + activation + down + residual = 6, plus
+/// a post-ffn norm (+1) when `has_post_norms`. Used by the capture-aware
+/// profiling counters (`captured_kernel_nodes` at build,
+/// `logical_graph_kernel_executions` at replay).
+fn resident_ffn_node_count(has_post_norms: bool) -> u32 {
+    if has_post_norms {
+        7
+    } else {
+        6
+    }
 }
 
 #[cfg(test)]
