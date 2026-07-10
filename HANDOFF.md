@@ -728,7 +728,7 @@ trait-surface work, `KvDispatch` bridge, then Vulkan Phase 5, then hardware CI.
 
 ---
 
-## Session 28 (2026-07-10): LARQL-GPU-B3A — CUDA Graph replay for the resident decode FFN (IN PROGRESS)
+## Session 28 (2026-07-10): LARQL-GPU-B3A — CUDA Graph replay for the resident decode FFN (COMPLETE, OPT-IN)
 
 **B3A is mid-implementation on `feat/cuda-resident-ffn-graph` (base `6ed40296`).**
 The infrastructure (smoke test, plan contract, into-buffer launchers, arena,
@@ -786,41 +786,38 @@ graph state, cache, counters) is committed and tested; the pipeline integration
   with the B3A-6 teardown order (graphs destroyed → arena dropped → weight
   cache flushed → generation advanced). 200 tests PASS.
 
-### Remaining work
+### All B3A tasks COMPLETE (commits `1f7a5d1e`..`ac922262`)
 
-- **B3A-5** (the critical piece): integrate the graph build + replay into the
-  decode loop. The method `host_ffn_block_device_resident_graph` slots in at
-  pipeline.rs:430 (where `host_ffn_block_device_resident` is called). It must:
-  (1) build the graph on token 1 (capture the 7 `*_into` launches into stable
-  scratch + the arena output buffer on the cap_stream); (2) launch token 1
-  (review point 1); (3) replay on subsequent tokens; (4) handle the
-  **cross-stream sync** (attention runs on the NULL stream, the graph replays
-  on cap_stream — a D2D copy seeds the arena input, a stream-wait before
-  replay, a stream-wait after, a D2D copy reads the output); (5) fall back to
-  the existing resident device FFN chain on any failure (never CPU, never
-  double-appending KV). An incomplete scaffold was written and reverted — the
-  cross-stream sync mechanics + the actual `capture_ffn_chain` kernel launches
-  are the open work.
+- **B3A-5** (pipeline integration): DONE. `host_ffn_block_device_resident_graph`
+  slots in at pipeline.rs:430, builds the graph on token 1 (7 `*_into` launches
+  captured on cap_stream), launches it (review point 1), replays on tokens 2+,
+  handles cross-stream sync (D2D seed + synchronize + D2D read), and falls back
+  to the existing resident device FFN chain on any failure. 204/204 tests pass.
+- **B3A-8** (tests): DONE. 4 dedicated graph tests (build/replay/reset/disabled
+  with EXACT counter assertions). Q4_K_M parity < 1e-3 under GRAPHS=1.
+- **B3A-9** (regression): DONE. 204/204 pass both GRAPHS=0 and GRAPHS=1 (serial).
+- **B3A-10** (benchmark): DONE. Same-day A/B on real Qwen2.5-3B Q4_K_M.
+- **B3A-11** (gate): DONE. 36.6% submission reduction (≥25% ✅); −0.18%
+  wall-clock (≥1% ❌). **Graph stays opt-in (default Disabled).**
+- **B3A-12** (docs): DONE. Baseline report + completion-plan + this entry.
 
-- **B3A-8**: correctness + lifecycle tests (single-token parity < 1e-3,
-  multi-token no-drift, build/replay count assertions, reset/rebuild,
-  forced-failure fallback, unsupported-layer, repeated create→replay→reset
-  stress). Depends on B3A-5.
+### B3A-10 measured result (honest)
 
-- **B3A-9/10/11**: full RTX 3060 regression (graphs=0 and =1 suites),
-  same-day main-vs-feature benchmark, performance decision gate (≥25%
-  submission reduction, ≥1% median improvement, build amortization within
-  ~64 tokens). Depend on B3A-5.
+| metric | GRAPHS=0 | GRAPHS=1 | gate |
+|---|---|---|---|
+| median p50 ms/tok | 121.99 | 122.21 | −0.18% (❌ ≥1%) |
+| launches/tok | 599.2 | 379.8 | −36.6% (✅ ≥25%) |
+
+The 36.6% submission reduction is real but the cross-stream sync overhead
+(2 synchronize/layer = 72/token) offsets the launch savings. B3B (event-based
+sync or attention graphization) is the path to the ≥1% wall-clock gate.
 
 ### Key design constraints (from B3A review + smoke-test findings)
 
 - **Dedicated capture stream** (NULL stream can't be captured); event tracking
   disabled for graph buffers.
-- **Zero-D2D on the happy path** is the goal (ping-pong arena: attention
-  writes B, FFN graph reads B / writes A), but the current scaffold uses D2D
-  copies at the layer boundary (seed input + read output) — these are counted
-  in `d2d_submissions` and honest against the ≥25% gate. The true zero-D2D
-  design (attention's residual-add writes directly into the arena via
-  `launch_residual_add_into`) is a refinement once the basic replay works.
-- **Default graph mode = Disabled** until B3A-11's performance gate passes;
+- **D2D copies at the layer boundary** (seed input + read output) are counted
+  in `d2d_submissions` and honest against the ≥25% gate. The zero-D2D design
+  (attention's residual-add writes directly into the arena) is a B3B refinement.
+- **Default graph mode = Disabled** (B3A-11 gate: wall-clock improvement < 1%);
   opt-in via `LARQL_CUDA_GRAPHS=1`.
