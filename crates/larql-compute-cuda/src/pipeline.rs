@@ -630,13 +630,11 @@ impl CudaBackend {
         {
             return false;
         }
-        // The gate/up + down formats must match (the device FFN chain requires
-        // a uniform k-quant triple — mirrors `host_ffn_block_device`).
-        if !matches!(
-            (layer.gate.format, layer.up.format, layer.down.format),
-            (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K)
-                | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
-        ) {
+        // The gate/up/down triple must be a supported resident-hidden FFN
+        // layout (see [`supported_resident_ffn_triple`]). The shared helper
+        // is also used by `host_ffn_block_device_resident` so the two gates
+        // cannot drift.
+        if !supported_resident_ffn_triple(layer.gate.format, layer.up.format, layer.down.format) {
             return false;
         }
         // Down stored width must equal inter (no device-side zero-pad step).
@@ -2493,9 +2491,11 @@ impl CudaBackend {
     /// Returns `None` (caller falls back to the host path) when the norm path
     /// bails (non-RmsNorm, `None`-weight pre-ffn norm under `!has_post_norms`
     /// without a weight to upload) or any chained launch returns `Err`. The
-    /// eligibility gates (Q4_K/Q6_K, `inter` ≥ activation gate, `stored_cols ==
-    /// inter`) are enforced by [`resident_hidden_layer_eligible`] before this
-    /// is called, but the defensive checks stay for direct-call safety.
+    /// eligibility gates (a supported resident-hidden FFN triple — see
+    /// [`supported_resident_ffn_triple`]; `inter` ≥ activation gate;
+    /// `stored_cols == inter`) are enforced by [`resident_hidden_layer_eligible`]
+    /// before this is called, but the defensive checks stay for direct-call
+    /// safety.
     fn host_ffn_block_device_resident(
         &self,
         runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
@@ -2513,11 +2513,7 @@ impl CudaBackend {
         let gate_fmt = layer.gate.format;
         let up_fmt = layer.up.format;
         let down_fmt = layer.down.format;
-        if !matches!(
-            (gate_fmt, up_fmt, down_fmt),
-            (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K)
-                | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
-        ) {
+        if !supported_resident_ffn_triple(gate_fmt, up_fmt, down_fmt) {
             return None;
         }
         let stored_cols = down_stored_cols(layer, hidden, inter)?;
@@ -3931,6 +3927,33 @@ fn matvec_dev_by_fmt(
     }
 }
 
+/// Supported resident-hidden FFN (gate, up, down) k-quant triples. Each
+/// projection is dispatched independently through [`matvec_dev_by_fmt`] and
+/// produces f32 device activations, so mixed weight formats are technically
+/// possible — the activation kernel consumes f32 device outputs and does not
+/// care which quant format produced them, and the down projection likewise
+/// consumes the f32 device activation regardless of its own weight format.
+///
+/// This helper intentionally accepts only model layouts that LARQL produces
+/// and validates:
+/// - `Q4_K / Q4_K / Q4_K` (uniform-Q4_K, the `--down-q4k` build),
+/// - `Q6_K / Q6_K / Q6_K` (uniform-Q6_K),
+/// - `Q4_K / Q4_K / Q6_K` (the default Q4_K_M FFN mix: gate/up Q4_K, down
+///   Q6_K).
+///
+/// Other permutations remain rejected until backed by a real produced format,
+/// a concrete need, and dedicated parity coverage. In particular
+/// `Q6_K / Q6_K / Q4_K` and mixed gate/up formats (e.g. `Q4_K / Q6_K / _`)
+/// are not produced by any LARQL extraction path and stay unsupported.
+fn supported_resident_ffn_triple(gate: QuantFormat, up: QuantFormat, down: QuantFormat) -> bool {
+    matches!(
+        (gate, up, down),
+        (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q4_K)
+            | (QuantFormat::Q6_K, QuantFormat::Q6_K, QuantFormat::Q6_K)
+            | (QuantFormat::Q4_K, QuantFormat::Q4_K, QuantFormat::Q6_K)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3949,6 +3972,91 @@ mod tests {
         layer.rotary_dim = 64;
         layer.head_dim = 256;
         assert!((rope_fraction(&layer) - 0.25).abs() < 1e-12);
+    }
+
+    // ── D6-B/E: supported_resident_ffn_triple + eligibility host tests ──
+    //
+    // Pure (no device) so they run on every host, including CI without a GPU.
+    // `supported_resident_ffn_triple` is the single source of truth shared by
+    // `resident_hidden_layer_eligible` and `host_ffn_block_device_resident`.
+
+    use larql_compute::QuantFormat as QF;
+
+    #[test]
+    fn supported_resident_ffn_triple_accepts_uniform_q4k() {
+        assert!(supported_resident_ffn_triple(QF::Q4_K, QF::Q4_K, QF::Q4_K));
+    }
+
+    #[test]
+    fn supported_resident_ffn_triple_accepts_uniform_q6k() {
+        assert!(supported_resident_ffn_triple(QF::Q6_K, QF::Q6_K, QF::Q6_K));
+    }
+
+    #[test]
+    fn supported_resident_ffn_triple_accepts_default_q4km_mix() {
+        // The production default Q4_K_M FFN layout: gate/up Q4_K, down Q6_K.
+        assert!(supported_resident_ffn_triple(QF::Q4_K, QF::Q4_K, QF::Q6_K));
+    }
+
+    #[test]
+    fn supported_resident_ffn_triple_rejects_q6k_q6k_q4k() {
+        // Not a produced LARQL format; stays unsupported.
+        assert!(!supported_resident_ffn_triple(QF::Q6_K, QF::Q6_K, QF::Q4_K));
+    }
+
+    #[test]
+    fn supported_resident_ffn_triple_rejects_mixed_gate_up() {
+        // Mixed gate/up formats are not produced and not validated.
+        assert!(!supported_resident_ffn_triple(QF::Q4_K, QF::Q6_K, QF::Q4_K));
+        assert!(!supported_resident_ffn_triple(QF::Q4_K, QF::Q6_K, QF::Q6_K));
+        assert!(!supported_resident_ffn_triple(QF::Q6_K, QF::Q4_K, QF::Q4_K));
+    }
+
+    #[test]
+    fn supported_resident_ffn_triple_rejects_unsupported_quant_formats() {
+        assert!(!supported_resident_ffn_triple(QF::Q4_0, QF::Q4_0, QF::Q4_0));
+        assert!(!supported_resident_ffn_triple(QF::Q4_K, QF::Q4_K, QF::Q4_0));
+        assert!(!supported_resident_ffn_triple(QF::BF16, QF::BF16, QF::BF16));
+        assert!(!supported_resident_ffn_triple(QF::Q4_K, QF::Q4_K, QF::Q8_0));
+    }
+
+    /// Padded-down contraction (`stored_cols > inter`) stays rejected even when
+    /// the format triple is supported — the resident chain assumes a contiguous
+    /// `[seq, inter]` activation feeds the down matmul directly, with no
+    /// device-side zero-pad step. Builds a `FullPipelineLayer` whose `down.data`
+    /// length implies one extra Q4_K super-block row beyond `inter`, then
+    /// asserts `down_stored_cols` returns the padded width (and thus the
+    /// eligibility gate's `stored_cols == inter` check rejects it).
+    #[test]
+    fn down_stored_cols_rejects_padded_down_contraction() {
+        // hidden=256, inter=256: a valid Q4_K down matrix is
+        // 256 rows × 144 bytes/super-block × (256/256 super-blocks) = 256*144 bytes.
+        // Pad to 512 stored cols (2 super-blocks/row): 256 rows × 2 × 144 bytes.
+        let hidden = 256usize;
+        let inter = 256usize;
+        let stored_cols_padded = 512usize;
+        let bytes_per_sb = super_block_bytes(QuantFormat::Q4_K).unwrap();
+        let mut layer = make_minimal_layer();
+        layer.down.data = down_bytes_static(hidden, stored_cols_padded, bytes_per_sb);
+
+        let stored = down_stored_cols(&layer, hidden, inter).expect("down_stored_cols Some");
+        assert_eq!(
+            stored, stored_cols_padded,
+            "padded down should report its padded stored width"
+        );
+        assert_ne!(
+            stored, inter,
+            "padded down must fail the `stored_cols == inter` eligibility check"
+        );
+    }
+
+    /// Allocate a static byte buffer of the right length for the padded-down
+    /// fixture (contents don't matter — only the length drives
+    /// `down_stored_cols`).
+    fn down_bytes_static(hidden: usize, stored_cols: usize, bytes_per_sb: usize) -> &'static [u8] {
+        let len = hidden * (stored_cols / 256) * bytes_per_sb;
+        let v = vec![0u8; len];
+        Box::leak(v.into_boxed_slice())
     }
 
     /// Build a `FullPipelineLayer` with just the fields `rope_fraction` /

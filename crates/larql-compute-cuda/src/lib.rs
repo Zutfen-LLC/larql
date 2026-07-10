@@ -5195,4 +5195,389 @@ mod tests {
         assert_eq!(b.kv_cache_len_native(), seq_len + 1);
         assert_eq!(b.kv_cache_len(), seq_len + 1);
     }
+
+    // ── D6-F: native mixed-Q4_K_M resident-hidden parity tests ──────────
+    //
+    // GPU-007/D6 extends resident-hidden decode to the production-default
+    // Q4_K_M FFN layout (gate/up Q4_K, down Q6_K). These mirror the GPU-007G
+    // uniform-Q4_K suite against a faithful Q4_K_M fixture (V Q6_K too),
+    // compare against `predict_kquant_decode_step` (the f32-activation CPU
+    // reference), and assert EXACT use/fallback counts — a single quiet layer
+    // fallback would fail these where looser assertions would pass.
+
+    /// Seed helper for the mixed Q4_K_M fixture. Mirrors
+    /// [`resident_hidden_seed_layers`] but constructs a [`Q4kmFixtureIndex`]
+    /// (gate/up Q4_K, down Q6_K; attention Q/K/O Q4_K, V Q6_K — the faithful
+    /// production Q4_K_M layout).
+    fn resident_hidden_seed_q4km(
+        b: &CudaBackend,
+        token_ids: &[u32],
+        num_layers: usize,
+    ) -> (
+        larql_models::ModelWeights,
+        larql_compute::test_fixtures::Q4kmFixtureIndex,
+        usize,
+        usize,
+        usize,
+        f32,
+    ) {
+        let weights = make_test_q4k_weights_inter_layers(RESIDENT_HIDDEN_INTER, num_layers);
+        let index = larql_compute::test_fixtures::make_q4km_fixture_index(&weights);
+        let (x, seq_len, hidden) = prefill_input(&weights, token_ids);
+        let inter = index.num_features(0);
+        let softcap = weights.arch.attn_logit_softcapping().unwrap_or(0.0);
+        b.reset_kv_cache();
+        let kv_shapes: Vec<(usize, usize)> = (0..weights.num_layers)
+            .map(|l| {
+                (
+                    weights.arch.num_kv_heads_for_layer(l),
+                    weights.arch.head_dim_for_layer(l),
+                )
+            })
+            .collect();
+        b.preallocate_kv_cache_per_layer(
+            &kv_shapes,
+            larql_compute::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+        );
+        let layers = build_layers(&weights, &index);
+        let _ = b
+            .prefill_kquant(&layers, &x, hidden, inter, seq_len, false, softcap)
+            .expect("Q4_K_M resident-hidden prefill seeding should succeed");
+        (weights, index, seq_len, hidden, inter, softcap)
+    }
+
+    /// Parse a `uses=`/`fallbacks=` count out of a diag line.
+    fn parse_diag_count(diag: &str, name: &str) -> u64 {
+        diag.split(name)
+            .nth(1)
+            .and_then(|s| s.split([',', ')']).next())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// D6-F: a single-token decode through the mixed Q4_K_M fixture matches
+    /// the CPU f32-activation reference, and the resident-hidden path engages
+    /// with an EXACT count: every layer runs resident, zero fallbacks. The
+    /// resident-KV path likewise engages 100% (the attention mix Q/K/O Q4_K +
+    /// V Q6_K is already eligible per the per-projection k-quant gate).
+    #[test]
+    fn q4km_resident_hidden_decode_matches_cpu_reference_after_prefill() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+
+        // Fixture-level format assertions: gate/up Q4_K, down Q6_K.
+        assert_eq!(layers[0].gate.format, larql_compute::QuantFormat::Q4_K);
+        assert_eq!(layers[0].up.format, larql_compute::QuantFormat::Q4_K);
+        assert_eq!(layers[0].down.format, larql_compute::QuantFormat::Q6_K);
+        // Attention V is Q6_K (faithful Q4_K_M); Q/K/O stay Q4_K.
+        assert_eq!(layers[0].wv.format, larql_compute::QuantFormat::Q6_K);
+        assert_eq!(layers[0].wq.format, larql_compute::QuantFormat::Q4_K);
+        // Gate/up/down tensor dims: gate/up [inter, hidden], down [hidden, inter].
+        let hidden_dim = weights.hidden_size;
+        assert_eq!(inter, RESIDENT_HIDDEN_INTER);
+        assert_eq!(hidden_dim, hidden);
+
+        // CPU reference: prefill then one f32-activation decode step.
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let next_tok = resident_kv_first_decode_tok();
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+
+        // CUDA mixed-Q4_K_M decode of the same next token.
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed on the mixed Q4_K_M fixture");
+
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        assert_eq!(cpu_row.len(), cuda_decode.len());
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "mixed-Q4_K_M resident-hidden decode diverged from CPU reference: max_abs={max_abs:.6e}"
+        );
+
+        // EXACT counter assertions: every layer ran resident, zero fallbacks.
+        let rh_diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after mixed-Q4_K_M decode");
+        assert_eq!(
+            parse_diag_count(&rh_diag, "uses="),
+            num_layers as u64,
+            "mixed-Q4_K_M resident-hidden uses must equal num_layers: {rh_diag}"
+        );
+        assert_eq!(
+            parse_diag_count(&rh_diag, "fallbacks="),
+            0,
+            "mixed-Q4_K_M resident-hidden must have zero fallbacks: {rh_diag}"
+        );
+        // Resident-KV likewise 100% (1 decode token × num_layers).
+        let rkv_diag = b
+            .resident_kv_diag()
+            .expect("resident-KV diag present after mixed-Q4_K_M decode");
+        assert_eq!(
+            parse_diag_count(&rkv_diag, "uses="),
+            num_layers as u64,
+            "mixed-Q4_K_M resident-KV uses must equal num_layers: {rkv_diag}"
+        );
+        assert_eq!(
+            parse_diag_count(&rkv_diag, "fallbacks="),
+            0,
+            "mixed-Q4_K_M resident-KV must have zero fallbacks: {rkv_diag}"
+        );
+    }
+
+    /// D6-F: multi-token decode through the mixed Q4_K_M fixture matches the
+    /// CPU reference across several tokens (no progressive drift), with EXACT
+    /// use counts: `uses == num_layers * decoded_tokens`, `fallbacks == 0`.
+    #[test]
+    fn q4km_resident_hidden_multi_token_matches_cpu_reference() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+
+        let start = resident_kv_first_decode_tok();
+        let next_tokens = [start, start + 1, start + 2, start + 3];
+        for (step, tok) in next_tokens.into_iter().enumerate() {
+            let cpu_pos = seq_len + step;
+            let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+                &weights,
+                tok,
+                &index,
+                &mut cpu_cache,
+                cpu_pos,
+            )
+            .expect("CPU f32 decode step");
+
+            let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[tok]);
+            let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+            let cuda_decode = b
+                .decode_token(&layers, &x_dec, hidden, inter)
+                .expect("CUDA decode_token should succeed across the mixed-Q4_K_M run");
+
+            let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+            assert_eq!(cpu_row.len(), cuda_decode.len());
+            let max_abs = cpu_row
+                .iter()
+                .zip(cuda_decode.iter())
+                .map(|(c, g)| (c - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs < 1e-3,
+                "mixed-Q4_K_M multi-token decode (tok {tok}) diverged: max_abs={max_abs:.6e}"
+            );
+            // KV lockstep after each token.
+            assert_eq!(
+                b.host_kv_len(),
+                cpu_pos + 1,
+                "host mirror drifted at tok {tok}"
+            );
+            assert_eq!(
+                b.kv_cache_len_native(),
+                cpu_pos + 1,
+                "device cursor drifted at tok {tok}"
+            );
+        }
+
+        // EXACT totals: every (layer, token) ran resident, zero fallbacks.
+        let rh_diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after multi-token mixed-Q4_K_M decode");
+        let expected_uses = num_layers as u64 * next_tokens.len() as u64;
+        assert_eq!(
+            parse_diag_count(&rh_diag, "uses="),
+            expected_uses,
+            "mixed-Q4_K_M multi-token resident-hidden uses must equal num_layers*tokens: {rh_diag}"
+        );
+        assert_eq!(
+            parse_diag_count(&rh_diag, "fallbacks="),
+            0,
+            "mixed-Q4_K_M multi-token resident-hidden must have zero fallbacks: {rh_diag}"
+        );
+    }
+
+    /// D6-F: resident-hidden runs across consecutive layers on the mixed
+    /// Q4_K_M fixture. A 4-layer fixture with a single decode token must
+    /// register `uses == num_layers` (proving consecutive resident layers),
+    /// `fallbacks == 0`.
+    #[test]
+    fn q4km_resident_hidden_runs_across_consecutive_layers() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let num_layers = 4;
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed on the 4-layer mixed-Q4_K_M fixture");
+
+        // CPU reference for parity.
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "4-layer mixed-Q4_K_M decode diverged: max_abs={max_abs:.6e}"
+        );
+
+        // EXACT: every layer resident, zero fallbacks.
+        let rh_diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after 4-layer mixed-Q4_K_M decode");
+        assert_eq!(
+            parse_diag_count(&rh_diag, "uses="),
+            num_layers as u64,
+            "4-layer mixed-Q4_K_M resident-hidden uses must equal num_layers: {rh_diag}"
+        );
+        assert_eq!(
+            parse_diag_count(&rh_diag, "fallbacks="),
+            0,
+            "4-layer mixed-Q4_K_M resident-hidden must have zero fallbacks: {rh_diag}"
+        );
+    }
+
+    /// D6-F: resident-hidden decode on the mixed Q4_K_M fixture does NOT
+    /// regress the GPU-006 host/device KV cursor lockstep. After a decode, the
+    /// host mirror and the device cursor must agree.
+    #[test]
+    fn q4km_resident_hidden_decode_keeps_kv_lockstep() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
+        let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
+        let (weights, index, seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+
+        // Post-prefill lockstep.
+        assert_eq!(b.host_kv_len(), seq_len);
+        assert_eq!(b.kv_cache_len_native(), seq_len);
+
+        let next_tok = resident_kv_first_decode_tok();
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let _ = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token should succeed");
+
+        // Lockstep after decode: host mirror + device cursor both at seq_len + 1.
+        assert_eq!(b.host_kv_len(), seq_len + 1);
+        assert_eq!(b.kv_cache_len_native(), seq_len + 1);
+        assert_eq!(b.kv_cache_len(), seq_len + 1);
+    }
+
+    /// D6-F: forced ineligibility (sub-gate prompt) keeps output parity and
+    /// registers EXACT fallback counts. A 3-token prompt makes the decode-
+    /// attention work fall below the native gate, so the resident path is
+    /// ineligible and the host fallback runs on every layer. Output must still
+    /// match the CPU reference, and the fallback counter must equal num_layers
+    /// with zero uses.
+    #[test]
+    fn q4km_resident_hidden_fallback_when_ineligible() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
+        // 3-token prompt → first decode work below the gate → ineligible.
+        let token_ids = resident_kv_prompt(3);
+        let (weights, index, seq_len, hidden, inter, _) =
+            resident_hidden_seed_q4km(&b, &token_ids, num_layers);
+        let layers = build_layers(&weights, &index);
+
+        let (_h_prefill, mut cpu_cache, _timings) =
+            larql_compute::kquant_forward::predict_kquant_prefill(&weights, &token_ids, &index);
+        let next_tok = 99u32; // distinct from the 3-token prompt
+        let (cpu_decode, _timings) = larql_compute::kquant_forward::predict_kquant_decode_step(
+            &weights,
+            next_tok,
+            &index,
+            &mut cpu_cache,
+            seq_len,
+        )
+        .expect("CPU f32 decode step");
+
+        let h_tok = larql_compute::forward::embed_tokens_pub(&weights, &[next_tok]);
+        let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+        let cuda_decode = b
+            .decode_token(&layers, &x_dec, hidden, inter)
+            .expect("CUDA decode_token (fallback) should succeed on mixed-Q4_K_M");
+
+        let cpu_row: Vec<f32> = cpu_decode.row(0).to_vec();
+        let max_abs = cpu_row
+            .iter()
+            .zip(cuda_decode.iter())
+            .map(|(c, g)| (c - g).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "mixed-Q4_K_M fallback diverged from CPU reference: max_abs={max_abs:.6e}"
+        );
+
+        // EXACT: every layer fell back, zero uses.
+        let rh_diag = b
+            .resident_hidden_diag()
+            .expect("resident-hidden diag present after mixed-Q4_K_M fallback");
+        assert_eq!(
+            parse_diag_count(&rh_diag, "uses="),
+            0,
+            "ineligible mixed-Q4_K_M must have zero resident-hidden uses: {rh_diag}"
+        );
+        assert_eq!(
+            parse_diag_count(&rh_diag, "fallbacks="),
+            num_layers as u64,
+            "ineligible mixed-Q4_K_M fallbacks must equal num_layers: {rh_diag}"
+        );
+    }
 }
