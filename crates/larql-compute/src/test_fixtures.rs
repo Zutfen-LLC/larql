@@ -703,4 +703,64 @@ mod tests {
         // chain bottoms out there — but every gate above passes.
         assert!(result.is_none());
     }
+
+    /// Smoke test for the mixed Q4_K_M fixture (`Q4kmFixtureIndex`): verify
+    /// every accessor returns sensible data with the production-default
+    /// per-component format mix (attn Q/K/O Q4_K, V Q6_K; FFN gate/up Q4_K,
+    /// down Q6_K), and that the format-aware `kquant_ffn_layer_once` dequants
+    /// both Q4_K (gate/up) and Q6_K (down) components correctly.
+    #[test]
+    fn q4km_fixture_index_returns_mixed_format_slices() {
+        let weights = make_test_q4k_weights();
+        let idx = make_q4km_fixture_index(&weights);
+
+        // Trait accessors.
+        assert_eq!(idx.num_features(0), weights.intermediate_size);
+        assert_eq!(idx.vocab_size(), weights.vocab_size);
+
+        // Per-layer attention bytes: Q/K/O Q4_K, V Q6_K (production Q4_K_M mix).
+        let attn = idx.attn_kquant_layer_data(0).expect("layer 0 attn");
+        assert_eq!(attn.len(), 4);
+        assert_eq!(attn[0].1, "Q4_K"); // Q
+        assert_eq!(attn[1].1, "Q4_K"); // K
+        assert_eq!(attn[2].1, "Q6_K"); // V (the Q4_K_M attention mix)
+        assert_eq!(attn[3].1, "Q4_K"); // O
+        for (bytes, _fmt) in &attn {
+            assert!(!bytes.is_empty(), "empty attention bytes");
+        }
+
+        // Per-layer FFN data: gate/up Q4_K, down Q6_K (production Q4_K_M mix).
+        let ffn = idx.interleaved_kquant_layer_data(0).expect("layer 0 ffn");
+        assert_eq!(ffn.len(), FFN_COMPONENTS_PER_LAYER);
+        assert_eq!(ffn[0].1, "Q4_K"); // gate
+        assert_eq!(ffn[1].1, "Q4_K"); // up
+        assert_eq!(ffn[2].1, "Q6_K"); // down (the Q4_K_M FFN mix)
+        for (bytes, _fmt) in &ffn {
+            assert!(!bytes.is_empty(), "empty FFN bytes");
+        }
+        let mmap = idx.interleaved_kquant_mmap_ref().expect("mmap");
+        assert!(!mmap.is_empty());
+
+        // Out-of-range layer returns None.
+        assert!(idx.attn_kquant_layer_data(weights.num_layers).is_none());
+        assert!(idx
+            .interleaved_kquant_layer_data(weights.num_layers)
+            .is_none());
+
+        // Format-aware dequant cache: gate/up via Q4_K, down via Q6_K.
+        // Each component has `intermediate * hidden` elements.
+        let elems = weights.intermediate_size * weights.hidden_size;
+        let gate = idx.kquant_ffn_layer_once(0, 0).expect("layer 0 gate cache");
+        assert_eq!(gate.len(), elems, "gate dequant element count");
+        let up = idx.kquant_ffn_layer_once(0, 1).expect("layer 0 up cache");
+        assert_eq!(up.len(), elems, "up dequant element count");
+        let down = idx.kquant_ffn_layer_once(0, 2).expect("layer 0 down cache");
+        assert_eq!(down.len(), elems, "down dequant element count (Q6_K)");
+        // Second call returns the same Arc (cache hit).
+        let down_again = idx.kquant_ffn_layer_once(0, 2).expect("hit down cache");
+        assert!(Arc::ptr_eq(&down, &down_again));
+
+        // Out-of-range component returns None.
+        assert!(idx.kquant_ffn_layer_once(0, 99).is_none());
+    }
 }
