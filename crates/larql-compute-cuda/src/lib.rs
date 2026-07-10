@@ -15,6 +15,7 @@ pub mod backend;
 pub mod buffers;
 pub mod decode;
 pub mod ffn_graph;
+pub mod ffn_graph_state;
 pub mod kernels;
 pub mod kv_cache;
 pub mod kv_dispatch_impl;

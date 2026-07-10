@@ -3059,7 +3059,7 @@ pub(crate) struct RuntimeError {
 }
 
 impl RuntimeError {
-    fn context(action: &'static str, source: DriverError) -> Self {
+    pub(crate) fn context(action: &'static str, source: DriverError) -> Self {
         Self {
             message: format!("{action}: {source}"),
         }
