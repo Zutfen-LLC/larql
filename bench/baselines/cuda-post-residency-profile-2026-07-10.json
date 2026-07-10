@@ -1,0 +1,188 @@
+{
+  "profile_id": "larql-gpu-profile-001-post-residency-decode-bottleneck",
+  "date": "2026-07-10",
+  "hardware": "NVIDIA GeForce RTX 3060 (12 GB, sm_86)",
+  "caveat": "RTX 3060, NOT the packet-required RTX 3090. Bottleneck ranking transfers (same sm_86); absolute tok/s and launch-overhead fraction differ.",
+  "cases": {
+    "decode-short-context__q4k": {
+      "n_reps": 5,
+      "decode_ms_median": 131.4646779606299,
+      "decode_ms_min": 130.76353022047243,
+      "decode_ms_max": 136.4975059212598,
+      "decode_ms_mad": 0.429404102362156,
+      "tok_per_s": 7.60660593790427,
+      "prefill_ms": 589.3901569999999,
+      "stages": {
+        "embed_ms": 0.002240730769230769,
+        "gpu_fwd_ms": 108.3669691846154,
+        "cpu_fwd_ms": 0.0,
+        "gate_up_ms": 0.0,
+        "down_ms": 0.0,
+        "final_norm_ms": 0.004806276923076923,
+        "lm_head_ms": 28.158569607692318,
+        "detok_ms": 0.04371293846153848
+      },
+      "profile": {
+        "launches_per_tok": 454.6771653543307,
+        "htod_per_tok": 0.0,
+        "htod_mib_per_tok": 0.0,
+        "dtoh_per_tok": 0.0,
+        "dtoh_mib_per_tok": 0.0,
+        "syncs_per_tok": 0.0,
+        "mirror_ms_per_tok": 0.0,
+        "mirror_rows_per_tok": 0.0,
+        "hidden_readback_ms_per_tok": 0.0
+      }
+    },
+    "decode-medium-context__q4k": {
+      "n_reps": 5,
+      "decode_ms_median": 133.17475837795277,
+      "decode_ms_min": 133.07354835433068,
+      "decode_ms_max": 140.73076902362203,
+      "decode_ms_mad": 0.10121002362208742,
+      "tok_per_s": 7.508930462347669,
+      "prefill_ms": 9271.19781,
+      "stages": {
+        "embed_ms": 0.002377807692307692,
+        "gpu_fwd_ms": 106.2284066923077,
+        "cpu_fwd_ms": 0.0,
+        "gate_up_ms": 0.0,
+        "down_ms": 0.0,
+        "final_norm_ms": 0.004625315384615386,
+        "lm_head_ms": 26.93213590769231,
+        "detok_ms": 0.1130319076923077
+      },
+      "profile": {
+        "launches_per_tok": 533.4803149606299,
+        "htod_per_tok": 0.0,
+        "htod_mib_per_tok": 0.0,
+        "dtoh_per_tok": 0.0,
+        "dtoh_mib_per_tok": 0.0,
+        "syncs_per_tok": 0.0,
+        "mirror_ms_per_tok": 0.0,
+        "mirror_rows_per_tok": 0.0,
+        "hidden_readback_ms_per_tok": 0.0
+      }
+    },
+    "decode-long-context__q4k": {
+      "n_reps": 2,
+      "decode_ms_median": 151.6749914251969,
+      "decode_ms_min": 148.89089629921267,
+      "decode_ms_max": 154.45908655118114,
+      "decode_ms_mad": 2.784095125984237,
+      "tok_per_s": 6.5952668567747965,
+      "prefill_ms": 163350.77294499998,
+      "stages": {
+        "embed_ms": 0.003104023076923078,
+        "gpu_fwd_ms": 121.41145586923068,
+        "cpu_fwd_ms": 0.0,
+        "gate_up_ms": 0.0,
+        "down_ms": 0.0,
+        "final_norm_ms": 0.005641969230769232,
+        "lm_head_ms": 27.4424766,
+        "detok_ms": 0.2595742076923077
+      },
+      "profile": {
+        "launches_per_tok": 1186.5826771653544,
+        "htod_per_tok": 0.0,
+        "htod_mib_per_tok": 0.0,
+        "dtoh_per_tok": 0.0,
+        "dtoh_mib_per_tok": 0.0,
+        "syncs_per_tok": 0.0,
+        "mirror_ms_per_tok": 0.0,
+        "mirror_rows_per_tok": 0.0,
+        "hidden_readback_ms_per_tok": 0.0
+      }
+    },
+    "decode-short-context__q4k-uniform": {
+      "n_reps": 5,
+      "decode_ms_median": 128.04238529921258,
+      "decode_ms_min": 126.97163281102364,
+      "decode_ms_max": 129.40546105511817,
+      "decode_ms_mad": 0.23968718897637586,
+      "tok_per_s": 7.8099138630007205,
+      "prefill_ms": 491.224934,
+      "stages": {
+        "embed_ms": 0.0028832076923076934,
+        "gpu_fwd_ms": 100.58112134615384,
+        "cpu_fwd_ms": 0.0,
+        "gate_up_ms": 0.0,
+        "down_ms": 0.0,
+        "final_norm_ms": 0.00630766153846154,
+        "lm_head_ms": 28.781701946153856,
+        "detok_ms": 0.047590361538461544
+      },
+      "profile": {
+        "launches_per_tok": 597.5433070866142,
+        "htod_per_tok": 0.0,
+        "htod_mib_per_tok": 0.0,
+        "dtoh_per_tok": 0.0,
+        "dtoh_mib_per_tok": 0.0,
+        "syncs_per_tok": 0.0,
+        "mirror_ms_per_tok": 0.0,
+        "mirror_rows_per_tok": 0.0,
+        "hidden_readback_ms_per_tok": 0.0
+      }
+    },
+    "decode-short-context__q4k-pass2": {
+      "n_reps": 1,
+      "decode_ms_median": 136.90136003149604,
+      "decode_ms_min": 136.90136003149604,
+      "decode_ms_max": 136.90136003149604,
+      "decode_ms_mad": 0.0,
+      "tok_per_s": 7.304529332432755,
+      "prefill_ms": 561.425339,
+      "stages": {
+        "embed_ms": 0.002548292307692307,
+        "gpu_fwd_ms": 108.48549038461535,
+        "cpu_fwd_ms": 0.0,
+        "gate_up_ms": 0.0,
+        "down_ms": 0.0,
+        "final_norm_ms": 0.00540653076923077,
+        "lm_head_ms": 28.386642392307678,
+        "detok_ms": 0.05032507692307692
+      },
+      "profile": {
+        "launches_per_tok": 454.6771653543307,
+        "htod_per_tok": 149.66929133858267,
+        "htod_mib_per_tok": 2.7820497047244093,
+        "dtoh_per_tok": 224.50393700787401,
+        "dtoh_mib_per_tok": 4.318405511811024,
+        "syncs_per_tok": 224.50393700787401,
+        "mirror_ms_per_tok": 0.6195130866141733,
+        "mirror_rows_per_tok": 2745.3543307086616,
+        "hidden_readback_ms_per_tok": 4.48503937007874e-05
+      }
+    },
+    "decode-short-context__q4k-uniform-pass2": {
+      "n_reps": 1,
+      "decode_ms_median": 127.45335685039369,
+      "decode_ms_min": 127.45335685039369,
+      "decode_ms_max": 127.45335685039369,
+      "decode_ms_mad": 0.0,
+      "tok_per_s": 7.846007549050373,
+      "prefill_ms": 488.372383,
+      "stages": {
+        "embed_ms": 0.002801753846153846,
+        "gpu_fwd_ms": 98.90221560769228,
+        "cpu_fwd_ms": 0.0,
+        "gate_up_ms": 0.0,
+        "down_ms": 0.0,
+        "final_norm_ms": 0.006337315384615389,
+        "lm_head_ms": 28.51831073076924,
+        "detok_ms": 0.04765619230769229
+      },
+      "profile": {
+        "launches_per_tok": 597.5433070866142,
+        "htod_per_tok": 2.15748031496063,
+        "htod_mib_per_tok": 0.09657972440944881,
+        "dtoh_per_tok": 76.99212598425197,
+        "dtoh_mib_per_tok": 0.1796259842519685,
+        "syncs_per_tok": 76.99212598425197,
+        "mirror_ms_per_tok": 0.5999948582677166,
+        "mirror_rows_per_tok": 2745.3543307086616,
+        "hidden_readback_ms_per_tok": 2.0760164251968503
+      }
+    }
+  }
+}

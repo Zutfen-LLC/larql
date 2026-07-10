@@ -177,15 +177,43 @@ Ordered by expected wall-clock impact; re-rank against the A4 profile.
   settings, all 7 resident_hidden tests pass natively, three-repeat stability
   confirmed, release-mode focused tests pass. See
   bench/baselines/cuda-cross-layer-residency-2026-07-10.md.
+  <!-- LARQL-GPU-PROFILE-001 (2026-07-10, RTX 3060): the resident-hidden
+       eligibility gate (pipeline.rs resident_hidden_layer_eligible) requires a
+       uniform Q4_K or Q6_K FFN (gate,up,down) triple. The default Q4_K_M mix
+       (gate/up Q4_K, down Q6_K — the `convert quantize q4k` default and the
+       Ollama-compatible format) fails this gate, so GPU-007 engages 0% on a
+       real Q4_K_M model (measured: 0 uses / 612 fallbacks). It engages 100%
+       only with `--down-q4k` (uniform Q4_K). The synthetic fixtures used for
+       the GPU-007 validation are uniform Q4_K, so the code was validated but
+       the production default format never reaches it. See D6 below and
+       bench/baselines/cuda-post-residency-profile-2026-07-10.md. -->
+- **D6. resident-hidden Q4_K_M eligibility** (1 session, NEW — outside B3/B4/
+  B5/C1). Extend `host_ffn_block_device_resident` to handle the mixed Q4_K/Q6_K
+  FFN triple (gate/up Q4_K, down Q6_K) so GPU-007 engages on the default
+  Q4_K_M format. Profile evidence (RTX 3060, pending 3090 re-validation): the
+  resident path is 7% faster (122 vs 131 ms/tok) and does 13× less DtoH
+  traffic (0.5 vs 6.6 MiB/tok) — currently left on the table for the format
+  users actually have. This is the A4-profile-recommended next slice; it
+  outranks B3/B4 because until it lands GPU-007 is dead code on the critical
+  path. See bench/baselines/cuda-post-residency-profile-2026-07-10.md §PROFILE-001J.
 - B3. **Launch batching / graphization** (1-2 sessions, optional until A4 says
   launch overhead matters). Collapse per-op `launch → stream` calls into
   fewer submissions (CUDA Graphs via cudarc if exposed, else simple
   multi-launch batching before the single sync). Mirrors Metal's
   single-command-buffer `decode/mod.rs` shape.
+  <!-- LARQL-GPU-PROFILE-001 (2026-07-10, RTX 3060): measured 571 launches/tok
+       on Q4_K_M (resident-hidden OFF). Launch latency not directly measured
+       (no Nsight); inferred reducible cost is medium-confidence. Rank #2 after
+       D6. See bench/baselines/cuda-post-residency-profile-2026-07-10.md. -->
 - B4. **lm-head on device** (1 session). Revisit the Session 8b decision that
   gated `f32_gemv`/`topk1` off the native path: with the weight cache (the
   re-upload concern is gone) land a fused GEMV+argmax (`f16_gemv_topk1`)
   kernel so greedy decode never reads back the full logits row.
+  <!-- LARQL-GPU-PROFILE-001 (2026-07-10, RTX 3060): lm_head = 27 ms/tok (20%
+       of decode), but the Q4K GEMV already runs on device — B4 only saves the
+       host top-k + the uniform-Q4_K readback (~5-8 ms/tok upper bound), below
+       the 20-25% threshold. Rank #3. See
+       bench/baselines/cuda-post-residency-profile-2026-07-10.md. -->
 - B5. **MoE polish** (1 session). Device-side routing softmax/top-k if A4
   shows router glue matters; otherwise skip.
 
@@ -280,6 +308,7 @@ parallel (the scaffold already mirrors CUDA's module layout).
 | ~~1~~ | ~~A — hardware validation~~ | ~~2-4~~ | ~~✅ DONE (GPU-004)~~ |
 | 1 | **A-stabilization** — decode parity fix | 1-2 | ⏳ fix applied (ASTAB-001), pending hardware validation — blocks correct inference |
 | 2 | B1 + B2 — resident KV + cross-layer | 2-4 | after A-stabilization |
+| 2b | **D6 — resident-hidden Q4_K_M eligibility** | 1 | after B2 — A4 profile's #1 recommendation (RTX 3060 evidence, pending 3090) |
 | 3 | D1 + D2 + D5 — Vulkan bootstrap + first kernel + pipeline extraction | 3-4 | can start during B |
 | 4 | C1 + C3 — coarse bridge + CLI polish | 1½-2½ | any time |
 | 5 | E — CI (E2 as soon as D2 lands) | 1-2 | with D2 |
