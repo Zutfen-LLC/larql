@@ -138,6 +138,28 @@ impl Drop for ResidentFfnGraph {
     }
 }
 
+// SAFETY (Send + Sync for the graph-state types):
+//
+// `CudaGraph` is documented by cudarc as NOT internally synchronized — "API
+// calls accessing the same graph object must be serialized externally." LARQL's
+// resident decode is single-threaded per token (the existing `CudaBackend`
+// contract: one decode stream, no concurrent graph access), and every graph-
+// state field is reachable only through a `Mutex` on `CudaBackend`. The decode
+// loop holds the mutex briefly (to look up or insert a graph entry) and drops
+// the guard before launching; no two threads ever touch the same graph object
+// concurrently. Asserting `Send + Sync` here is sound under that contract —
+// the `Mutex` provides the external serialization cudarc requires.
+unsafe impl Send for ResidentFfnGraph {}
+unsafe impl Sync for ResidentFfnGraph {}
+unsafe impl Send for ResidentFfnGraphScratch {}
+unsafe impl Sync for ResidentFfnGraphScratch {}
+unsafe impl Send for RetainedWeights {}
+unsafe impl Sync for RetainedWeights {}
+unsafe impl Send for ResidentFfnGraphCache {}
+unsafe impl Sync for ResidentFfnGraphCache {}
+unsafe impl Send for ResidentDecodeArena {}
+unsafe impl Sync for ResidentDecodeArena {}
+
 /// Generation-scoped cache of per-layer FFN graphs.
 ///
 /// Keyed by `(generation, layer_index)` — the plan-level identity

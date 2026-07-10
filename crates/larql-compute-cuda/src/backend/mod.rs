@@ -41,6 +41,24 @@ pub struct CudaBackend {
     /// recorder methods short-circuit otherwise). Surfaced via
     /// `profile_diag()` / `take_profile_counters()`.
     profile: ProfileCounters,
+    /// B3A: the resident-FFN graph replay mode, resolved ONCE at backend
+    /// construction from `LARQL_CUDA_GRAPHS` (B3A review point 9 — the hot
+    /// path reads this field, never process-global env). `Auto` = use the
+    /// graph path when a layer is eligible; `Disabled` = never (kill switch).
+    /// Default is `Disabled` until the B3A-11 performance gate flips it.
+    graph_mode: crate::ffn_graph::GraphMode,
+    /// B3A: capture-aware graph profiling counters (point 8). All zeroed at
+    /// construction; only mutated when `LARQL_GPU_PROFILE=1`. Surfaced via
+    /// `graph_diag()` / `take_profile_counters()`.
+    graph_profile: GraphProfileCounters,
+    /// B3A: generation-scoped cache of per-layer resident-FFN executable
+    /// graphs. Allocated lazily; reset (graphs destroyed, generation
+    /// advanced) at every `reset_kv_cache` BEFORE the weight cache flushes.
+    graph_cache: std::sync::Mutex<crate::ffn_graph_state::ResidentFfnGraphCache>,
+    /// B3A: the resident decode arena (ping-pong hidden buffers + capture
+    /// stream). `None` until the first graph-eligible decode token allocates
+    /// it; dropped (with the graphs) at generation reset.
+    arena: std::sync::Mutex<Option<crate::ffn_graph_state::ResidentDecodeArena>>,
     /// Test-only eligibility hook for exercising a resident → fallback →
     /// resident transition without changing any layer math.
     #[cfg(test)]
@@ -58,6 +76,34 @@ struct ProfileCounters {
     mirror_append_ns: std::sync::atomic::AtomicU64,
     mirror_rows_copied: std::sync::atomic::AtomicU64,
     hidden_readback_ns: std::sync::atomic::AtomicU64,
+}
+
+/// B3A capture-aware graph profiling counters (review point 8). All
+/// `AtomicU64` with `Ordering::Relaxed`; only mutated when
+/// `LARQL_GPU_PROFILE=1` (the recorder methods short-circuit otherwise).
+///
+/// The distinction between `direct_kernel_submissions` (individual `*_dev`
+/// launches, counted by `note_launch`), `graph_submissions` (one per
+/// `CudaGraph::launch()`), and `captured_kernel_nodes` (the physical nodes a
+/// graph contains, counted once at build) is what makes the submission-
+/// reduction accounting honest. `logical_graph_kernel_executions` =
+/// `captured_kernel_nodes` × replays.
+#[derive(Default)]
+struct GraphProfileCounters {
+    /// One per `CudaGraph::launch()` (incl. token 1 — review point 1).
+    graph_submissions: std::sync::atomic::AtomicU64,
+    /// One per `ResidentFfnGraph::build()` (one per eligible layer per gen).
+    graph_builds: std::sync::atomic::AtomicU64,
+    /// += kernel_node_count() at build time.
+    captured_kernel_nodes: std::sync::atomic::AtomicU64,
+    /// += kernel_node_count() per replay.
+    logical_graph_kernel_executions: std::sync::atomic::AtomicU64,
+    /// Build `Err` count.
+    graph_failures: std::sync::atomic::AtomicU64,
+    /// Replay `Err` → resident device chain fallback count.
+    graph_fallbacks: std::sync::atomic::AtomicU64,
+    /// Any D2D copy on the graph path (expected 0; counted honestly if any).
+    d2d_submissions: std::sync::atomic::AtomicU64,
 }
 
 /// A consumed snapshot of the profile counters, returned by
@@ -128,6 +174,7 @@ impl CudaBackend {
     }
 
     pub fn with_options(options: BackendOptions) -> Result<Self, BackendInitError> {
+        let graph_mode = crate::ffn_graph::graph_mode_from_env();
         match CudaRuntime::initialize(options.device_ordinal) {
             Ok(runtime) => Ok(Self {
                 options,
@@ -140,6 +187,12 @@ impl CudaBackend {
                 resident_hidden_uses: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_fallbacks: std::sync::atomic::AtomicU64::new(0),
                 profile: ProfileCounters::default(),
+                graph_mode,
+                graph_profile: GraphProfileCounters::default(),
+                graph_cache: std::sync::Mutex::new(
+                    crate::ffn_graph_state::ResidentFfnGraphCache::new(),
+                ),
+                arena: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
                     usize::MAX,
@@ -156,6 +209,12 @@ impl CudaBackend {
                 resident_hidden_uses: std::sync::atomic::AtomicU64::new(0),
                 resident_hidden_fallbacks: std::sync::atomic::AtomicU64::new(0),
                 profile: ProfileCounters::default(),
+                graph_mode,
+                graph_profile: GraphProfileCounters::default(),
+                graph_cache: std::sync::Mutex::new(
+                    crate::ffn_graph_state::ResidentFfnGraphCache::new(),
+                ),
+                arena: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
                     usize::MAX,
@@ -329,6 +388,13 @@ impl CudaBackend {
     /// kernels on the same stream and read back once.
     pub(crate) fn runtime(&self) -> Option<&Arc<CudaRuntime>> {
         self.runtime.as_ref()
+    }
+
+    /// B3A: the resident-FFN graph replay mode (B3A review point 9). Resolved
+    /// once at construction from `LARQL_CUDA_GRAPHS`; the decode hot path reads
+    /// this field, never process-global env.
+    pub(crate) fn graph_mode(&self) -> crate::ffn_graph::GraphMode {
+        self.graph_mode
     }
 
     /// Snapshot the persistent weight-cache hit/miss counters and resident-byte
@@ -1052,6 +1118,17 @@ impl CudaBackend {
     /// resets the KV cache) — see [`CudaBackend::flush_weight_cache`] for
     /// cross-vindex reuse.
     pub(crate) fn reset_kv_cache_native(&self) {
+        // B3A-6: destroy executable graphs + release scratch + retained weights
+        // BEFORE flushing the weight cache (so graph teardown references valid
+        // buffers), then advance the generation (the primary ABA defense).
+        if let Ok(mut cache) = self.graph_cache.lock() {
+            cache.reset();
+        }
+        // The arena (ping-pong buffers + capture stream) is generation-scoped;
+        // drop it so the next generation allocates fresh stable-address buffers.
+        if let Ok(mut arena) = self.arena.lock() {
+            arena.take();
+        }
         if let Some(runtime) = self.runtime.as_ref() {
             runtime.flush_weight_cache();
         }
