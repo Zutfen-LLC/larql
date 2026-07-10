@@ -57,12 +57,12 @@ pub struct CudaBackend {
     /// graphs. Allocated lazily; reset (graphs destroyed, generation
     /// advanced) at every `reset_kv_cache` BEFORE the weight cache flushes.
     #[allow(dead_code)]
-    graph_cache: std::sync::Mutex<crate::ffn_graph_state::ResidentFfnGraphCache>,
+    pub(crate) graph_cache: std::sync::Mutex<crate::ffn_graph_state::ResidentFfnGraphCache>,
     /// B3A: the resident decode arena (ping-pong hidden buffers + capture
     /// stream). `None` until the first graph-eligible decode token allocates
     /// it; dropped (with the graphs) at generation reset.
     #[allow(dead_code)]
-    arena: std::sync::Mutex<Option<crate::ffn_graph_state::ResidentDecodeArena>>,
+    pub(crate) arena: std::sync::Mutex<Option<crate::ffn_graph_state::ResidentDecodeArena>>,
     /// Test-only eligibility hook for exercising a resident → fallback →
     /// resident transition without changing any layer math.
     #[cfg(test)]
@@ -535,6 +535,98 @@ impl CudaBackend {
         };
         Some(format!(
             "cuda resident-hidden decode: uses={uses}, fallbacks={fallbacks}, resident_rate={rate}"
+        ))
+    }
+
+    // ── B3A graph profiling recorders (capture-aware, point 8) ──────────
+    //
+    // All gate on `gpu_profile_enabled()` so normal decode is a no-op branch.
+    // The direct/graph/captured distinction makes submission accounting honest.
+
+    #[allow(dead_code)]
+    pub(crate) fn note_graph_build(&self) {
+        if crate::options::gpu_profile_enabled() {
+            self.graph_profile
+                .graph_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn note_graph_submission(&self) {
+        if crate::options::gpu_profile_enabled() {
+            self.graph_profile
+                .graph_submissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn note_graph_captured_nodes(&self, nodes: u32) {
+        if crate::options::gpu_profile_enabled() {
+            self.graph_profile
+                .captured_kernel_nodes
+                .fetch_add(nodes as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn note_graph_logical_exec(&self, nodes: u32) {
+        if crate::options::gpu_profile_enabled() {
+            self.graph_profile
+                .logical_graph_kernel_executions
+                .fetch_add(nodes as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn note_graph_failure(&self) {
+        if crate::options::gpu_profile_enabled() {
+            self.graph_profile
+                .graph_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn note_graph_fallback(&self) {
+        if crate::options::gpu_profile_enabled() {
+            self.graph_profile
+                .graph_fallbacks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn note_graph_d2d(&self) {
+        if crate::options::gpu_profile_enabled() {
+            self.graph_profile
+                .d2d_submissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// B3A graph diagnostic: one-liner for the graph replay counters, or `None`
+    /// when no graph activity has occurred. Surfaced through `device_info()`
+    /// when `LARQL_GPU_DIAG` is set.
+    #[allow(dead_code)]
+    pub fn graph_diag(&self) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let builds = self.graph_profile.graph_builds.load(Ordering::Relaxed);
+        let submissions = self.graph_profile.graph_submissions.load(Ordering::Relaxed);
+        let failures = self.graph_profile.graph_failures.load(Ordering::Relaxed);
+        let fallbacks = self.graph_profile.graph_fallbacks.load(Ordering::Relaxed);
+        if builds == 0 && submissions == 0 && failures == 0 && fallbacks == 0 {
+            return None;
+        }
+        let warm = submissions.saturating_sub(builds);
+        let replay_rate = if submissions == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.1}%", (warm as f64 / submissions as f64) * 100.0)
+        };
+        Some(format!(
+            "cuda resident-FFN graph: builds={builds}, submissions={submissions}, replays={warm}, failures={failures}, fallbacks={fallbacks}, replay_rate={replay_rate}"
         ))
     }
 

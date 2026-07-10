@@ -1986,7 +1986,7 @@ impl CudaRuntime {
         let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
             RuntimeError::context("allocating CUDA q4k_matvec_dev output buffer", err)
         })?;
-        self.launch_q4k_matvec_into(&w_dev, x_dev, &mut out_dev, num_rows, hidden)?;
+        self.launch_q4k_matvec_into(&self.stream, &w_dev, x_dev, &mut out_dev, num_rows, hidden)?;
         Ok(out_dev)
     }
 
@@ -1995,12 +1995,14 @@ impl CudaRuntime {
     /// The graph-capture twin of [`launch_q4k_matvec_dev`]: takes an
     /// already-resolved `w_dev` (from the weight cache — resolved before capture
     /// so its device address is stable) and writes into `out_dev` (a stable
-    /// graph-owned buffer) instead of allocating a fresh `CudaSlice`. Shares the
-    /// kernel-arg layout + `LaunchConfig` with `_dev` so the two cannot drift;
-    /// the `_dev` launcher delegates here after its `alloc_zeros`.
-    #[allow(dead_code)]
+    /// graph-owned buffer) instead of allocating a fresh `CudaSlice`. Launches
+    /// on `stream` (the capture stream for graph capture, `self.stream` for the
+    /// non-graph `_dev` path). Shares the kernel-arg layout + `LaunchConfig`
+    /// with `_dev` so the two cannot drift; the `_dev` launcher delegates here
+    /// after its `alloc_zeros`.
     pub(crate) fn launch_q4k_matvec_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         w_dev: &std::sync::Arc<CudaSlice<u8>>,
         x_dev: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
@@ -2021,7 +2023,7 @@ impl CudaRuntime {
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(&self.q4k_matvec);
+        let mut launch_args = stream.launch_builder(&self.q4k_matvec);
         launch_args
             .arg(&**w_dev)
             .arg(x_dev)
@@ -2090,16 +2092,16 @@ impl CudaRuntime {
         let mut out_dev = self.stream.alloc_zeros::<f32>(num_rows).map_err(|err| {
             RuntimeError::context("allocating CUDA q6k_matvec_dev output buffer", err)
         })?;
-        self.launch_q6k_matvec_into(&w_dev, x_dev, &mut out_dev, num_rows, hidden)?;
+        self.launch_q6k_matvec_into(&self.stream, &w_dev, x_dev, &mut out_dev, num_rows, hidden)?;
         Ok(out_dev)
     }
 
     /// Q6_K × f32 matvec into a pre-allocated stable output buffer (B3A-4).
     /// Graph-capture twin of [`launch_q6k_matvec_dev`]; see
     /// [`launch_q4k_matvec_into`] for the contract.
-    #[allow(dead_code)]
     pub(crate) fn launch_q6k_matvec_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         w_dev: &std::sync::Arc<CudaSlice<u8>>,
         x_dev: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
@@ -2120,7 +2122,7 @@ impl CudaRuntime {
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(&self.q6k_matvec);
+        let mut launch_args = stream.launch_builder(&self.q6k_matvec);
         launch_args
             .arg(&**w_dev)
             .arg(x_dev)
@@ -2244,12 +2246,14 @@ impl CudaRuntime {
     #[allow(dead_code)]
     pub(crate) fn launch_geglu_silu_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         gate_dev: &CudaSlice<f32>,
         up_dev: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
         n: usize,
     ) -> Result<(), RuntimeError> {
         self.launch_elementwise_binary_into(
+            stream,
             &self.geglu_silu,
             gate_dev,
             up_dev,
@@ -2264,12 +2268,14 @@ impl CudaRuntime {
     #[allow(dead_code)]
     pub(crate) fn launch_geglu_gelu_tanh_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         gate_dev: &CudaSlice<f32>,
         up_dev: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
         n: usize,
     ) -> Result<(), RuntimeError> {
         self.launch_elementwise_binary_into(
+            stream,
             &self.geglu_gelu_tanh,
             gate_dev,
             up_dev,
@@ -2284,11 +2290,13 @@ impl CudaRuntime {
     #[allow(dead_code)]
     pub(crate) fn launch_activation_silu_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         input_dev: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
         n: usize,
     ) -> Result<(), RuntimeError> {
         self.launch_elementwise_unary_into(
+            stream,
             &self.activation_silu,
             input_dev,
             out_dev,
@@ -2301,11 +2309,13 @@ impl CudaRuntime {
     #[allow(dead_code)]
     pub(crate) fn launch_activation_gelu_tanh_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         input_dev: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
         n: usize,
     ) -> Result<(), RuntimeError> {
         self.launch_elementwise_unary_into(
+            stream,
             &self.activation_gelu_tanh,
             input_dev,
             out_dev,
@@ -2321,6 +2331,7 @@ impl CudaRuntime {
     #[allow(dead_code)]
     pub(crate) fn launch_residual_add_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         h_dev: &CudaSlice<f32>,
         x_dev: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
@@ -2328,6 +2339,7 @@ impl CudaRuntime {
         b_scale: f32,
     ) -> Result<(), RuntimeError> {
         self.launch_elementwise_binary_into(
+            stream,
             &self.residual_add,
             h_dev,
             x_dev,
@@ -2371,20 +2383,29 @@ impl CudaRuntime {
             .stream
             .alloc_zeros::<f32>(n)
             .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
-        self.launch_elementwise_binary_into(func, in_a, in_b, &mut out_dev, extra_scalar, n, ctx)?;
+        self.launch_elementwise_binary_into(
+            &self.stream,
+            func,
+            in_a,
+            in_b,
+            &mut out_dev,
+            extra_scalar,
+            n,
+            ctx,
+        )?;
         Ok(out_dev)
     }
 
     /// Binary elementwise into a pre-allocated stable output buffer (B3A-4).
     ///
     /// The graph-capture core: writes into `out_dev` (a stable graph-owned
-    /// buffer) instead of allocating. Shares the kernel-arg layout +
-    /// `LaunchConfig` with the `_dev` twin so the two cannot drift; the `_dev`
-    /// launcher delegates here after its `alloc_zeros`.
-    #[allow(dead_code)]
+    /// buffer) instead of allocating. Launches on `stream`. Shares the kernel-
+    /// arg layout + `LaunchConfig` with the `_dev` twin so the two cannot drift;
+    /// the `_dev` launcher delegates here after its `alloc_zeros`.
     #[allow(clippy::too_many_arguments)]
     fn launch_elementwise_binary_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         func: &CudaFunction,
         in_a: &CudaSlice<f32>,
         in_b: &CudaSlice<f32>,
@@ -2406,7 +2427,7 @@ impl CudaRuntime {
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(func);
+        let mut launch_args = stream.launch_builder(func);
         launch_args.arg(in_a).arg(in_b).arg(out_dev);
         if let Some(ref scalar) = extra_scalar {
             launch_args.arg(scalar);
@@ -2448,15 +2469,15 @@ impl CudaRuntime {
             .stream
             .alloc_zeros::<f32>(n)
             .map_err(|err| RuntimeError::context_concat("allocating CUDA ", ctx, " output", err))?;
-        self.launch_elementwise_unary_into(func, input, &mut out_dev, n, ctx)?;
+        self.launch_elementwise_unary_into(&self.stream, func, input, &mut out_dev, n, ctx)?;
         Ok(out_dev)
     }
 
     /// Unary elementwise into a pre-allocated stable output buffer (B3A-4).
     /// Graph-capture core; see [`launch_elementwise_binary_into`].
-    #[allow(dead_code)]
     fn launch_elementwise_unary_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         func: &CudaFunction,
         input: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
@@ -2475,7 +2496,7 @@ impl CudaRuntime {
             block_dim: (threads_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(func);
+        let mut launch_args = stream.launch_builder(func);
         launch_args.arg(input).arg(out_dev).arg(&n_u);
         unsafe { launch_args.launch(cfg) }
             .map_err(|err| RuntimeError::context_concat("launching CUDA ", ctx, " kernel", err))?;
@@ -2605,12 +2626,13 @@ impl CudaRuntime {
     /// is a pre-uploaded stable weight buffer (from [`upload_rms_norm_weight`]),
     /// and the output writes into `out_dev` (a stable graph-owned buffer) instead
     /// of allocating. `has_weight` is `1` when a real weight was uploaded, `0`
-    /// for the parameter-free placeholder path. Shares the kernel-arg layout +
-    /// `LaunchConfig` with `_dev`.
+    /// for the parameter-free placeholder path. Launches on `stream`. Shares the
+    /// kernel-arg layout + `LaunchConfig` with `_dev`.
     #[allow(clippy::too_many_arguments)]
     #[allow(dead_code)]
     pub(crate) fn launch_rms_norm_into(
         &self,
+        stream: &cudarc::driver::CudaStream,
         x_dev: &CudaSlice<f32>,
         weight_dev: &CudaSlice<f32>,
         out_dev: &mut CudaSlice<f32>,
@@ -2633,7 +2655,7 @@ impl CudaRuntime {
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch_args = self.stream.launch_builder(&self.rms_norm);
+        let mut launch_args = stream.launch_builder(&self.rms_norm);
         launch_args
             .arg(x_dev)
             .arg(weight_dev)

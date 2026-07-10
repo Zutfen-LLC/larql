@@ -290,6 +290,16 @@ impl ResidentDecodeArena {
 
     /// The "input" buffer for the current layer (the one attention just wrote).
     /// Layers alternate: even layers read A, odd layers read B (flip by index).
+    /// Returns `&mut` so the graph-build/replay path can D2D-copy into it.
+    pub(crate) fn input_mut(&mut self, flip: bool) -> &mut CudaSlice<f32> {
+        if flip {
+            &mut self.hidden_b
+        } else {
+            &mut self.hidden_a
+        }
+    }
+
+    /// Borrow the input buffer immutably (for graph capture — the graph reads it).
     pub(crate) fn input(&self, flip: bool) -> &CudaSlice<f32> {
         if flip {
             &self.hidden_b
@@ -298,13 +308,36 @@ impl ResidentDecodeArena {
         }
     }
 
-    /// The "output" buffer for the current layer (the one the FFN graph writes).
-    /// Opposite of input — after the graph writes, the next layer reads it.
+    /// Borrow the output buffer immutably (for reading after graph replay).
     pub(crate) fn output(&self, flip: bool) -> &CudaSlice<f32> {
         if flip {
             &self.hidden_a
         } else {
             &self.hidden_b
+        }
+    }
+
+    /// Borrow the output buffer mutably (for graph capture — the graph writes it).
+    pub(crate) fn output_mut(&mut self, flip: bool) -> &mut CudaSlice<f32> {
+        if flip {
+            &mut self.hidden_a
+        } else {
+            &mut self.hidden_b
+        }
+    }
+
+    /// Borrow both the input and output buffers mutably simultaneously. They
+    /// are disjoint fields (`hidden_a` / `hidden_b`), so this is safe and lets
+    /// the graph-capture path hold both a `&CudaSlice` input (read) and a
+    /// `&mut CudaSlice` output (write) across the captured kernel launches.
+    pub(crate) fn input_output_mut(
+        &mut self,
+        flip: bool,
+    ) -> (&CudaSlice<f32>, &mut CudaSlice<f32>) {
+        if flip {
+            (&self.hidden_b, &mut self.hidden_a)
+        } else {
+            (&self.hidden_a, &mut self.hidden_b)
         }
     }
 
