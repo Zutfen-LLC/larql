@@ -5816,8 +5816,20 @@ mod tests {
     // the host norm + CPU Q4_K matvec + top_k reference. Both layers run on
     // the real CUDA runtime; all are no-ops on hosts without CUDA.
 
-    /// Host top-K reference, matching `lm_head_knn_backend`'s contract:
-    // descending by score, non-finite skipped, capped at `k`.
+    /// Explicit lexicographic candidate ordering shared by the host reference
+    /// and the device reduction kernels (B4-CORRECTION B). Candidate `x`
+    /// ranks ahead of `y` when `x.score > y.score`, OR the scores are equal
+    /// and `x.id < y.id`. Non-finite scores are excluded before this is
+    /// applied. Pure (no device) so the comparator itself is unit-testable on
+    /// every host; both `host_topk` and the device-kernel expectations derive
+    /// from it rather than from incidental stable-sort behavior.
+    fn greedy_ranks_higher(x: (u32, f32), y: (u32, f32)) -> bool {
+        x.1 > y.1 || (x.1 == y.1 && x.0 < y.0)
+    }
+
+    /// Host top-K reference using the explicit lexicographic comparator
+    /// (B4-CORRECTION B): descending by score, exact ties broken by lower
+    /// token id, non-finite skipped, capped at `k`.
     fn host_topk(scores: &[f32], k: usize) -> Vec<(u32, f32)> {
         let mut indexed: Vec<(u32, f32)> = scores
             .iter()
@@ -5826,8 +5838,16 @@ mod tests {
             .filter(|(_, s)| s.is_finite())
             .map(|(i, s)| (i as u32, s))
             .collect();
-        // Min-heap isn't needed for the small test sizes; sort + truncate.
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Explicit comparator — do NOT rely on stable-sort input order.
+        indexed.sort_by(|a, b| {
+            if greedy_ranks_higher(*a, *b) {
+                std::cmp::Ordering::Less
+            } else if greedy_ranks_higher(*b, *a) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
         indexed.truncate(k);
         indexed
     }
@@ -5948,18 +5968,15 @@ mod tests {
                 let dev = device_reduce_topk(&b, scores, k);
                 let host = host_topk(scores, k);
                 assert_eq!(dev.len(), host.len(), "case {ci} k={k}: len mismatch");
-                // The winner must always match.
-                assert_eq!(dev[0].0, host[0].0, "case {ci} k={k}: winner mismatch");
-                // The candidate SET must match (order may differ only on
-                // exact ties, which these fixtures avoid).
-                let dev_set: std::collections::HashSet<u32> = dev.iter().map(|(t, _)| *t).collect();
-                let host_set: std::collections::HashSet<u32> =
-                    host.iter().map(|(t, _)| *t).collect();
-                assert_eq!(dev_set, host_set, "case {ci} k={k}: set mismatch");
-                // Scores within Q4_K-free tolerance (reduction is exact here).
-                for ((dt, ds), (ht, hs)) in dev.iter().zip(host.iter()) {
-                    assert_eq!(dt, ht, "case {ci} k={k}: token order");
-                    assert!((ds - hs).abs() < 1e-4, "case {ci} k={k}: score drift");
+                // B4-CORRECTION B: exact token ORDER must now match, including
+                // exact ties (lower id first), since the device and host share
+                // one explicit lexicographic comparator.
+                for (rank, ((dt, ds), (ht, hs))) in dev.iter().zip(host.iter()).enumerate() {
+                    assert_eq!(dt, ht, "case {ci} k={k} rank={rank}: token order");
+                    assert!(
+                        (ds - hs).abs() < 1e-4,
+                        "case {ci} k={k} rank={rank}: score drift"
+                    );
                 }
             }
         }
@@ -6007,6 +6024,236 @@ mod tests {
         assert_eq!(dev.len(), 2, "only finite candidates returned");
         assert_eq!(dev[0].0, 7);
         assert_eq!(dev[1].0, 3);
+    }
+
+    // ── B4-CORRECTION B: adversarial exact-tie parity tests ────────────
+    //
+    // The pre-correction final reduction compared only `partial_scores` and
+    // broke ties on partial-buffer position / strided-scan order, which can
+    // select the WRONG (higher) token id when two partial candidates share a
+    // score. These fixtures pin the lexicographic (score desc, id asc)
+    // contract across blocks, threads, scan positions, and the full returned
+    // candidate set. Each runs on the real CUDA runtime.
+
+    /// Build a score vector of length `n` that is `base` everywhere, then
+    /// overrride the given `(index, score)` pairs. Helper for tie fixtures.
+    fn tie_scores(n: usize, base: f32, overrides: &[(usize, f32)]) -> Vec<f32> {
+        let mut s = vec![base; n];
+        for (i, v) in overrides {
+            s[*i] = *v;
+        }
+        s
+    }
+
+    /// Assert the device reduction exactly equals the host lexicographic
+    /// top-k (token ids AND scores, in order).
+    fn assert_device_matches_host_ties(b: &CudaBackend, scores: &[f32], k: usize, ctx: &str) {
+        let dev = device_reduce_topk(b, scores, k);
+        let host = host_topk(scores, k);
+        assert_eq!(dev.len(), host.len(), "{ctx}: len mismatch");
+        for (rank, ((dt, ds), (ht, hs))) in dev.iter().zip(host.iter()).enumerate() {
+            assert_eq!(dt, ht, "{ctx} rank={rank}: tie broke to wrong token id");
+            assert!((ds - hs).abs() < 1e-5, "{ctx} rank={rank}: score drift");
+        }
+    }
+
+    #[test]
+    fn b4c_tie_within_one_partial_block() {
+        // (1) Two exact ties within one 256-row block. The lower id must win.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // tokens 10 and 200 (both in block 0) tie at 5.0; token 5 wins alone
+        // at 9.0. Top-3 = [5, 10, 200].
+        let s = tie_scores(256, 1.0, &[(5, 9.0), (10, 5.0), (200, 5.0)]);
+        assert_device_matches_host_ties(&b, &s, 3, "within-block");
+        let dev = device_reduce_topk(&b, &s, 3);
+        assert_eq!(dev[1].0, 10, "within-block tie: lower id 10 before 200");
+        assert_eq!(dev[2].0, 200);
+    }
+
+    #[test]
+    fn b4c_tie_across_two_partial_blocks() {
+        // (2) Exact tie across two different blocks: token 3 (block 0) and
+        // token 300 (block 1, 300/256=1). Both score 5.0. Lower id wins.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let s = tie_scores(600, 1.0, &[(3, 5.0), (300, 5.0), (400, 8.0)]);
+        assert_device_matches_host_ties(&b, &s, 3, "cross-block");
+        let dev = device_reduce_topk(&b, &s, 3);
+        assert_eq!(dev[0].0, 400, "cross-block: clear winner");
+        assert_eq!(dev[1].0, 3, "cross-block tie: lower id 3 before 300");
+        assert_eq!(dev[2].0, 300);
+    }
+
+    #[test]
+    fn b4c_tie_first_and_last_logical_rows() {
+        // (3) Tie across row 0 and the last logical row.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let n = 700;
+        let s = tie_scores(n, 0.5, &[(0, 7.0), (n - 1, 7.0), (250, 6.0)]);
+        assert_device_matches_host_ties(&b, &s, 3, "first-last");
+        let dev = device_reduce_topk(&b, &s, 3);
+        assert_eq!(dev[0].0, 0, "first-last tie: id 0 before last row");
+        assert_eq!(dev[1].0, (n - 1) as u32);
+    }
+
+    #[test]
+    fn b4c_tie_across_final_reduction_threads_and_strided_scan() {
+        // (4)+(5) The decisive adversarial case. With more than 256 partial
+        // candidates the final kernel's per-thread strided scan wraps, so a
+        // high-id candidate at partial position 256 (visited by thread 0 in
+        // its second iteration) can outrank a low-id candidate at position 1
+        // (visited by thread 1) under the OLD score-only comparator (thread 0
+        // beats thread 1 on ties). The lexicographic comparator must still
+        // pick the lower id. We use ALL-EQUAL scores so the correct top-k is
+        // exactly tokens [0,1,2,3,4]; any position/thread tie-break that isn't
+        // purely id-based returns the wrong set.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // 60 blocks * 256 = 15360 rows; num_partials = 60*5 = 300 > 256, so
+        // position 256 exists and is visited by thread 0 (second iteration).
+        let n = 60 * 256;
+        let scores = vec![1.0f32; n];
+        assert_device_matches_host_ties(&b, &scores, 5, "all-equal-strided");
+        let dev = device_reduce_topk(&b, &scores, 5);
+        let expect: Vec<u32> = (0..5).collect();
+        let got: Vec<u32> = dev.iter().map(|(t, _)| *t).collect();
+        assert_eq!(got, expect, "all-equal top-5 must be the five lowest ids");
+    }
+
+    #[test]
+    fn b4c_tie_second_through_fifth_ordering() {
+        // (6) The full returned candidate set is id-ordered on ties, not just
+        // the winner. Five tokens tie at the top score across five blocks.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // ids 2, 258, 514, 770, 1026 — one per block (0..4), all score 4.0.
+        let mut overrides = Vec::new();
+        for blk in 0..5 {
+            overrides.push((blk * 256 + 2, 4.0));
+        }
+        let s = tie_scores(5 * 256, 1.0, &overrides);
+        assert_device_matches_host_ties(&b, &s, 5, "second-fifth");
+        let dev = device_reduce_topk(&b, &s, 5);
+        for (i, d) in dev.iter().enumerate() {
+            assert_eq!(d.0, (i as u32) * 256 + 2, "rank {i} id ordering on ties");
+        }
+    }
+
+    #[test]
+    fn b4c_tie_equal_negative_scores() {
+        // (7) Equal negative scores tie-break identically.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let s = tie_scores(700, -10.0, &[(1, -3.0), (500, -3.0), (300, -1.0)]);
+        assert_device_matches_host_ties(&b, &s, 3, "negative");
+        let dev = device_reduce_topk(&b, &s, 3);
+        assert_eq!(dev[0].0, 300, "negative: least-negative wins");
+        assert_eq!(dev[1].0, 1, "negative tie: lower id first");
+        assert_eq!(dev[2].0, 500);
+    }
+
+    #[test]
+    fn b4c_tie_adjacent_to_nan_and_infinity() {
+        // (8) Tied finite scores sit next to NaN and ±∞. Non-finite excluded;
+        // the finite tie still breaks to the lower id.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let mut s = tie_scores(600, 1.0, &[(7, 5.0), (8, 5.0), (9, 6.0)]);
+        s[6] = f32::NAN;
+        s[10] = f32::INFINITY;
+        s[11] = f32::NEG_INFINITY;
+        assert_device_matches_host_ties(&b, &s, 3, "nan-inf-adjacent");
+        let dev = device_reduce_topk(&b, &s, 3);
+        assert_eq!(dev[0].0, 9, "finite winner beside non-finite");
+        assert_eq!(dev[1].0, 7, "tie beside non-finite: lower id first");
+        assert_eq!(dev[2].0, 8);
+    }
+
+    #[test]
+    fn b4c_tie_is_byte_identical_across_repeats() {
+        // (10) The same reduction repeated must return byte-identical order.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let n = 60 * 256; // exercises the strided scan (>256 partials)
+        let scores = vec![1.0f32; n];
+        let first = device_reduce_topk(&b, &scores, 5);
+        for rep in 0..8 {
+            let again = device_reduce_topk(&b, &scores, 5);
+            assert_eq!(first, again, "repeat {rep}: non-deterministic tie order");
+        }
+    }
+
+    #[test]
+    fn b4c_tie_padding_rows_remain_excluded_under_ties() {
+        // (9) Logical-vocabulary protection under ties at the boundary. The
+        // device GEMV reads only [0, logical) rows, so padding rows can never
+        // score or tie. This confirms the chain (via device_greedy_chain)
+        // returns only logical ids even when logical-row scores tie and the
+        // boundary token is among them.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let hidden = 256usize;
+        let logical = 300usize;
+        // Two logical rows engineered to produce equal lm-head scores against
+        // a symmetric query; padding rows [300..600) set huge. The winner and
+        // every candidate must be < logical.
+        let mut f32_rows = vec![0.0f32; 600 * hidden];
+        for v in 0..600 {
+            for h in 0..hidden {
+                f32_rows[v * hidden + h] = if v < logical {
+                    1.0 // uniform → many logical rows tie
+                } else {
+                    1000.0 // padding dominated, would win without restriction
+                };
+            }
+        }
+        let lm_head_q4k = quantize_q4_k(&f32_rows);
+        let hidden_vec: Vec<f32> = vec![1.0; hidden];
+        let runtime = b.runtime().unwrap();
+        let hidden_dev = runtime.upload_f32(&hidden_vec).unwrap();
+        let dev_pick = device_greedy_chain(
+            &b,
+            &hidden_dev,
+            &lm_head_q4k,
+            None,
+            hidden,
+            logical,
+            1e-6,
+            1.0,
+            5,
+        );
+        assert!(
+            (dev_pick.token_id as usize) < logical,
+            "padding won under ties"
+        );
+        for (id, _) in &dev_pick.probability_hits {
+            assert!((*id as usize) < logical, "padding candidate under ties");
+        }
+        // On the all-uniform logical block the top-5 must be the five lowest
+        // logical ids (0..5) — the tie contract applied within the logical
+        // range, with padding fully excluded.
+        let got: Vec<u32> = dev_pick.probability_hits.iter().map(|(t, _)| *t).collect();
+        assert_eq!(got, vec![0, 1, 2, 3, 4], "logical tie order under padding");
     }
 
     /// Build a deterministic f32 lm-head `[vocab, hidden]` and quantize to
@@ -6058,8 +6305,27 @@ mod tests {
         let num_blocks = logical.div_ceil(crate::ops::GREEDY_BLOCK_SIZE);
         let partial_len = (num_blocks * kk).max(crate::ops::GREEDY_MAX_K);
         let mut normed = runtime.stream().alloc_zeros::<f32>(hidden).unwrap();
+        // B4-CORRECTION C: mirror the production path — resolve the final-norm
+        // weight through the f32 weight cache and pass a device handle to
+        // `launch_rms_norm_into`, so the test exercises the same launcher the
+        // resident chain uses (not a per-call-upload variant).
+        let (norm_slice, norm_has_weight): (&[f32], i32) = match norm_weight {
+            Some(w) => (w, 1),
+            None => (&crate::greedy_workspace::PARAM_FREE_NORM_PLACEHOLDER[..], 0),
+        };
+        let norm_weight_dev = runtime.resolve_f32_weight(norm_slice).unwrap();
         runtime
-            .launch_rms_norm_into_dev(hidden_dev, &mut normed, norm_weight, 1, hidden, eps, offset)
+            .launch_rms_norm_into(
+                runtime.stream(),
+                hidden_dev,
+                &norm_weight_dev,
+                &mut normed,
+                1,
+                hidden,
+                eps,
+                offset,
+                norm_has_weight,
+            )
             .unwrap();
         let row_bytes = (hidden / 256) * 144;
         let w_dev = runtime
@@ -6272,11 +6538,21 @@ mod tests {
         // the same (RMSNorm is scale-equivariant under uniform weight for
         // the argmax), but the SCORES differ. Run both and confirm the
         // winner is stable while scores differ.
+        //
+        // B4-CORRECTION C: the weights are now resolved through the f32
+        // weight cache, keyed on `(ptr, len)`. Bind both weights to
+        // long-lived locals so their heap addresses are distinct (the cache
+        // is ptr-identity keyed — two dropped-and-reallocated temporaries
+        // could share a recycled address and trigger an ABA hit, returning
+        // the wrong weight). Production weights are stable mmap slices, so
+        // this mirrors the real lifetime.
+        let norm_w_a = vec![2.0f32; hidden];
+        let norm_w_b = vec![0.5f32; hidden];
         let pick_a = device_greedy_chain(
             &b,
             &hidden_dev,
             &lm_head_q4k,
-            Some(&vec![2.0; hidden]),
+            Some(&norm_w_a),
             hidden,
             vocab,
             1e-6,
@@ -6287,7 +6563,7 @@ mod tests {
             &b,
             &hidden_dev,
             &lm_head_q4k,
-            Some(&vec![0.5; hidden]),
+            Some(&norm_w_b),
             hidden,
             vocab,
             1e-6,
@@ -6329,5 +6605,210 @@ mod tests {
         let out = b.decode_token_greedy_q4k(&layers, &[0.0; 4], 4, 4, &head);
         // Scaffold decode_token returns None → the greedy method returns None.
         assert!(out.is_none() || matches!(out, Some(GreedyDecodeOutput::HostHidden(_))));
+    }
+
+    // ── B4-CORRECTION A: result-readback accounting tests ──────────────
+
+    #[test]
+    fn b4c_result_buffers_match_candidate_width() {
+        // The workspace's result buffers must be sized to the configured
+        // candidate width so the terminal DtoH transfers exactly k f32 + k
+        // u32 (not GREEDY_MAX_K of each).
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let runtime = b.runtime().expect("native runtime");
+        let stream = runtime.stream();
+        let hidden = 256;
+        let logical = 1024;
+        for &k in &[1usize, 3, 5, 8] {
+            let ws =
+                crate::greedy_workspace::GreedyHeadWorkspace::build(stream, logical, hidden, k)
+                    .expect("build workspace");
+            assert_eq!(ws.result_scores.len(), k, "result_scores len for k={k}");
+            assert_eq!(ws.result_ids.len(), k, "result_ids len for k={k}");
+            assert_eq!(ws.result_len(), k, "result_len accessor for k={k}");
+            assert_eq!(ws.candidate_width, k);
+        }
+        // Candidate width above the cap clamps to GREEDY_MAX_K.
+        let ws = crate::greedy_workspace::GreedyHeadWorkspace::build(stream, logical, hidden, 20)
+            .expect("build workspace");
+        assert_eq!(ws.result_scores.len(), crate::ops::GREEDY_MAX_K);
+        assert_eq!(ws.result_ids.len(), crate::ops::GREEDY_MAX_K);
+    }
+
+    #[test]
+    fn b4c_result_dtoh_accounting_for_known_k() {
+        // The production path records TWO result DtoH copies (scores + ids),
+        // each k*4 bytes → 2 copies, 8k bytes total. For the production k=5
+        // that is 2 copies / 40 bytes (the honest pre-vs-post picture:
+        // pre-correction reported 1 copy / 40 B while actually performing 2
+        // calls / 64 B because the buffers were GREEDY_MAX_K wide).
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let prev = std::env::var_os("LARQL_GPU_PROFILE");
+        std::env::set_var("LARQL_GPU_PROFILE", "1");
+        for &k in &[1usize, 3, 5] {
+            // Mirror run_greedy_chain_on_device exactly: two notes of k*4.
+            let each = k * 4;
+            b.note_lm_head_result_dtoh(each);
+            b.note_lm_head_result_dtoh(each);
+        }
+        let snap = b
+            .take_profile_counters()
+            .expect("profile counters present after note calls");
+        match prev {
+            Some(v) => std::env::set_var("LARQL_GPU_PROFILE", v),
+            None => std::env::remove_var("LARQL_GPU_PROFILE"),
+        }
+        // Three k-values → 6 copies; bytes = 2*(4+12+20) = 72.
+        assert_eq!(
+            snap.lm_head_result_dtoh_copies, 6,
+            "two copies per engaged token"
+        );
+        assert_eq!(
+            snap.lm_head_result_dtoh_bytes, 72,
+            "8k bytes per engaged token"
+        );
+        // For the production k=5 alone: 2 copies, 40 bytes.
+        let prod_each = 5usize * 4;
+        assert_eq!(2 * prod_each, 40, "production k=5 → 40 bytes total");
+    }
+
+    // ── B4-CORRECTION C: final-norm weight residency tests ─────────────
+
+    #[test]
+    fn b4c_final_norm_weight_uploaded_once_and_reused() {
+        // The final-norm weight is immutable for the generation. Resolving it
+        // through the f32 weight cache uploads once (miss) and reuses on every
+        // subsequent call with the same slice (hit). This is the mechanism the
+        // production path (run_greedy_chain_on_device) uses to drive
+        // per-token final-norm-weight HtoD to zero in steady state.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let runtime = b.runtime().expect("native runtime");
+        let weight: Vec<f32> = (0..2048).map(|i| i as f32 * 0.001).collect();
+        // Flush so the test starts from a known cache state.
+        runtime.flush_weight_cache();
+        let before = runtime.weight_cache_stats();
+        let _h1 = runtime.resolve_f32_weight(&weight).expect("first resolve");
+        let mid = runtime.weight_cache_stats();
+        let _h2 = runtime.resolve_f32_weight(&weight).expect("second resolve");
+        let _h3 = runtime.resolve_f32_weight(&weight).expect("third resolve");
+        let after = runtime.weight_cache_stats();
+        assert_eq!(
+            mid.float_misses - before.float_misses,
+            1,
+            "exactly one cold upload on first resolution"
+        );
+        assert_eq!(
+            after.float_hits - before.float_hits,
+            2,
+            "steady-state resolutions are cache hits (no upload)"
+        );
+        assert_eq!(
+            after.float_misses - before.float_misses,
+            1,
+            "still only one upload across three resolutions"
+        );
+    }
+
+    #[test]
+    fn b4c_parameter_free_norm_remains_supported() {
+        // The parameter-free path (None weight) resolves a stable static
+        // placeholder and launches with has_weight=0. The chain must still
+        // produce a valid pick (already covered by
+        // b4_greedy_chain_logical_vocab_protects_padding which passes None);
+        // here we verify the placeholder resolves and is cached identically.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let runtime = b.runtime().expect("native runtime");
+        let h1 = runtime
+            .resolve_f32_weight(&crate::greedy_workspace::PARAM_FREE_NORM_PLACEHOLDER)
+            .expect("placeholder resolve");
+        let h2 = runtime
+            .resolve_f32_weight(&crate::greedy_workspace::PARAM_FREE_NORM_PLACEHOLDER)
+            .expect("placeholder resolve 2");
+        // Same device handle (cache hit) — the static address is stable, so
+        // the parameter-free path uploads the one-element placeholder once.
+        assert!(
+            std::sync::Arc::ptr_eq(&h1, &h2),
+            "parameter-free placeholder cached after first upload"
+        );
+    }
+
+    // ── B4-CORRECTION §9: q4k_matvec counter call-site scope ───────────
+
+    #[test]
+    fn b4c_q4k_matvec_counter_is_not_lm_head_exclusive() {
+        // The counter renamed from `lm_head_full_score_dtoh` to
+        // `q4k_matvec_dtoh` describes ALL Q4_K matvec result readbacks, not
+        // lm-head traffic exclusively. `QuantMatVec::q4k_matvec` is a general
+        // op (also reached by Q4_K MoE/FFN matvecs in pipeline.rs). This test
+        // proves the counter increments for ANY successful q4k_matvec call,
+        // regardless of whether the caller is the lm-head path — so the B4
+        // report cannot claim lm-head exclusivity unless the route proves it.
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let prev = std::env::var_os("LARQL_GPU_PROFILE");
+        std::env::set_var("LARQL_GPU_PROFILE", "1");
+        // A small Q4_K matrix that is NOT an lm-head (e.g. an FFN gate
+        // projection shape). q4k_matvec must still increment the counter —
+        // demonstrating the counter's general scope.
+        let hidden = 256;
+        let rows = 512; // arbitrary, non-lm-head shape
+        let f32_rows: Vec<f32> = (0..rows * hidden).map(|i| (i as f32) * 1e-4).collect();
+        let q4k = quantize_q4_k(&f32_rows);
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.01).collect();
+        let out = larql_compute::QuantMatVec::q4k_matvec(&b, &q4k, &x, rows, hidden);
+        assert!(out.is_some(), "native q4k_matvec should succeed");
+        let snap = b
+            .take_profile_counters()
+            .expect("profile counters present after q4k_matvec");
+        match prev {
+            Some(v) => std::env::set_var("LARQL_GPU_PROFILE", v),
+            None => std::env::remove_var("LARQL_GPU_PROFILE"),
+        }
+        assert_eq!(
+            snap.q4k_matvec_dtoh_copies, 1,
+            "q4k_matvec counter increments for a non-lm-head Q4_K matvec"
+        );
+        assert_eq!(snap.q4k_matvec_dtoh_bytes, 512 * 4);
+    }
+
+    // ── B4-CORRECTION B: pure host-comparator unit tests ───────────────
+
+    #[test]
+    fn b4c_greedy_comparator_ordering() {
+        // Pure (no device) test of the explicit lexicographic comparator that
+        // the host reference and device kernels share.
+        use std::cmp::Ordering;
+        let cmp = |a: (u32, f32), b: (u32, f32)| {
+            if greedy_ranks_higher(a, b) {
+                Ordering::Less
+            } else if greedy_ranks_higher(b, a) {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        };
+        // Higher score ranks first.
+        assert_eq!(cmp((1, 5.0), (2, 3.0)), Ordering::Less);
+        // Equal score → lower id first.
+        assert_eq!(cmp((3, 5.0), (7, 5.0)), Ordering::Less);
+        assert_eq!(cmp((7, 5.0), (3, 5.0)), Ordering::Greater);
+        // Same id+score → equal.
+        assert_eq!(cmp((4, 5.0), (4, 5.0)), Ordering::Equal);
+        // Equal negative score → lower id first.
+        assert_eq!(cmp((1, -3.0), (9, -3.0)), Ordering::Less);
     }
 }

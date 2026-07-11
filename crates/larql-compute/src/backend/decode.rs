@@ -184,13 +184,19 @@ pub struct ProfileCountersSnapshot {
     pub device_greedy_fallbacks: u64,
     /// B4 failures: the device could not even read back the hidden state.
     pub device_greedy_failures: u64,
-    /// Full lm-head score-vector device→host copies on the host path (the
-    /// transfer B4 eliminates). Counted even when B4 is off so the two
-    /// paths can be compared.
-    pub lm_head_full_score_dtoh_copies: u64,
-    /// Bytes transferred by the full lm-head score-vector DtoH copies.
-    pub lm_head_full_score_dtoh_bytes: u64,
+    /// Q4_K matvec result-vector device→host copies on the host path
+    /// (B4-CORRECTION §9: renamed from `lm_head_full_score_dtoh_copies`).
+    /// `QuantMatVec::q4k_matvec` is a general op reached by the host lm-head
+    /// path AND by Q4_K MoE/FFN matvecs, so this counter describes all Q4_K
+    /// matvec result readbacks. For the canonical dense benchmark the only
+    /// decode-time caller is the host lm-head path, so the value is
+    /// lm-head-equivalent there — a property of the route, not the counter.
+    /// Counted even when B4 is off so the two paths can be compared.
+    pub q4k_matvec_dtoh_copies: u64,
+    /// Bytes transferred by the Q4_K matvec result DtoH copies.
+    pub q4k_matvec_dtoh_bytes: u64,
     /// Fixed-size candidate-result device→host copies on the B4 path.
+    /// B4-CORRECTION A: two per engaged token (f32 scores + u32 ids).
     pub lm_head_result_dtoh_copies: u64,
     /// Bytes transferred by the fixed-size candidate-result DtoH copies.
     pub lm_head_result_dtoh_bytes: u64,
@@ -199,6 +205,14 @@ pub struct ProfileCountersSnapshot {
     pub final_hidden_readbacks: u64,
     /// Bytes transferred by the final-hidden-state readbacks.
     pub final_hidden_readback_bytes: u64,
+    /// B4-CORRECTION C: final-RMSNorm weight cold HtoD uploads (one per
+    /// generation/vindex binding). Steady-state decode adds zero.
+    pub final_norm_weight_htod_copies: u64,
+    /// Bytes transferred by the final-norm-weight cold HtoD uploads.
+    pub final_norm_weight_htod_bytes: u64,
+    /// B4-CORRECTION C: steady-state reuses of the resident final-norm
+    /// weight (the per-token hits that replaced the per-token uploads).
+    pub final_norm_weight_cache_hits: u64,
 }
 
 impl ProfileTimings {

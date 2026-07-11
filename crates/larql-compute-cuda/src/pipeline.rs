@@ -856,15 +856,52 @@ impl CudaBackend {
         // 1. Final RMSNorm into the workspace's normalised-hidden buffer.
         //    rows=1 (single-token decode), cols=hidden. Epsilon + offset
         //    exactly match the host `apply_norm` path.
+        //
+        //    B4-CORRECTION C: the final-norm weight is immutable for the
+        //    generation, so resolve it ONCE through the f32 weight cache and
+        //    reuse the device handle every token. The pre-correction path
+        //    re-uploaded the weight via `launch_rms_norm_into_dev` every
+        //    eligible token (a per-token HtoD omitted from the structural
+        //    report). The handle is cached on the workspace and re-resolved
+        //    only when the source pointer changes (a head-spec swap without
+        //    a reset). Parameter-free norm (None) resolves a stable static
+        //    placeholder with `has_weight=0`.
+        let norm_src_ptr = head
+            .final_norm_weight
+            .map_or(0usize, |w| w.as_ptr() as usize);
+        if ws.norm_weight_src_ptr != Some(norm_src_ptr) {
+            let (slice, has_weight): (&[f32], i32) = match head.final_norm_weight {
+                Some(w) => (w, 1),
+                None => (&crate::greedy_workspace::PARAM_FREE_NORM_PLACEHOLDER[..], 0),
+            };
+            let dev = runtime.resolve_f32_weight(slice).ok()?;
+            ws.norm_weight_dev = Some(dev);
+            ws.norm_weight_src_ptr = Some(norm_src_ptr);
+            ws.norm_has_weight = has_weight;
+            if crate::options::gpu_profile_enabled() {
+                // Dedicated cold-upload counter (NOT the generic htod counter,
+                // which cannot distinguish cold setup from steady-state decode
+                // and deliberately excludes weight-cache uploads).
+                self.note_final_norm_weight_htod(slice.len() * 4);
+            }
+        } else if crate::options::gpu_profile_enabled() {
+            self.note_final_norm_weight_cache_hit();
+        }
+        let norm_weight_dev = ws
+            .norm_weight_dev
+            .as_ref()
+            .expect("final-norm weight resolved above");
         runtime
-            .launch_rms_norm_into_dev(
+            .launch_rms_norm_into(
+                runtime.stream(),
                 final_hidden_dev,
+                norm_weight_dev,
                 &mut ws.normed_hidden,
-                head.final_norm_weight,
                 1,
                 hidden,
                 head.final_norm_eps,
                 head.final_norm_offset,
+                ws.norm_has_weight,
             )
             .ok()?;
 
@@ -914,13 +951,25 @@ impl CudaBackend {
             .ok()?;
 
         // 5. Single sync + read back ONLY the fixed-size result (k scores
-        //    + k ids). This is the only DtoH on the B4 path.
+        //    + k ids). This is the only DtoH on the B4 path. B4-CORRECTION A:
+        //    the result buffers are sized to `k` (not GREEDY_MAX_K), so each
+        //    `clone_dtoh` transfers exactly `k` elements. The path issues TWO
+        //    `clone_dtoh` calls (scores + ids); the counters now reflect that
+        //    honestly — 2 DtoH operations, `k*4` bytes each, `8k` bytes total
+        //    (40 B for the production k=5) — rather than the pre-correction
+        //    single `k*8` copy that understated the call count and (because
+        //    the buffers were GREEDY_MAX_K wide) the byte count.
         runtime.stream().synchronize().ok()?;
+        let result_bytes_each = k * 4;
         if crate::options::gpu_profile_enabled() {
             runtime.note_sync();
-            runtime.note_dtoh(k * 8);
+            // Two real DtoH API calls share this one sync, but they are two
+            // separate copies — record them as two.
+            runtime.note_dtoh(result_bytes_each);
+            runtime.note_dtoh(result_bytes_each);
         }
-        self.note_lm_head_result_dtoh(k * 8);
+        self.note_lm_head_result_dtoh(result_bytes_each);
+        self.note_lm_head_result_dtoh(result_bytes_each);
         let scores_host = runtime.stream().clone_dtoh(&ws.result_scores).ok()?;
         let ids_host = runtime.stream().clone_dtoh(&ws.result_ids).ok()?;
 

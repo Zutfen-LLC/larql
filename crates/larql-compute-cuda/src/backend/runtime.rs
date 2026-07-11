@@ -2143,6 +2143,23 @@ impl CudaRuntime {
             .map_err(|err| RuntimeError::context("uploading Q4_K weights to CUDA", err))
     }
 
+    /// Resolve a dense f32 weight (e.g. the final RMSNorm weight) through
+    /// the persistent weight cache (B4-CORRECTION C). Uploads the slice once
+    /// on the first call with a given `(ptr, len)` and returns the cached
+    /// `Arc<CudaSlice<f32>>` on every subsequent call, so the immutable
+    /// final-norm weight is uploaded at most once per generation/vindex
+    /// binding instead of every decode token. The cache is flushed at
+    /// `reset_kv_cache`, matching the greedy workspace lifetime.
+    #[allow(dead_code)]
+    pub(crate) fn resolve_f32_weight(
+        &self,
+        weight: &[f32],
+    ) -> Result<std::sync::Arc<CudaSlice<f32>>, RuntimeError> {
+        self.weight_cache
+            .get_or_upload_f32(&self.stream, weight)
+            .map_err(|err| RuntimeError::context("uploading f32 weight to CUDA", err))
+    }
+
     /// Q6_K × f32 matvec, device-resident twin of [`launch_q4k_matvec_dev`].
     pub(crate) fn launch_q6k_matvec_dev(
         &self,
@@ -2746,75 +2763,6 @@ impl CudaRuntime {
         Ok(out_dev)
     }
 
-    /// LARQL-GPU-B4: RMSNorm into a pre-allocated stable output buffer (the
-    /// greedy-head workspace's `normed_hidden`). The graph-capture-friendly
-    /// twin of [`launch_rms_norm_dev`]: writes into `out_dev` instead of
-    /// allocating a fresh `CudaSlice`, so the workspace is reused across
-    /// tokens without per-token allocation. Shares the kernel-arg layout
-    /// with `_dev` so the two cannot drift.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn launch_rms_norm_into_dev(
-        &self,
-        x_dev: &CudaSlice<f32>,
-        out_dev: &mut CudaSlice<f32>,
-        weight: Option<&[f32]>,
-        rows: usize,
-        cols: usize,
-        eps: f64,
-        offset: f32,
-    ) -> Result<(), RuntimeError> {
-        if rows == 0 || cols == 0 {
-            return Ok(());
-        }
-        if x_dev.len() != rows * cols || out_dev.len() != rows * cols {
-            return Err(RuntimeError::usage(format!(
-                "rms_norm_into_dev expected x_dev/out_dev of length {} (rows={rows} cols={cols}), got {}/{}",
-                rows * cols,
-                x_dev.len(),
-                out_dev.len()
-            )));
-        }
-        if let Some(w) = weight {
-            if w.len() != cols {
-                return Err(RuntimeError::usage(format!(
-                    "rms_norm_into_dev expected weight of length {cols}, got {}",
-                    w.len()
-                )));
-            }
-        }
-        let placeholder = [0.0f32];
-        let (weight_slice, has_weight): (&[f32], i32) = match weight {
-            Some(w) => (w, 1),
-            None => (&placeholder[..], 0),
-        };
-        let weight_dev = self
-            .stream
-            .clone_htod(weight_slice)
-            .map_err(|err| RuntimeError::context("uploading rms_norm_into_dev weight", err))?;
-        let block_dim = 1024u32;
-        let rows_u = rows as u32;
-        let cols_u = cols as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (rows_u, 1, 1),
-            block_dim: (block_dim, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut launch_args = self.stream.launch_builder(&self.rms_norm);
-        launch_args
-            .arg(x_dev)
-            .arg(&weight_dev)
-            .arg(out_dev)
-            .arg(&rows_u)
-            .arg(&cols_u)
-            .arg(&eps)
-            .arg(&offset)
-            .arg(&has_weight);
-        unsafe { launch_args.launch(cfg) }
-            .map_err(|err| RuntimeError::context("launching CUDA rms_norm_into_dev kernel", err))?;
-        self.note_launch();
-        Ok(())
-    }
-
     /// LARQL-GPU-B4: partial top-K reduction over the logical-vocabulary
     /// score buffer. Grid: `num_blocks` blocks of `GREEDY_BLOCK_SIZE`
     /// threads. Each block writes `k` `(score, id)` pairs into
@@ -2941,14 +2889,16 @@ impl CudaRuntime {
     }
 
     /// RMSNorm into a pre-allocated stable output buffer with a device-resident
-    /// weight (B3A-4). Graph-capture twin of [`launch_rms_norm_dev`]: `weight_dev`
-    /// is a pre-uploaded stable weight buffer (from [`upload_rms_norm_weight`]),
-    /// and the output writes into `out_dev` (a stable graph-owned buffer) instead
-    /// of allocating. `has_weight` is `1` when a real weight was uploaded, `0`
-    /// for the parameter-free placeholder path. Launches on `stream`. Shares the
-    /// kernel-arg layout + `LaunchConfig` with `_dev`.
+    /// weight (B3A-4 / B4-CORRECTION C). `weight_dev` is a pre-uploaded stable
+    /// weight buffer (resolved through the f32 weight cache — see
+    /// [`resolve_f32_weight`] — or [`upload_rms_norm_weight`]), and the output
+    /// writes into `out_dev` (a stable graph-owned buffer, or the greedy-head
+    /// workspace's `normed_hidden`) instead of allocating. `has_weight` is `1`
+    /// when a real weight was uploaded, `0` for the parameter-free placeholder
+    /// path. Launches on `stream`. Shares the kernel-arg layout + `LaunchConfig`
+    /// with [`launch_rms_norm_dev`]. Used by both the B3A graph-capture FFN path
+    /// and the B4 device-greedy final-norm step.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     pub(crate) fn launch_rms_norm_into(
         &self,
         stream: &cudarc::driver::CudaStream,

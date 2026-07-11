@@ -209,6 +209,37 @@ pub(super) fn format_profile_breakdown(rows: &[BenchRow], warmup: usize) -> Vec<
                 total as f64 / n
             )
         },
+        // B4-CORRECTION device-greedy structural counters. Only meaningful
+        // when device-greedy ran (attempts > 0); shown unconditionally so a
+        // zero row is itself evidence the path did not engage.
+        format!(
+            "    dev-greedy  attempts {:>6.1}/tok  engaged {:>6.1}/tok  fallbacks {:>5.1}/tok  failures {:>5.1}/tok",
+            p.device_greedy_attempts as f64 / n,
+            p.device_greedy_engaged as f64 / n,
+            p.device_greedy_fallbacks as f64 / n,
+            p.device_greedy_failures as f64 / n,
+        ),
+        format!(
+            "    q4k_matvec dtoh {:>6.1}/tok  {:>7.1}B/tok   (general Q4_K matvec readbacks; lm-head-equiv only on a dense route)",
+            p.q4k_matvec_dtoh_copies as f64 / n,
+            p.q4k_matvec_dtoh_bytes as f64 / n,
+        ),
+        format!(
+            "    result dtoh {:>6.1}/tok  {:>7.1}B/tok   (B4 fixed-size candidate readback: 2 ops x k*4 B)",
+            p.lm_head_result_dtoh_copies as f64 / n,
+            p.lm_head_result_dtoh_bytes as f64 / n,
+        ),
+        format!(
+            "    final-norm weight htod {:>5.1}/tok (cold)  {:>5.1}B/tok  cache_hits {:>6.1}/tok (steady-state)",
+            p.final_norm_weight_htod_copies as f64 / n,
+            p.final_norm_weight_htod_bytes as f64 / n,
+            p.final_norm_weight_cache_hits as f64 / n,
+        ),
+        format!(
+            "    final-hidden readback {:>6.1}/tok  {:>7.1}B/tok   (host-path transfer B4 eliminates)",
+            p.final_hidden_readbacks as f64 / n,
+            p.final_hidden_readback_bytes as f64 / n,
+        ),
     ]
 }
 
