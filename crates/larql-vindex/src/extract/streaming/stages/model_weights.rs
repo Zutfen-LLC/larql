@@ -32,10 +32,15 @@ impl<'a> StreamingContext<'a> {
             (Some(m), Some(i)) => (m, i),
             _ => {
                 return Err(VindexError::Parse(
-                    "GGUF input + extract-level requiring attention/FFN weights is not yet \
-                     implemented (browse-level GGUF works; inference/Q4K GGUF requires \
-                     per-tensor streaming through ggml::dequantize)"
-                        .to_string(),
+                    format!(
+                        "GGUF architecture '{}' cannot be extracted at level {:?} with quant {:?}: \
+                         the streaming model-weight writer accepts safetensors only. Required \
+                         attention, FFN, norm, PLE, and lm-head tensors were not written. \
+                         Implement per-tensor GGUF dequantization and audited destination routing \
+                         in extract::streaming::stages::model_weights before retrying; browse-level \
+                         GGUF remains available.",
+                        self.arch.family(), self.extract_level, self.quant
+                    )
                 ));
             }
         };
