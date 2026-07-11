@@ -219,6 +219,20 @@ impl GgufFile {
             let key = format!("{prefix}{suffix}");
             self.metadata.get(&key).and_then(|v| v.as_u32())
         };
+        let get_arch_u32_array = |suffix: &str| {
+            self.metadata
+                .get(&format!("{prefix}{suffix}"))
+                .and_then(|v| match v {
+                    GgufValue::Array(values) => Some(
+                        values
+                            .iter()
+                            .filter_map(GgufValue::as_u32)
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .filter(|values| !values.is_empty())
+        };
         let get_arch_f64 = |suffix: &str| {
             self.metadata
                 .get(&format!("{prefix}{suffix}"))
@@ -290,6 +304,73 @@ impl GgufFile {
         }
         if let Some(vocab_size) = get_arch_u32_opt(GGUF_VOCAB_SIZE).filter(|&v| v > 0) {
             config[HF_VOCAB_SIZE] = serde_json::json!(vocab_size);
+        }
+
+        if arch == "gemma4" {
+            if let Some(key_lengths) = get_arch_u32_array(GGUF_ATTENTION_KEY_LENGTH) {
+                let global = key_lengths
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(GEMMA4_GGUF_HEAD_DIM);
+                config["global_head_dim"] = serde_json::json!(global);
+                config["layer_types"] = serde_json::json!(key_lengths
+                    .iter()
+                    .map(|&dim| if dim == global {
+                        "full_attention"
+                    } else {
+                        "sliding_attention"
+                    })
+                    .collect::<Vec<_>>());
+            } else if let Some(global) = get_arch_u32_opt(GGUF_ATTENTION_KEY_LENGTH) {
+                config["global_head_dim"] = serde_json::json!(global);
+            }
+
+            if let Some(kv_heads) = get_arch_u32_array(GGUF_ATTENTION_HEAD_COUNT_KV) {
+                if let Some(global) = kv_heads.iter().copied().min() {
+                    config["num_global_key_value_heads"] = serde_json::json!(global);
+                }
+            }
+
+            let copy_u32 = |config: &mut serde_json::Value, source: &str, destination: &str| {
+                if let Some(value) = get_arch_u32_opt(source).filter(|&v| v > 0) {
+                    config[destination] = serde_json::json!(value);
+                }
+            };
+            copy_u32(&mut config, GGUF_ATTENTION_SLIDING_WINDOW, "sliding_window");
+            if let Some(pattern) = get_arch_u32_opt(GGUF_ATTENTION_SLIDING_WINDOW_PATTERN)
+                .or_else(|| get_arch_u32_opt(GGUF_FULL_ATTENTION_INTERVAL))
+                .filter(|&v| v > 0)
+            {
+                config["sliding_window_pattern"] = serde_json::json!(pattern);
+            }
+            copy_u32(
+                &mut config,
+                GGUF_ATTENTION_SHARED_KV_LAYERS,
+                "num_kv_shared_layers",
+            );
+            copy_u32(
+                &mut config,
+                GGUF_EMBEDDING_LENGTH_PER_LAYER,
+                "hidden_size_per_layer_input",
+            );
+
+            if let Some(local_base) = get_arch_f64(GGUF_ROPE_FREQ_BASE_SWA) {
+                config["rope_local_base_freq"] = serde_json::json!(local_base);
+            }
+            if let Some(epsilon) = get_arch_f64(GGUF_ATTENTION_NORM_RMS_EPS) {
+                config["rms_norm_eps"] = serde_json::json!(epsilon);
+            }
+            if let Some(softcap) = get_arch_f64(GGUF_FINAL_LOGIT_SOFTCAPPING) {
+                config["final_logit_softcapping"] = serde_json::json!(softcap);
+            }
+            if let (Some(rotary_dim), Some(global_head_dim)) = (
+                get_arch_u32_opt(GGUF_ROPE_DIMENSION_COUNT),
+                config["global_head_dim"].as_u64(),
+            ) {
+                config["partial_rotary_factor"] =
+                    serde_json::json!(rotary_dim as f64 / global_head_dim as f64);
+            }
         }
 
         // ── MLA fields (DeepSeek-V2/V3 family, e.g. Kimi K2) ─────────────────
@@ -1035,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma4_gguf_to_config_json_maps_arch_and_overrides_head_dim() {
+    fn test_gemma4_gguf_to_config_json_preserves_required_architecture() {
         // Synthesize GGUF metadata matching gemma-4-e2b's shape.
         // Exercises: (a) gemma4 name pass-through, (b) head_dim=256 override,
         // (c) array metadata (per-layer variable FFN sizes → take max).
@@ -1049,13 +1130,57 @@ mod tests {
         metadata.insert("gemma4.attention.head_count".to_string(), GgufValue::U32(8));
         metadata.insert(
             "gemma4.attention.head_count_kv".to_string(),
-            GgufValue::U32(1),
+            GgufValue::Array(
+                (0..35)
+                    .map(|layer| GgufValue::U32(if layer % 6 == 5 || layer == 34 { 1 } else { 4 }))
+                    .collect(),
+            ),
         );
-        // Gemma 4 reports attention.key_length=512 (global head_dim), not the
-        // per-head 256 we want. Loader must override to 256 for arch="gemma4".
         metadata.insert(
             "gemma4.attention.key_length".to_string(),
+            GgufValue::Array(
+                (0..35)
+                    .map(|layer| {
+                        GgufValue::U32(if layer % 6 == 5 || layer == 34 {
+                            512
+                        } else {
+                            256
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        metadata.insert(
+            "gemma4.attention.sliding_window".to_string(),
             GgufValue::U32(512),
+        );
+        metadata.insert(
+            "gemma4.rope.dimension_count".to_string(),
+            GgufValue::U32(128),
+        );
+        metadata.insert(
+            "gemma4.rope.freq_base".to_string(),
+            GgufValue::F32(1_000_000.0),
+        );
+        metadata.insert(
+            "gemma4.rope.freq_base_swa".to_string(),
+            GgufValue::F32(10_000.0),
+        );
+        metadata.insert(
+            "gemma4.embedding_length_per_layer_input".to_string(),
+            GgufValue::U32(256),
+        );
+        metadata.insert(
+            "gemma4.attention.shared_kv_layers".to_string(),
+            GgufValue::U32(6),
+        );
+        metadata.insert(
+            "gemma4.attention.layer_norm_rms_epsilon".to_string(),
+            GgufValue::F32(1e-6),
+        );
+        metadata.insert(
+            "gemma4.final_logit_softcapping".to_string(),
+            GgufValue::F32(30.0),
         );
         metadata.insert("gemma4.vocab_size".to_string(), GgufValue::U32(262144));
         // Per-layer variable FFN — some layers 6144, some 12288. Must take max.
@@ -1088,8 +1213,66 @@ mod tests {
         // intermediate_size: max of the per-layer FFN array (12288), not 6144
         assert_eq!(cfg["intermediate_size"], 12288);
         assert_eq!(cfg["num_attention_heads"], 8);
-        assert_eq!(cfg["num_key_value_heads"], 1);
+        assert_eq!(cfg["num_key_value_heads"], 4);
         assert_eq!(cfg["vocab_size"], 262144);
+        assert_eq!(cfg["global_head_dim"], 512);
+        assert_eq!(cfg["num_global_key_value_heads"], 1);
+        assert_eq!(cfg["sliding_window"], 512);
+        assert_eq!(cfg["partial_rotary_factor"], 0.25);
+        assert_eq!(cfg["rope_local_base_freq"], 10_000.0);
+        assert_eq!(cfg["hidden_size_per_layer_input"], 256);
+        assert_eq!(cfg["num_kv_shared_layers"], 6);
+        assert_eq!(cfg["final_logit_softcapping"], 30.0);
+        let layer_types = cfg["layer_types"].as_array().unwrap();
+        assert_eq!(layer_types.len(), 35);
+        assert_eq!(layer_types[0], "sliding_attention");
+        assert_eq!(layer_types[5], "full_attention");
+        assert_eq!(layer_types[34], "full_attention");
+
+        let arch = crate::detect_from_json_validated(&cfg).unwrap();
+        assert_eq!(arch.family(), "gemma4");
+        assert!(arch.has_per_layer_embeddings());
+        assert!(arch.is_sliding_window_layer(0));
+        assert!(!arch.is_sliding_window_layer(34));
+        assert_eq!(arch.head_dim_for_layer(0), 256);
+        assert_eq!(arch.head_dim_for_layer(34), 512);
+        assert_eq!(arch.rotary_fraction_for_layer(34), 0.25);
+    }
+
+    #[test]
+    fn gemma4_gguf_tensor_names_map_qk_norms_and_ple() {
+        assert_eq!(
+            normalize_gguf_key("blk.3.attn_q_norm.weight"),
+            "layers.3.self_attn.q_norm.weight"
+        );
+        assert_eq!(
+            normalize_gguf_key("blk.3.attn_k_norm.weight"),
+            "layers.3.self_attn.k_norm.weight"
+        );
+        assert_eq!(
+            normalize_gguf_key("blk.3.attn_q.weight"),
+            "layers.3.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            normalize_gguf_key("per_layer_token_embd.weight"),
+            "embed_tokens_per_layer.weight"
+        );
+        assert_eq!(
+            normalize_gguf_key("per_layer_model_proj.weight"),
+            "per_layer_model_projection.weight"
+        );
+        assert_eq!(
+            normalize_gguf_key("blk.3.inp_gate.weight"),
+            "layers.3.per_layer_input_gate.weight"
+        );
+        assert_eq!(
+            normalize_gguf_key("blk.3.proj.weight"),
+            "layers.3.per_layer_projection.weight"
+        );
+        assert_eq!(
+            normalize_gguf_key("blk.3.post_norm.weight"),
+            "layers.3.post_per_layer_input_norm.weight"
+        );
     }
 
     #[test]

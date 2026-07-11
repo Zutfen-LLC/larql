@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "slice": "LARQL-INFERENCE-TRUST-001A",
+  "date": "2026-07-11",
+  "decision": "RED",
+  "starting_main_sha": "d65dded1db68c69dda9a2a0ff19d446b277a5cad",
+  "source_model": {
+    "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
+    "filename": "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf",
+    "sha256": null,
+    "available_locally": false
+  },
+  "external_oracle": {
+    "llama_cpp_commit": null,
+    "commands": [],
+    "health_result": "NOT_RUN",
+    "reason": "No local source GGUF or llama.cpp binary was available"
+  },
+  "extraction": {
+    "command": "larql extract ${LARQL_GEMMA4_GGUF} -o /tmp/gemma4-e2b.vindex --level inference --quant q4k --profile",
+    "result": "BLOCKED_BEFORE_RUN",
+    "duration_seconds": null,
+    "peak_rss_bytes": null,
+    "output_size_bytes": null,
+    "blocker": "GGUF inference/Q4K streaming writer is not implemented"
+  },
+  "runtime": {
+    "vindex_integrity": "NOT_RUN",
+    "cpu_prefill": "NOT_RUN",
+    "cpu_decode": "NOT_RUN",
+    "nan_count": null,
+    "inf_count": null,
+    "output_classification": "FAILED"
+  },
+  "cuda_eligibility": "HOST_FALLBACK",
+  "cuda_reasons": [
+    "PerLayerEmbeddings capability is not advertised",
+    "HeterogeneousAttention capability is not advertised"
+  ],
+  "implemented_corrections": [
+    "Gemma 4 GGUF per-layer local/global geometry mapping",
+    "sliding-window, p-RoPE, local RoPE, PLE, shared-KV, norm epsilon, and softcap mapping",
+    "Q/K norm and PLE tensor-name mapping",
+    "feature-specific fail-loud inference extraction diagnostic",
+    "environment-gated manual real-GGUF architecture audit"
+  ],
+  "verification": {
+    "cargo_fmt": "PASS",
+    "larql_models_lib": { "passed": 424, "failed": 0, "ignored": 4 },
+    "gemma4_manual_audit_without_env": { "passed": 1, "failed": 0 },
+    "larql_vindex_lib": { "passed": 1131, "failed": 0, "ignored": 0 },
+    "larql_compute_lib": { "passed": 750, "failed": 0, "ignored": 2 },
+    "larql_inference_lib": { "passed": 1262, "failed": 0, "ignored": 4 },
+    "larql_cli_bins": { "passed": 243, "failed": 0, "ignored": 0 },
+    "clippy_requested_targets": "PASS",
+    "cuda_release_build": "PASS",
+    "link_environment_note": "Tests/build used LIBRARY_PATH=/tmp/kilo with a temporary libopenblas.so symlink to the installed libcblas.so because libopenblas was not installed"
+  },
+  "blockers": [
+    "TRUST-001A-B01: exact source GGUF and external oracle evidence unavailable",
+    "TRUST-001A-B02: GGUF inference-level tensor streaming and audited quantization routing absent",
+    "TRUST-001A-B03: source tensor classification and tokenizer export absent",
+    "TRUST-001A-B04: CPU sliding-window attention metadata is not enforced by attention kernels"
+  ]
+}

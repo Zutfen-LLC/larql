@@ -19,6 +19,7 @@ pub(super) const GGUF_TYPE_FLOAT64: u32 = 12;
 
 pub(super) const GGUF_GENERAL_ARCHITECTURE: &str = "general.architecture";
 pub(super) const GGUF_EMBEDDING_LENGTH: &str = "embedding_length";
+pub(super) const GGUF_EMBEDDING_LENGTH_PER_LAYER: &str = "embedding_length_per_layer_input";
 pub(super) const GGUF_BLOCK_COUNT: &str = "block_count";
 pub(super) const GGUF_FEED_FORWARD_LENGTH: &str = "feed_forward_length";
 // MoE-only architectures (DeepSeek-V4 family) omit the global
@@ -29,7 +30,14 @@ pub(super) const GGUF_EXPERT_FEED_FORWARD_LENGTH: &str = "expert_feed_forward_le
 pub(super) const GGUF_ATTENTION_HEAD_COUNT: &str = "attention.head_count";
 pub(super) const GGUF_ATTENTION_HEAD_COUNT_KV: &str = "attention.head_count_kv";
 pub(super) const GGUF_ATTENTION_KEY_LENGTH: &str = "attention.key_length";
+pub(super) const GGUF_ATTENTION_SLIDING_WINDOW: &str = "attention.sliding_window";
+pub(super) const GGUF_ATTENTION_SLIDING_WINDOW_PATTERN: &str = "attention.sliding_window_pattern";
+pub(super) const GGUF_ATTENTION_SHARED_KV_LAYERS: &str = "attention.shared_kv_layers";
+pub(super) const GGUF_ATTENTION_NORM_RMS_EPS: &str = "attention.layer_norm_rms_epsilon";
 pub(super) const GGUF_ROPE_FREQ_BASE: &str = "rope.freq_base";
+pub(super) const GGUF_ROPE_FREQ_BASE_SWA: &str = "rope.freq_base_swa";
+pub(super) const GGUF_FINAL_LOGIT_SOFTCAPPING: &str = "final_logit_softcapping";
+pub(super) const GGUF_FULL_ATTENTION_INTERVAL: &str = "full_attention_interval";
 // MLA-specific metadata keys emitted by llama.cpp for DeepSeek-V2/V3/Kimi-K2
 // family models. `_mla` variants carry the pre-absorption per-head dims;
 // non-`_mla` variants carry the (possibly larger) absorbed/effective sizes.
@@ -62,6 +70,16 @@ pub(super) const GEMMA4_GGUF_HEAD_DIM: u32 = 256;
 
 pub(super) const GGUF_TO_HF_KEY_REPLACEMENTS: &[(&str, &str)] = &[
     ("blk.", "layers."),
+    ("per_layer_token_embd.", "embed_tokens_per_layer."),
+    ("per_layer_model_proj.", "per_layer_model_projection."),
+    ("per_layer_proj_norm.", "per_layer_projection_norm."),
+    // These short Gemma 4 PLE names must run before attention mappings add
+    // `*_proj.` substrings to otherwise unrelated decoder tensors.
+    ("inp_gate.", "per_layer_input_gate."),
+    ("proj.", "per_layer_projection."),
+    ("post_norm.", "post_per_layer_input_norm."),
+    ("attn_q_norm.", "self_attn.q_norm."),
+    ("attn_k_norm.", "self_attn.k_norm."),
     ("attn_qkv.", "self_attn.qkv_proj."),
     ("attn_q.", "self_attn.q_proj."),
     ("attn_k.", "self_attn.k_proj."),
@@ -72,6 +90,8 @@ pub(super) const GGUF_TO_HF_KEY_REPLACEMENTS: &[(&str, &str)] = &[
     ("ffn_down.", "mlp.down_proj."),
     ("attn_norm.", "input_layernorm."),
     ("ffn_norm.", "post_attention_layernorm."),
+    ("post_attention_norm.", "post_attention_layernorm."),
+    ("post_ffw_norm.", "post_feedforward_layernorm."),
     ("token_embd.", "embed_tokens."),
     ("position_embd.", "wpe."),
     ("output_norm.", "norm."),
