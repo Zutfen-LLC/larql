@@ -1,0 +1,31 @@
+larql bench: /home/zutfen/models/qwen2.5-3b-q4k.vindex
+Prompt: "Write a step by step guide on how to bake a cake from scratch."
+Decode: 79 tokens after 5 warmup; backends=cuda
+
+  Backend                     prefill       mean        p50      tok/s  steps  notes
+  ─────────────────────────────────────────────────────────────────────────────────────
+  larql-cuda                   736.9ms    107.73ms    107.73ms       9.3      78  early stop @78/79 (EOS or GPU fallback)
+
+  Per-stage average (larql-cuda):
+    embed      0.003ms  ( 0.0%)
+    GPU fwd   107.930ms  (100.0%)
+    final_norm 0.000ms  ( 0.0%)
+    lm_head    0.000ms  ( 0.0%)
+    detok      0.031ms  ( 0.0%)
+
+  GPU profile (larql-cuda):
+    launches      412.3/tok
+    htod            4.8/tok   0.914MiB/tok
+    dtoh           84.3/tok   1.496MiB/tok
+    syncs          83.2/tok
+    KV mirror     0.350ms/tok   2145.2rows/tok
+    hidden rdback 0.000ms/tok
+    graph       builds    0.5/tok  submissions   38.3/tok  replays   37.8/tok
+    graph nodes captured    2.8/tok  logical_execs  229.8/tok
+    graph d2d      0.0/tok  cross_stream_syncs    0.0/tok  fallbacks   0.0/tok  failures   0.0/tok
+    TOTAL host submissions   450.6/tok  (= launches + graph + d2d)
+    dev-greedy  attempts    1.1/tok  engaged    1.1/tok  fallbacks   0.0/tok  failures   0.0/tok
+    q4k_matvec dtoh    0.0/tok  15583.2B/tok   (general Q4_K matvec readbacks; lm-head-equiv only on a dense route)
+    result dtoh    2.1/tok     42.6B/tok   (B4 fixed-size candidate readback: 2 ops x k*4 B)
+    final-norm weight htod   0.0/tok (cold)  105.0B/tok  cache_hits    1.1/tok (steady-state)
+    final-hidden readback    0.0/tok      0.0B/tok   (host-path transfer B4 eliminates)

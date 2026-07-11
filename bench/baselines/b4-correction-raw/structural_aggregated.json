@@ -1,0 +1,106 @@
+{
+  "modes": {
+    "B4A": {
+      "instrumented": true,
+      "p50_ms": {
+        "n": 1,
+        "raw": [
+          108.82
+        ],
+        "min": 108.82,
+        "max": 108.82,
+        "mean": 108.82,
+        "median": 108.82,
+        "mad": 0.0
+      },
+      "mean_ms": {
+        "n": 1,
+        "raw": [
+          108.88
+        ],
+        "min": 108.88,
+        "max": 108.88,
+        "mean": 108.88,
+        "median": 108.88,
+        "mad": 0.0
+      }
+    },
+    "B4B": {
+      "instrumented": true,
+      "p50_ms": {
+        "n": 1,
+        "raw": [
+          107.73
+        ],
+        "min": 107.73,
+        "max": 107.73,
+        "mean": 107.73,
+        "median": 107.73,
+        "mad": 0.0
+      },
+      "mean_ms": {
+        "n": 1,
+        "raw": [
+          107.73
+        ],
+        "min": 107.73,
+        "max": 107.73,
+        "mean": 107.73,
+        "median": 107.73,
+        "mad": 0.0
+      }
+    },
+    "BaselineA": {
+      "instrumented": true,
+      "p50_ms": {
+        "n": 1,
+        "raw": [
+          108.73
+        ],
+        "min": 108.73,
+        "max": 108.73,
+        "mean": 108.73,
+        "median": 108.73,
+        "mad": 0.0
+      },
+      "mean_ms": {
+        "n": 1,
+        "raw": [
+          108.74
+        ],
+        "min": 108.74,
+        "max": 108.74,
+        "mean": 108.74,
+        "median": 108.74,
+        "mad": 0.0
+      }
+    },
+    "BaselineB": {
+      "instrumented": true,
+      "p50_ms": {
+        "n": 1,
+        "raw": [
+          108.2
+        ],
+        "min": 108.2,
+        "max": 108.2,
+        "mean": 108.2,
+        "median": 108.2,
+        "mad": 0.0
+      },
+      "mean_ms": {
+        "n": 1,
+        "raw": [
+          108.18
+        ],
+        "min": 108.18,
+        "max": 108.18,
+        "mean": 108.18,
+        "median": 108.18,
+        "mad": 0.0
+      }
+    }
+  },
+  "failed": 0,
+  "missing": 0
+}

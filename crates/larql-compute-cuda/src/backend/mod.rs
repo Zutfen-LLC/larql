@@ -145,15 +145,33 @@ pub(crate) struct GreedyProfileCounters {
     pub(crate) fallbacks: std::sync::atomic::AtomicU64,
     /// Device could not even read back the hidden state.
     pub(crate) failures: std::sync::atomic::AtomicU64,
-    /// Full lm-head score-vector DtoH copies on the host path.
-    pub(crate) lm_head_full_score_dtoh_copies: std::sync::atomic::AtomicU64,
-    pub(crate) lm_head_full_score_dtoh_bytes: std::sync::atomic::AtomicU64,
-    /// Fixed-size candidate-result DtoH copies on the B4 path.
+    /// Q4_K matvec result-vector DtoH copies (B4-CORRECTION §9: renamed from
+    /// `lm_head_full_score_dtoh_*`). `QuantMatVec::q4k_matvec` is a general
+    /// op reached by the host lm-head path AND by Q4_K MoE / FFN matvecs, so
+    /// this counter describes all Q4_K matvec result readbacks, not lm-head
+    /// traffic exclusively. For the canonical dense Qwen2.5-3B benchmark the
+    /// only decode-time caller IS the host lm-head path, so the route makes
+    /// it lm-head-equivalent there — but that is a property of the route,
+    /// not of the counter.
+    pub(crate) q4k_matvec_dtoh_copies: std::sync::atomic::AtomicU64,
+    pub(crate) q4k_matvec_dtoh_bytes: std::sync::atomic::AtomicU64,
+    /// Fixed-size candidate-result DtoH copies on the B4 path. B4-CORRECTION
+    /// A: this is now TWO copies per engaged token (one f32 score buffer +
+    /// one u32 id buffer, each `k` elements = `4k` bytes), matching the two
+    /// `clone_dtoh` calls the path actually issues.
     pub(crate) lm_head_result_dtoh_copies: std::sync::atomic::AtomicU64,
     pub(crate) lm_head_result_dtoh_bytes: std::sync::atomic::AtomicU64,
     /// Final-hidden-state DtoH readbacks on the host path.
     pub(crate) final_hidden_readbacks: std::sync::atomic::AtomicU64,
     pub(crate) final_hidden_readback_bytes: std::sync::atomic::AtomicU64,
+    /// B4-CORRECTION C: final-RMSNorm weight cold HtoD uploads (one per
+    /// generation/vindex binding). Steady-state decode adds zero here — the
+    /// weight is reused from the workspace handle.
+    pub(crate) final_norm_weight_htod_copies: std::sync::atomic::AtomicU64,
+    pub(crate) final_norm_weight_htod_bytes: std::sync::atomic::AtomicU64,
+    /// B4-CORRECTION C: steady-state reuses of the resident final-norm
+    /// weight (the per-token hits that replaced the per-token uploads).
+    pub(crate) final_norm_weight_cache_hits: std::sync::atomic::AtomicU64,
 }
 
 /// A consumed snapshot of the profile counters, returned by
@@ -198,12 +216,20 @@ pub struct CudaProfileSnapshot {
     pub device_greedy_engaged: u64,
     pub device_greedy_fallbacks: u64,
     pub device_greedy_failures: u64,
-    pub lm_head_full_score_dtoh_copies: u64,
-    pub lm_head_full_score_dtoh_bytes: u64,
+    /// Q4_K matvec result DtoH copies (B4-CORRECTION §9: general Q4_K
+    /// matvec readbacks, not lm-head-exclusive). See
+    /// `GreedyProfileCounters::q4k_matvec_dtoh_copies`.
+    pub q4k_matvec_dtoh_copies: u64,
+    pub q4k_matvec_dtoh_bytes: u64,
     pub lm_head_result_dtoh_copies: u64,
     pub lm_head_result_dtoh_bytes: u64,
     pub final_hidden_readbacks: u64,
     pub final_hidden_readback_bytes: u64,
+    /// B4-CORRECTION C: final-norm weight cold HtoD (one per generation) +
+    /// steady-state reuses.
+    pub final_norm_weight_htod_copies: u64,
+    pub final_norm_weight_htod_bytes: u64,
+    pub final_norm_weight_cache_hits: u64,
 }
 
 impl From<CudaProfileSnapshot> for larql_compute::ProfileCountersSnapshot {
@@ -230,12 +256,15 @@ impl From<CudaProfileSnapshot> for larql_compute::ProfileCountersSnapshot {
             device_greedy_engaged: c.device_greedy_engaged,
             device_greedy_fallbacks: c.device_greedy_fallbacks,
             device_greedy_failures: c.device_greedy_failures,
-            lm_head_full_score_dtoh_copies: c.lm_head_full_score_dtoh_copies,
-            lm_head_full_score_dtoh_bytes: c.lm_head_full_score_dtoh_bytes,
+            q4k_matvec_dtoh_copies: c.q4k_matvec_dtoh_copies,
+            q4k_matvec_dtoh_bytes: c.q4k_matvec_dtoh_bytes,
             lm_head_result_dtoh_copies: c.lm_head_result_dtoh_copies,
             lm_head_result_dtoh_bytes: c.lm_head_result_dtoh_bytes,
             final_hidden_readbacks: c.final_hidden_readbacks,
             final_hidden_readback_bytes: c.final_hidden_readback_bytes,
+            final_norm_weight_htod_copies: c.final_norm_weight_htod_copies,
+            final_norm_weight_htod_bytes: c.final_norm_weight_htod_bytes,
+            final_norm_weight_cache_hits: c.final_norm_weight_cache_hits,
         }
     }
 }
@@ -838,21 +867,27 @@ impl CudaBackend {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Record a full lm-head score-vector DtoH copy on the host path (the
-    /// transfer B4 eliminates). Profile-gated.
-    pub(crate) fn note_lm_head_full_score_dtoh(&self, bytes: usize) {
+    /// Record a Q4_K matvec result-vector DtoH copy (B4-CORRECTION §9:
+    /// renamed from `note_lm_head_full_score_dtoh`). `QuantMatVec::q4k_matvec`
+    /// is a general op reached by the host lm-head path and by Q4_K MoE/FFN
+    /// matvecs; this counter describes all such readbacks. For the canonical
+    /// dense benchmark the only decode-time caller is the host lm-head path.
+    /// Profile-gated.
+    pub(crate) fn note_q4k_matvec_dtoh(&self, bytes: usize) {
         if crate::options::gpu_profile_enabled() {
             self.greedy_profile
-                .lm_head_full_score_dtoh_copies
+                .q4k_matvec_dtoh_copies
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.greedy_profile
-                .lm_head_full_score_dtoh_bytes
+                .q4k_matvec_dtoh_bytes
                 .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     /// Record a fixed-size candidate-result DtoH copy on the B4 path.
-    /// Profile-gated.
+    /// B4-CORRECTION A: call once per `clone_dtoh` (the path issues two —
+    /// scores + ids), so the copy count reflects the real number of CUDA
+    /// DtoH API calls. Profile-gated.
     pub(crate) fn note_lm_head_result_dtoh(&self, bytes: usize) {
         if crate::options::gpu_profile_enabled() {
             self.greedy_profile
@@ -874,6 +909,32 @@ impl CudaBackend {
             self.greedy_profile
                 .final_hidden_readback_bytes
                 .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record one cold HtoD upload of the final-RMSNorm weight
+    /// (B4-CORRECTION C). Happens at most once per generation/vindex binding
+    /// (on the first eligible decode token); steady-state decode records zero
+    /// here and one [`note_final_norm_weight_cache_hit`] instead. Profile-gated.
+    pub(crate) fn note_final_norm_weight_htod(&self, bytes: usize) {
+        if crate::options::gpu_profile_enabled() {
+            self.greedy_profile
+                .final_norm_weight_htod_copies
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.greedy_profile
+                .final_norm_weight_htod_bytes
+                .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record one steady-state reuse of the resident final-RMSNorm weight
+    /// (B4-CORRECTION C) — the per-token hit that replaced the pre-correction
+    /// per-token upload. Profile-gated.
+    pub(crate) fn note_final_norm_weight_cache_hit(&self) {
+        if crate::options::gpu_profile_enabled() {
+            self.greedy_profile
+                .final_norm_weight_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -966,13 +1027,13 @@ impl CudaBackend {
         let device_greedy_engaged = self.greedy_profile.engaged.swap(0, Ordering::Relaxed);
         let device_greedy_fallbacks = self.greedy_profile.fallbacks.swap(0, Ordering::Relaxed);
         let device_greedy_failures = self.greedy_profile.failures.swap(0, Ordering::Relaxed);
-        let lm_head_full_score_dtoh_copies = self
+        let q4k_matvec_dtoh_copies = self
             .greedy_profile
-            .lm_head_full_score_dtoh_copies
+            .q4k_matvec_dtoh_copies
             .swap(0, Ordering::Relaxed);
-        let lm_head_full_score_dtoh_bytes = self
+        let q4k_matvec_dtoh_bytes = self
             .greedy_profile
-            .lm_head_full_score_dtoh_bytes
+            .q4k_matvec_dtoh_bytes
             .swap(0, Ordering::Relaxed);
         let lm_head_result_dtoh_copies = self
             .greedy_profile
@@ -990,12 +1051,27 @@ impl CudaBackend {
             .greedy_profile
             .final_hidden_readback_bytes
             .swap(0, Ordering::Relaxed);
+        let final_norm_weight_htod_copies = self
+            .greedy_profile
+            .final_norm_weight_htod_copies
+            .swap(0, Ordering::Relaxed);
+        let final_norm_weight_htod_bytes = self
+            .greedy_profile
+            .final_norm_weight_htod_bytes
+            .swap(0, Ordering::Relaxed);
+        let final_norm_weight_cache_hits = self
+            .greedy_profile
+            .final_norm_weight_cache_hits
+            .swap(0, Ordering::Relaxed);
         let greedy_active = device_greedy_attempts != 0
             || device_greedy_engaged != 0
             || device_greedy_fallbacks != 0
             || device_greedy_failures != 0
-            || lm_head_full_score_dtoh_copies != 0
-            || final_hidden_readbacks != 0;
+            || q4k_matvec_dtoh_copies != 0
+            || lm_head_result_dtoh_copies != 0
+            || final_hidden_readbacks != 0
+            || final_norm_weight_htod_copies != 0
+            || final_norm_weight_cache_hits != 0;
         let graph_active = graph_submissions != 0
             || graph_builds != 0
             || graph_failures != 0
@@ -1031,12 +1107,15 @@ impl CudaBackend {
             device_greedy_engaged,
             device_greedy_fallbacks,
             device_greedy_failures,
-            lm_head_full_score_dtoh_copies,
-            lm_head_full_score_dtoh_bytes,
+            q4k_matvec_dtoh_copies,
+            q4k_matvec_dtoh_bytes,
             lm_head_result_dtoh_copies,
             lm_head_result_dtoh_bytes,
             final_hidden_readbacks,
             final_hidden_readback_bytes,
+            final_norm_weight_htod_copies,
+            final_norm_weight_htod_bytes,
+            final_norm_weight_cache_hits,
         })
     }
 

@@ -1619,6 +1619,18 @@ pub const GREEDY_TOPK_PARTIAL_CUDA_SRC: &str = r#"
 // `__int_as_float(0xff800000)` sentinel.
 #define NEG_INF (__int_as_float(0xff800000u))
 
+// B4-CORRECTION B: deterministic tie-break contract, shared with the host
+// reference and `greedy_topk_final`. Candidate (bv, bt) ranks ahead of
+// (av, at) when its score is strictly greater, OR the scores are equal and
+// its global token id is strictly smaller. Non-finite scores never reach
+// this comparator (they are masked to NEG_INF and excluded by `win_val >
+// NEG_INF`). The partial reduction carries the GLOBAL TOKEN ID (not the
+// lane / partial-buffer position) through every comparison, so an exact
+// score tie always resolves to the lower token id regardless of CUDA
+// thread, block, or strided-scan order.
+#define BETTER(bv, bt, av, at) \
+    (((bv) > (av)) || (((bv) == (av)) && ((bt) < (at))))
+
 extern "C" __global__ void greedy_topk_partial(
     const float* scores,
     float* partial_scores,
@@ -1642,28 +1654,32 @@ extern "C" __global__ void greedy_topk_partial(
     }
     __syncthreads();
 
-    // k sequential argmax reductions over the slice. Each pass: copy the
-    // (masked) slice into a reduction buffer, reduce to a single max, then
-    // mask the winner at NEG_INF for the next pass. A shared index array
-    // carries the within-slice position so we can compute the global id.
+    // k sequential reductions over the slice. Each pass: copy the (masked)
+    // slice into a reduction buffer carrying the GLOBAL token id, reduce to
+    // a single winner with the lexicographic (score desc, id asc)
+    // comparator, then mask the winner at NEG_INF for the next pass.
     __shared__ float red_val[GREEDY_BLK];
-    __shared__ unsigned int red_idx[GREEDY_BLK];
+    __shared__ unsigned int red_tok[GREEDY_BLK];
 
     for (unsigned int kk = 0u; kk < k; ++kk) {
-        // Initialise the reduction buffer from the (masked) slice.
+        // Initialise the reduction buffer from the (masked) slice. The
+        // token id carried is the GLOBAL id (base + lane), so the
+        // comparator breaks ties on the real vocabulary index, not the
+        // lane-local position.
         red_val[tid] = shm[tid];
-        red_idx[tid] = tid;
+        red_tok[tid] = base + tid;
         __syncthreads();
 
-        // In-place tree reduction (256 -> 1) keeping the max + its index.
+        // In-place tree reduction (256 -> 1) keeping the lexicographic best.
         for (unsigned int off = GREEDY_BLK / 2u; off > 0u; off >>= 1u) {
             if (tid < off) {
-                const float a = red_val[tid];
-                const float b = red_val[tid + off];
-                // Strict >: lowest index wins on ties (a is the lower index).
-                if (b > a) {
-                    red_val[tid] = b;
-                    red_idx[tid] = red_idx[tid + off];
+                const float av = red_val[tid];
+                const float bv = red_val[tid + off];
+                const unsigned int at = red_tok[tid];
+                const unsigned int bt = red_tok[tid + off];
+                if (BETTER(bv, bt, av, at)) {
+                    red_val[tid] = bv;
+                    red_tok[tid] = bt;
                 }
             }
             __syncthreads();
@@ -1672,20 +1688,21 @@ extern "C" __global__ void greedy_topk_partial(
         // Thread 0 records the winner and masks it for the next pass.
         if (tid == 0u) {
             const float win_val = red_val[0u];
-            const unsigned int local_idx = red_idx[0u];
-            const unsigned int global_id = base + local_idx;
+            const unsigned int win_tok = red_tok[0u];
             const unsigned int slot = bid * k + kk;
             if (win_val > NEG_INF) {
                 partial_scores[slot] = win_val;
-                partial_ids[slot] = global_id;
+                partial_ids[slot] = win_tok;
+                // Recover the within-slice position to mask the winner.
+                // win_tok is in [base, base+GREEDY_BLK) ∩ [0, logical_rows)
+                // because only finite in-range lanes can win.
+                const unsigned int local_idx = win_tok - base;
+                shm[local_idx] = NEG_INF;
             } else {
-                // No finite candidate left in this slice; sentinel + leave
-                // remaining slots as sentinels too (shm is exhausted).
+                // No finite candidate left in this slice; sentinel.
                 partial_scores[slot] = NEG_INF;
                 partial_ids[slot] = 0xFFFFFFFFu;
             }
-            // Mask the winner so it can't win the next pass.
-            shm[local_idx] = NEG_INF;
         }
         __syncthreads();
     }
@@ -1694,14 +1711,28 @@ extern "C" __global__ void greedy_topk_partial(
 
 /// Final top-K reduction. Single block, `GREEDY_BLK` threads. Strided
 /// scan over the `num_partials = num_blocks * k` partial candidates,
-/// `k` sequential argmax passes (each thread keeps a register-local best,
-/// then a 256-way shared-memory reduction). Writes the final sorted
-/// (descending) top-`k` into `result_scores[k]` / `result_ids[k]`.
-/// Unfilled slots (fewer than `k` finite candidates overall) are the
-/// `(-INFINITY, 0xFFFFFFFF)` sentinel.
+/// `k` sequential passes (each thread keeps a register-local best, then a
+/// 256-way shared-memory reduction). Writes the final sorted (descending)
+/// top-`k` into `result_scores[k]` / `result_ids[k]`. Unfilled slots (fewer
+/// than `k` finite candidates overall) are the `(-INFINITY, 0xFFFFFFFF)`
+/// sentinel.
+///
+/// B4-CORRECTION B: the comparator is the explicit lexicographic
+/// (score desc, global token id asc) order shared with `greedy_topk_partial`
+/// and the host reference. The strided per-thread scan and the shared
+/// reduction BOTH carry the global token id (read from `partial_ids`), so
+/// an exact score tie always resolves to the lower token id regardless of
+/// partial-buffer position, CUDA thread, or strided-scan order. The prior
+/// score-only final comparator compared only `partial_scores` and broke
+/// ties on partial-buffer position, which could select the wrong token id
+/// when two partial candidates from different blocks shared a score.
 pub const GREEDY_TOPK_FINAL_CUDA_SRC: &str = r#"
 #define GREEDY_BLK 256u
 #define NEG_INF (__int_as_float(0xff800000u))
+
+// Same lexicographic tie-break contract as greedy_topk_partial.
+#define BETTER(bv, bt, av, at) \
+    (((bv) > (av)) || (((bv) == (av)) && ((bt) < (at))))
 
 extern "C" __global__ void greedy_topk_final(
     float* partial_scores,
@@ -1714,40 +1745,53 @@ extern "C" __global__ void greedy_topk_final(
     const unsigned int tid = threadIdx.x;
     const unsigned int block_dim = blockDim.x;
 
-    // k sequential argmax passes over the partial buffer. Each pass:
-    // every thread strides over the buffer keeping its register-local best,
-    // then a 256-way shared reduction picks the global winner, which thread
-    // 0 records and masks (set to NEG_INF) for the next pass.
+    // k sequential passes over the partial buffer. Each pass: every thread
+    // strides over the buffer keeping its register-local best (score +
+    // global token id + partial-buffer position), then a 256-way shared
+    // reduction picks the global winner with the lexicographic comparator.
+    // Thread 0 records the winner and masks it (set to NEG_INF) for the next
+    // pass. The global token id drives the tie-break; the partial-buffer
+    // position is carried only so the winner can be masked.
     __shared__ float red_val[GREEDY_BLK];
-    __shared__ unsigned int red_idx[GREEDY_BLK];
+    __shared__ unsigned int red_pos[GREEDY_BLK];
+    __shared__ unsigned int red_tok[GREEDY_BLK];
 
     for (unsigned int kk = 0u; kk < k; ++kk) {
-        // Per-thread register-local best (init to -inf so unfilled partials
-        // never win).
+        // Per-thread register-local best (init to the sentinel so unfilled
+        // partials never win).
         float best_val = NEG_INF;
-        unsigned int best_idx = 0xFFFFFFFFu;
+        unsigned int best_pos = 0xFFFFFFFFu;
+        unsigned int best_tok = 0xFFFFFFFFu;
 
         for (unsigned int i = tid; i < num_partials; i += block_dim) {
             const float v = partial_scores[i];
             // Skip non-finite (NaN/±∞) — host `is_finite()` contract.
-            if (isfinite(v) && v > best_val) {
-                best_val = v;
-                best_idx = i;
+            if (isfinite(v)) {
+                const unsigned int v_tok = partial_ids[i];
+                if (BETTER(v, v_tok, best_val, best_tok)) {
+                    best_val = v;
+                    best_pos = i;
+                    best_tok = v_tok;
+                }
             }
         }
 
         red_val[tid] = best_val;
-        red_idx[tid] = best_idx;
+        red_pos[tid] = best_pos;
+        red_tok[tid] = best_tok;
         __syncthreads();
 
-        // 256-way tree reduction keeping the max + its partial-buffer index.
+        // 256-way tree reduction keeping the lexicographic best.
         for (unsigned int off = block_dim / 2u; off > 0u; off >>= 1u) {
             if (tid < off) {
-                const float a = red_val[tid];
-                const float b = red_val[tid + off];
-                if (b > a) {
-                    red_val[tid] = b;
-                    red_idx[tid] = red_idx[tid + off];
+                const float av = red_val[tid];
+                const float bv = red_val[tid + off];
+                const unsigned int at = red_tok[tid];
+                const unsigned int bt = red_tok[tid + off];
+                if (BETTER(bv, bt, av, at)) {
+                    red_val[tid] = bv;
+                    red_pos[tid] = red_pos[tid + off];
+                    red_tok[tid] = bt;
                 }
             }
             __syncthreads();
@@ -1756,12 +1800,13 @@ extern "C" __global__ void greedy_topk_final(
         // Thread 0 records the winner and masks it in the partial buffer.
         if (tid == 0u) {
             const float win_val = red_val[0u];
-            const unsigned int win_partial_idx = red_idx[0u];
-            if (win_partial_idx != 0xFFFFFFFFu && win_val > NEG_INF) {
+            const unsigned int win_pos = red_pos[0u];
+            const unsigned int win_tok = red_tok[0u];
+            if (win_pos != 0xFFFFFFFFu && win_val > NEG_INF) {
                 result_scores[kk] = win_val;
-                result_ids[kk] = partial_ids[win_partial_idx];
+                result_ids[kk] = win_tok;
                 // Mask the winner so it can't win the next pass.
-                partial_scores[win_partial_idx] = NEG_INF;
+                partial_scores[win_pos] = NEG_INF;
             } else {
                 result_scores[kk] = NEG_INF;
                 result_ids[kk] = 0xFFFFFFFFu;

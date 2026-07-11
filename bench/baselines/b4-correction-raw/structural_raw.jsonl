@@ -1,0 +1,4 @@
+{"mode": "BaselineA", "graphs": 0, "b4": 0, "instrumented": true, "rep": 1, "prefill_ms": 740.4, "mean_ms": 108.74, "p50_ms": 108.73, "tok_s": 9.2, "n_steps": 78, "early_stop": true, "note": "early stop @78/79 (EOS or GPU fallback)"}
+{"mode": "B4A", "graphs": 0, "b4": 1, "instrumented": true, "rep": 1, "prefill_ms": 746.5, "mean_ms": 108.88, "p50_ms": 108.82, "tok_s": 9.2, "n_steps": 78, "early_stop": true, "note": "early stop @78/79 (EOS or GPU fallback)"}
+{"mode": "BaselineB", "graphs": 1, "b4": 0, "instrumented": true, "rep": 1, "prefill_ms": 744.1, "mean_ms": 108.18, "p50_ms": 108.2, "tok_s": 9.2, "n_steps": 78, "early_stop": true, "note": "early stop @78/79 (EOS or GPU fallback)"}
+{"mode": "B4B", "graphs": 1, "b4": 1, "instrumented": true, "rep": 1, "prefill_ms": 736.9, "mean_ms": 107.73, "p50_ms": 107.73, "tok_s": 9.3, "n_steps": 78, "early_stop": true, "note": "early stop @78/79 (EOS or GPU fallback)"}

@@ -153,11 +153,17 @@ impl QuantMatVec for CudaBackend {
         hidden: usize,
     ) -> Option<Vec<f32>> {
         if let Ok(Some(native)) = self.native_q4k_matvec(q4k_data, x, num_rows, hidden) {
-            // LARQL-GPU-B4 diagnostic: this is the full score-vector DtoH
-            // the device-greedy path eliminates. The dominant decode-time
-            // caller is the host lm-head path; count it so the B4 engagement
-            // report can show the transfer going to zero when B4 engages.
-            self.note_lm_head_full_score_dtoh(num_rows * 4);
+            // B4-CORRECTION §9: this counter was named `lm_head_full_score_dtoh`,
+            // but `QuantMatVec::q4k_matvec` is a GENERAL op — it is also reached
+            // by Q4_K MoE/FFN gate/up/down matvecs (see `pipeline.rs`
+            // `moe_expert_contribution_q4k`). Renamed to `q4k_matvec_dtoh` so
+            // it accurately describes all Q4_K matvec result readbacks. For the
+            // canonical dense Qwen2.5-3B benchmark the only decode-time caller
+            // IS the host lm-head path (no MoE, no other Q4_K matvec in the
+            // measured route), so the value is lm-head-equivalent there — but
+            // that is a property of the route, proven by call-site audit, not
+            // of the counter.
+            self.note_q4k_matvec_dtoh(num_rows * 4);
             return Some(native);
         }
         CPU.q4k_matvec(q4k_data, x, num_rows, hidden)
