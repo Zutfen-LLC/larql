@@ -60,18 +60,17 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 35
     container:
-      image: rust:1-bookworm
+      image: ghcr.io/zutfen-llc/larql-ci-rust:latest
+      volumes:
+        - larql-cargo-registry:/usr/local/cargo/registry
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install sccache
-        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary.
-        # If MinIO is unreachable, fall back to compiling without cache.
+      - name: Verify sccache + MinIO connectivity
+        # sccache is pre-baked in the CI image. Just verify MinIO is reachable.
+        # If unreachable, disable sccache so the build still completes.
         run: |
-          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
-          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-          chmod +x /usr/local/bin/sccache
           if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
             echo "::warning::MinIO cache unreachable — compiling without sccache"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
@@ -122,18 +121,17 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 35
     container:
-      image: rust:1-bookworm
+      image: ghcr.io/zutfen-llc/larql-ci-rust:latest
+      volumes:
+        - larql-cargo-registry:/usr/local/cargo/registry
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install sccache
-        # Debian bookworm sccache pkg (0.4.0-pre6) lacks S3 backend — use official binary.
-        # If MinIO is unreachable, fall back to compiling without cache.
+      - name: Verify sccache + MinIO connectivity
+        # sccache is pre-baked in the CI image. Just verify MinIO is reachable.
+        # If unreachable, disable sccache so the build still completes.
         run: |
-          curl -sL https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
-          mv /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache
-          chmod +x /usr/local/bin/sccache
           if ! curl -sf --connect-timeout 3 "$SCCACHE_ENDPOINT/minio/health/live" >/dev/null 2>&1; then
             echo "::warning::MinIO cache unreachable — compiling without sccache"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"

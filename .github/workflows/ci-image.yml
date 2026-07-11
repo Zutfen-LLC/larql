@@ -1,0 +1,46 @@
+# Builds and pushes the larql CI Rust image to GHCR.
+#
+# The image is a thin layer on top of rust:1-bookworm that pre-installs
+# sccache. All larql workflows reference ghcr.io/zutfen-llc/larql-ci-rust:latest
+# instead of the bare rust image, eliminating the per-run sccache download.
+#
+# Triggered on changes to ci/rust-ci.Dockerfile or manually via workflow_dispatch.
+
+name: ci-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ci/rust-ci.Dockerfile'
+      - '.github/workflows/ci-image.yml'
+  workflow_dispatch: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/larql-ci-rust
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push
+        run: |
+          docker buildx build \
+            --file ci/rust-ci.Dockerfile \
+            --tag $REGISTRY/$IMAGE_NAME:latest \
+            --tag $REGISTRY/$IMAGE_NAME:${{ github.sha }} \
+            --push \
+            .
+
+      - name: Image digest
+        run: docker buildx imagetools inspect $REGISTRY/$IMAGE_NAME:latest --format '{{json .manifest}}'
