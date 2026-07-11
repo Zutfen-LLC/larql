@@ -126,7 +126,7 @@ pub fn build_vindex_streaming_profiled(
 
     // The safetensors contract is checked before creating checkpoints or any
     // writer artifact. GGUF has a separate audited routing path.
-    if arch.family() == "gemma4"
+    if crate::format::weights::preflight::is_gemma4_e2b(&*arch)
         && context::detect_gguf_entry(model_dir)?.is_none()
         && extract_level.writes_attn()
     {

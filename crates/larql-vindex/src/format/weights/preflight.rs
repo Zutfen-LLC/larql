@@ -10,6 +10,11 @@ use crate::error::VindexError;
 
 use super::WeightSource;
 
+/// Whether automatic extraction must enforce this slice's Gemma 4 E2B contract.
+pub(crate) fn is_gemma4_e2b(arch: &dyn larql_models::ModelArchitecture) -> bool {
+    arch.family() == "gemma4" && arch.config().num_layers == 35
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TensorMetadata {
     pub normalized_name: String,

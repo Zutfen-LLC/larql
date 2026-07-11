@@ -262,7 +262,7 @@ pub fn write_model_weights_kquant_with_opts(
     opts: KquantWriteOptions,
     profiler: Option<&ExtractProfiler>,
 ) -> Result<(), VindexError> {
-    if source.arch().family() == "gemma4" {
+    if super::preflight::is_gemma4_e2b(source.arch()) {
         let preflight = super::preflight::validate_weight_source(
             source,
             super::preflight::SafetensorsPreflightOptions::default(),
