@@ -111,8 +111,16 @@ struct GraphProfileCounters {
     graph_failures: std::sync::atomic::AtomicU64,
     /// Replay `Err` → resident device chain fallback count.
     graph_fallbacks: std::sync::atomic::AtomicU64,
-    /// Any D2D copy on the graph path (expected 0; counted honestly if any).
+    /// Any D2D copy on the graph path (the cross-stream seed + output copies
+    /// the separate cap_stream design requires; counted honestly per B3A
+    /// review point 3 — never claimed zero unless the design achieves zero).
     d2d_submissions: std::sync::atomic::AtomicU64,
+    /// Explicit cross-stream `synchronize()` calls the graph path issues
+    /// (runtime-stream↔cap_stream handoff, outside any capture window). The
+    /// previous accounting hid these because raw `stream.synchronize()`
+    /// bypasses `note_sync`; counting them here keeps the sync total honest
+    /// (B3A review point 3).
+    graph_cross_stream_syncs: std::sync::atomic::AtomicU64,
 }
 
 /// A consumed snapshot of the profile counters, returned by
@@ -131,6 +139,27 @@ pub struct CudaProfileSnapshot {
     pub mirror_append_ns: u64,
     pub mirror_rows_copied: u64,
     pub hidden_readback_ns: u64,
+    // ── B3A capture-aware graph counters (review points 3, 8) ──
+    // These make submission-reduction accounting honest: total host CUDA
+    // submissions/token = launches + graph_submissions + d2d_submissions.
+    // The previous accounting reported only `launches`, excluding the cap_stream
+    // graph launches and D2D copies the graph path adds.
+    /// One `CudaGraph::launch()` per eligible layer per token (incl. token 1).
+    pub graph_submissions: u64,
+    /// One per `ResidentFfnGraph::build()` (one per eligible layer per gen).
+    pub graph_builds: u64,
+    /// Physical kernel nodes a captured graph contains (+= at build).
+    pub captured_kernel_nodes: u64,
+    /// `captured_kernel_nodes` × replays.
+    pub logical_graph_kernel_executions: u64,
+    /// Build `Err` count.
+    pub graph_failures: u64,
+    /// Replay `Err` → resident device chain fallback count.
+    pub graph_fallbacks: u64,
+    /// D2D copies on the graph path (seed + output; the cross-stream cost).
+    pub d2d_submissions: u64,
+    /// Explicit cross-stream `synchronize()` calls the graph path issues.
+    pub graph_cross_stream_syncs: u64,
 }
 
 impl From<CudaProfileSnapshot> for larql_compute::ProfileCountersSnapshot {
@@ -145,6 +174,14 @@ impl From<CudaProfileSnapshot> for larql_compute::ProfileCountersSnapshot {
             mirror_append_ns: c.mirror_append_ns,
             mirror_rows_copied: c.mirror_rows_copied,
             hidden_readback_ns: c.hidden_readback_ns,
+            graph_submissions: c.graph_submissions,
+            graph_builds: c.graph_builds,
+            captured_kernel_nodes: c.captured_kernel_nodes,
+            logical_graph_kernel_executions: c.logical_graph_kernel_executions,
+            graph_failures: c.graph_failures,
+            graph_fallbacks: c.graph_fallbacks,
+            d2d_submissions: c.d2d_submissions,
+            graph_cross_stream_syncs: c.graph_cross_stream_syncs,
         }
     }
 }
@@ -597,6 +634,16 @@ impl CudaBackend {
         }
     }
 
+    /// Record one explicit cross-stream `synchronize()` from the graph path
+    /// (B3A review point 3). Always counted (not profile-gated): it is a real
+    /// host CUDA submission the graph path introduces, and hiding it would
+    /// make the sync accounting dishonest.
+    pub(crate) fn note_graph_cross_stream_sync(&self) {
+        self.graph_profile
+            .graph_cross_stream_syncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// B3A graph diagnostic: one-liner for the graph replay counters, or `None`
     /// when no graph activity has occurred. Surfaced through `device_info()`
     /// when `LARQL_GPU_DIAG` is set.
@@ -616,8 +663,24 @@ impl CudaBackend {
         } else {
             format!("{:.1}%", (warm as f64 / submissions as f64) * 100.0)
         };
+        // Node + D2D + sync decomposition (review point 3 honest accounting).
+        // Read non-destructively (load) so the cumulative diagnostic survives
+        // across reads; `cuda_profile_counters` swaps them for window deltas.
+        let captured_nodes = self
+            .graph_profile
+            .captured_kernel_nodes
+            .load(Ordering::Relaxed);
+        let logical_execs = self
+            .graph_profile
+            .logical_graph_kernel_executions
+            .load(Ordering::Relaxed);
+        let d2d = self.graph_profile.d2d_submissions.load(Ordering::Relaxed);
+        let cross_syncs = self
+            .graph_profile
+            .graph_cross_stream_syncs
+            .load(Ordering::Relaxed);
         Some(format!(
-            "cuda resident-FFN graph: builds={builds}, submissions={submissions}, replays={warm}, failures={failures}, fallbacks={fallbacks}, replay_rate={replay_rate}"
+            "cuda resident-FFN graph: builds={builds}, submissions={submissions}, replays={warm}, failures={failures}, fallbacks={fallbacks}, replay_rate={replay_rate}, captured_nodes={captured_nodes}, logical_execs={logical_execs}, d2d={d2d}, cross_stream_syncs={cross_syncs}"
         ))
     }
 
@@ -709,7 +772,39 @@ impl CudaBackend {
         let mirror_append_ns = self.profile.mirror_append_ns.swap(0, Ordering::Relaxed);
         let mirror_rows_copied = self.profile.mirror_rows_copied.swap(0, Ordering::Relaxed);
         let hidden_readback_ns = self.profile.hidden_readback_ns.swap(0, Ordering::Relaxed);
-        if rt.is_none() && mirror_append_ns == 0 && hidden_readback_ns == 0 {
+        // B3A graph counters — consumed (swap) so consecutive reads give
+        // per-window deltas, matching the mirror/readback swap above.
+        let graph_submissions = self
+            .graph_profile
+            .graph_submissions
+            .swap(0, Ordering::Relaxed);
+        let graph_builds = self.graph_profile.graph_builds.swap(0, Ordering::Relaxed);
+        let captured_kernel_nodes = self
+            .graph_profile
+            .captured_kernel_nodes
+            .swap(0, Ordering::Relaxed);
+        let logical_graph_kernel_executions = self
+            .graph_profile
+            .logical_graph_kernel_executions
+            .swap(0, Ordering::Relaxed);
+        let graph_failures = self.graph_profile.graph_failures.swap(0, Ordering::Relaxed);
+        let graph_fallbacks = self
+            .graph_profile
+            .graph_fallbacks
+            .swap(0, Ordering::Relaxed);
+        let d2d_submissions = self
+            .graph_profile
+            .d2d_submissions
+            .swap(0, Ordering::Relaxed);
+        let graph_cross_stream_syncs = self
+            .graph_profile
+            .graph_cross_stream_syncs
+            .swap(0, Ordering::Relaxed);
+        let graph_active = graph_submissions != 0
+            || graph_builds != 0
+            || graph_failures != 0
+            || graph_fallbacks != 0;
+        if rt.is_none() && mirror_append_ns == 0 && hidden_readback_ns == 0 && !graph_active {
             return None;
         }
         let rt = rt.unwrap_or_default();
@@ -723,6 +818,14 @@ impl CudaBackend {
             mirror_append_ns,
             mirror_rows_copied,
             hidden_readback_ns,
+            graph_submissions,
+            graph_builds,
+            captured_kernel_nodes,
+            logical_graph_kernel_executions,
+            graph_failures,
+            graph_fallbacks,
+            d2d_submissions,
+            graph_cross_stream_syncs,
         })
     }
 

@@ -148,6 +148,28 @@ pub struct ProfileCountersSnapshot {
     pub mirror_rows_copied: u64,
     /// Final hidden-state device→host readback: nanoseconds.
     pub hidden_readback_ns: u64,
+    // ── B3A capture-aware graph counters (review points 3, 8) ────────────
+    // Populated only by backends with CUDA-Graph replay (CUDA today). Other
+    // backends leave them at the `Default` zero. Total host CUDA submissions
+    // per token = `launches + graph_submissions + d2d_submissions`; reporting
+    // `launches` alone overstates the graph path's reduction because it
+    // excludes the cap_stream graph launches and D2D copies the path adds.
+    /// One `graph.launch()` per eligible layer per token (incl. token 1).
+    pub graph_submissions: u64,
+    /// One graph build per eligible layer per generation.
+    pub graph_builds: u64,
+    /// Physical kernel nodes captured into graphs (counted once at build).
+    pub captured_kernel_nodes: u64,
+    /// `captured_kernel_nodes` × replays.
+    pub logical_graph_kernel_executions: u64,
+    /// Graph build failures.
+    pub graph_failures: u64,
+    /// Graph replay failures that fell back to the resident device chain.
+    pub graph_fallbacks: u64,
+    /// D2D copies on the graph path (seed + output cross-stream copies).
+    pub d2d_submissions: u64,
+    /// Explicit cross-stream `synchronize()` calls the graph path issues.
+    pub graph_cross_stream_syncs: u64,
 }
 
 impl ProfileTimings {

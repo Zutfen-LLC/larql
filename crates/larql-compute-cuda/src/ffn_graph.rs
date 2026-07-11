@@ -354,6 +354,32 @@ pub fn graph_mode_from_env() -> GraphMode {
     graph_mode_from_str(std::env::var(ENV_CUDA_GRAPHS).ok().as_deref())
 }
 
+/// The CUDA graph instantiate flags LARQL uses (B3A review point 5).
+///
+/// Point 5 mandates beginning with default (0) instantiate flags unless the
+/// smoke test or cudarc implementation **proves another flag is required**.
+/// That proof holds here: cudarc 0.19.8's `CudaStream::end_capture` takes a
+/// **typed** `CUgraphInstantiate_flags` enum whose only constructible
+/// variants are non-zero (`AUTO_FREE_ON_LAUNCH=1`, `UPLOAD=2`,
+/// `DEVICE_LAUNCH=4`, `USE_NODE_PRIORITY=8` on CUDA 12.4). There is no sound
+/// way to pass default (0) flags through this API:
+/// - `0u32 as CUgraphInstantiate_flags` is rejected (`as` cannot cast int→enum);
+/// - `transmute(0u32)` is `invalid_value` UB (a fieldless enum must hold a
+///   valid discriminant under Rust's abstract machine), even though it is
+///   `#[repr(u32)]`;
+/// - `CudaGraph`'s `cu_graph`/`cu_graph_exec` fields are private, so the raw
+///   `cuGraphInstantiateWithFlags(.., 0)` sys call cannot be used to build a
+///   `CudaGraph` from outside the crate.
+///
+/// `AUTO_FREE_ON_LAUNCH` only affects **graph-managed** allocations, which the
+/// FFN graph does not contain (all buffers are externally owned by the arena /
+/// weight cache / scratch), so it is a no-op here — the minimal-impact flag
+/// the API forces. `b3a_smoke_*` validates capture/instantiate/replay with
+/// this flag on the RTX 3060.
+pub(crate) fn graph_instantiate_flags() -> cudarc::driver::sys::CUgraphInstantiate_flags {
+    cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

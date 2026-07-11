@@ -203,19 +203,23 @@ Ordered by expected wall-clock impact; re-rank against the A4 profile.
   verification policy — no RTX 3090 rerun required. See
   bench/baselines/cuda-q4km-resident-hidden-2026-07-10.md.
 - B3A. **Launch batching / graphization — FFN graph replay** (IMPLEMENTED,
-  opt-in). The resident decode FFN chain is captured into a `CudaGraph` per
-  eligible layer and replayed (one `graph.launch()` replacing 7 individual
-  host launches). cudarc 0.19.8's safe Graph API is used directly (no upgrade,
-  no wrapper). **Result: 36.6% host submission reduction (599→380/tok), but
-  no wall-clock improvement (−0.18%, within noise) due to the cross-stream
-  sync overhead (2 synchronize/layer = 72/token). Stays opt-in
-  (`LARQL_CUDA_GRAPHS=1`, default Disabled) per the performance gate.**
-  204/204 tests pass in both modes. See
+  opt-in, accounting-corrected). The resident decode FFN chain is captured
+  into a `CudaGraph` per eligible layer and replayed (one `graph.launch()`
+  replacing 7 individual host launches). cudarc 0.19.8's safe Graph API is
+  used directly (no upgrade, no wrapper). **Honest result (review points 3+8):
+  18.2% TOTAL host submission reduction (623→510/tok, counting graph
+  submissions + D2D + cross-stream syncs), flat wall-clock, +91% syncs —
+  fails the ≥25% submission gate, the ≥1% wall-clock gate, and the
+  no-sync-regression gate. Stays opt-in (`LARQL_CUDA_GRAPHS=1`, default
+  Disabled).** 204/204 tests pass in both modes. See
   bench/baselines/cuda-resident-ffn-graph-2026-07-10.md.
-  <!-- LARQL-GPU-B3A (2026-07-10, RTX 3060): structural gate met (36.6% ≥ 25%),
-       wall-clock gate not met (-0.18% < 1%). Two critical findings: the NULL
-       default stream cannot be captured (STREAM_CAPTURE_UNSUPPORTED), and
-       cudarc's event tracking must be disabled for graph buffers
+  <!-- LARQL-GPU-B3A (2026-07-10, RTX 3060): accounting-corrected. The earlier
+       "36.6% structural gate met" was the NULL-stream `launches` counter
+       alone (excluded cap_stream graph launches + D2D; double-counted
+       token-1 captured nodes). Honest TOTAL = 623→510/tok = 18.2% (< 25%).
+       Wall-clock flat; syncs +91%. Two critical findings: the NULL default
+       stream cannot be captured (STREAM_CAPTURE_UNSUPPORTED), and cudarc's
+       event tracking must be disabled for graph buffers
        (STREAM_CAPTURE_ISOLATION). B3B (attention graphization or event-based
        cross-stream sync) is the path to the ≥1% wall-clock gate. -->
 - B3B. **Attention graphization / event-based sync** (1 session, follow-on to

@@ -2762,7 +2762,7 @@ impl CudaBackend {
     fn replay_ffn_graph(
         &self,
         runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
-        _layer: &FullPipelineLayer<'_>,
+        layer: &FullPipelineLayer<'_>,
         h_post_attn_dev: &CudaSlice<f32>,
         hidden: usize,
         li: usize,
@@ -2773,8 +2773,10 @@ impl CudaBackend {
         let cap_stream = arena.cap_stream.clone();
 
         // The post-attn state was produced on the runtime stream; sync before
-        // cap_stream reads it.
+        // cap_stream reads it. Counted as a graph cross-stream sync (point 3)
+        // — raw `synchronize()` bypasses `note_sync`.
         runtime.stream().synchronize().ok()?;
+        self.note_graph_cross_stream_sync();
         // Seed the arena input buffer from h_post_attn_dev (D2D on cap_stream).
         cap_stream
             .memcpy_dtod(h_post_attn_dev, arena.input_mut(flip))
@@ -2791,9 +2793,14 @@ impl CudaBackend {
         match replay_result {
             Ok(()) => {
                 self.note_graph_submission();
+                // B3A review point 8: logical_graph_kernel_executions must
+                // accumulate per launch (not just at build). The replayed
+                // graph executes `resident_ffn_node_count` physical nodes.
+                self.note_graph_logical_exec(resident_ffn_node_count(layer.has_post_norms));
                 // The graph wrote into the arena output on cap_stream. Sync
                 // before the runtime stream reads it.
                 cap_stream.synchronize().ok()?;
+                self.note_graph_cross_stream_sync();
                 let out = runtime.stream().clone_dtod(arena.output(flip)).ok()?;
                 self.note_graph_d2d();
                 drop(arena_guard);
@@ -2867,6 +2874,7 @@ impl CudaBackend {
 
         // Seed the arena input buffer from h_post_attn_dev (D2D on cap_stream).
         runtime.stream().synchronize().ok()?;
+        self.note_graph_cross_stream_sync();
         cap_stream
             .memcpy_dtod(h_post_attn_dev, arena.input_mut(flip))
             .ok()?;
@@ -2874,12 +2882,21 @@ impl CudaBackend {
         // Sync cap_stream before capture (drain the seed copy + ensure the
         // input is visible).
         cap_stream.synchronize().ok()?;
+        self.note_graph_cross_stream_sync();
 
         let (input_buf, output_buf_slot) = arena.input_output_mut(flip);
 
         // ── Capture ──
         // GLOBAL: the strictest mode. A forbidden sync inside capture is a
         // defect (review point 5), not something to tolerate via RELAXED.
+        //
+        // B3A review point 8: the `CaptureExitGuard` marks the runtime as
+        // mid-capture so the 7 `*_into` launches below do NOT inflate
+        // `direct_kernel_submissions` (`note_launch` is suppressed while the
+        // depth is non-zero). They become graph NODES, counted once at build
+        // via `note_graph_captured_nodes`. The guard decrements on drop so
+        // every return path balances.
+        let _capture_guard = CaptureExitGuard::enter(runtime.as_ref());
         cap_stream
             .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
             .ok()?;
@@ -3025,9 +3042,10 @@ impl CudaBackend {
         // here at the close of the closure scope. The graph captured the
         // device addresses; the Rust handles are no longer needed.
 
-        let graph = match cap_stream.end_capture(
-            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-        ) {
+        // B3A review point 5: instantiate flags via
+        // [`crate::ffn_graph::graph_instantiate_flags`] (see its docs for the
+        // cudarc-0.19.8 proof that a non-zero flag is required).
+        let graph = match cap_stream.end_capture(crate::ffn_graph::graph_instantiate_flags()) {
             Ok(Some(g)) => g,
             _ => {
                 self.note_graph_failure();
@@ -3069,6 +3087,7 @@ impl CudaBackend {
                 self.note_graph_logical_exec(node_count);
                 // Sync cap_stream before reading the output on the runtime stream.
                 cap_stream.synchronize().ok()?;
+                self.note_graph_cross_stream_sync();
                 let out = runtime.stream().clone_dtod(arena.output(flip)).ok()?;
                 self.note_graph_d2d();
                 // Store the entry for future replays (only if gen unchanged).
@@ -4418,6 +4437,30 @@ fn resident_ffn_node_count(has_post_norms: bool) -> u32 {
         7
     } else {
         6
+    }
+}
+
+/// RAII guard that balances [`crate::backend::CudaRuntime::enter_capture`] with
+/// [`crate::backend::CudaRuntime::exit_capture`] on every return path, so the
+/// capture-depth suppression of `note_launch`/`note_htod`/`note_dtoh`/
+/// `note_sync` (B3A review point 8) is always balanced even if `begin_capture`
+/// or the launch closure fails. Construct with [`CaptureExitGuard::enter`].
+struct CaptureExitGuard<'a> {
+    runtime: &'a crate::backend::CudaRuntime,
+}
+
+impl CaptureExitGuard<'_> {
+    /// Increment the capture depth and return a guard that decrements it on
+    /// drop. While alive, the four `note_*` runtime recorders are suppressed.
+    fn enter<'a>(runtime: &'a crate::backend::CudaRuntime) -> CaptureExitGuard<'a> {
+        runtime.enter_capture();
+        CaptureExitGuard { runtime }
+    }
+}
+
+impl Drop for CaptureExitGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime.exit_capture();
     }
 }
 
