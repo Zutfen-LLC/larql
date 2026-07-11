@@ -58,6 +58,7 @@ impl<'a> StreamingContext<'a> {
             tensor_index,
             arch: &*self.arch,
             num_layers: self.num_layers,
+            tied_embeddings: self.tied_embeddings,
         };
         // Thread the extract level into the write options so the
         // writer can skip attn/FFN/lm_head sections per tier.

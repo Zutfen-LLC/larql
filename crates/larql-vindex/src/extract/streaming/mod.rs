@@ -124,6 +124,18 @@ pub fn build_vindex_streaming_profiled(
     // manifests) before any output directory or checkpoint is created.
     crate::format::weights::ensure_extract_level_supported(&*arch, extract_level)?;
 
+    // The safetensors contract is checked before creating checkpoints or any
+    // writer artifact. GGUF has a separate audited routing path.
+    if context::detect_gguf_entry(model_dir)?.is_none() && extract_level.writes_attn() {
+        let report = crate::format::weights::audit_safetensors_preflight(
+            model_dir,
+            crate::format::weights::SafetensorsPreflightOptions::default(),
+        )?;
+        if !report.is_valid() {
+            return Err(VindexError::Parse(report.diagnostic()));
+        }
+    }
+
     std::fs::create_dir_all(output_dir)?;
 
     let mut ctx = StreamingContext::new(

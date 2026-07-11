@@ -20,6 +20,7 @@ pub mod load;
 pub mod manifest;
 pub mod mla_absorb;
 mod ple_sidecar;
+pub mod preflight;
 pub mod profile;
 pub mod write_f32;
 pub mod write_kquant;
@@ -41,4 +42,8 @@ pub use write_kquant::{
     KquantWriteOptions, QuantBlockFormat,
 };
 
+pub use preflight::{
+    audit_safetensors_preflight, validate_weight_source, SafetensorsPreflightOptions,
+    SafetensorsPreflightReport, ShapeMismatch, TensorMetadata,
+};
 pub use profile::ExtractProfiler;

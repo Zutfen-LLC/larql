@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "slice": "LARQL-INFERENCE-TRUST-001A-ST1",
+  "generated_date": "2026-07-11",
+  "starting_main_sha": "4391b41279acc9db0301d69d52663e318a409f19",
+  "repository": "unsloth/gemma-4-E2B-it-qat-q4_0-unquantized",
+  "source_revision_observed_via_hugging_face_api": "397aea7eca1853d6f3d099a56612a68ffc0229ae",
+  "source_last_modified_observed_via_hugging_face_api": "2026-06-05T13:17:03.000Z",
+  "local_source_available": false,
+  "unavailable_reason": "LARQL_GEMMA4_ST_DIR was not set",
+  "files": null,
+  "safetensors_metadata": null,
+  "tensor_count": null,
+  "dtype_histogram": null,
+  "tensor_inventory": null,
+  "config_declared_transformers_version": null,
+  "evidence_status": "not observed"
+}

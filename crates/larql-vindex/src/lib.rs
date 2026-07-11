@@ -96,11 +96,12 @@ pub use format::huggingface::{
     CollectionItem, DownloadProgress, PublishCallbacks, PublishOptions, SilentPublishCallbacks,
 };
 pub use format::weights::{
-    load_model_weights, load_model_weights_kquant, load_model_weights_kquant_shard,
-    load_model_weights_with_opts, write_model_weights, write_model_weights_kquant,
-    write_model_weights_kquant_with_opts, write_model_weights_with_opts, DownProjFormat,
-    ExtractProfiler, KquantWriteOptions, LoadWeightsOptions, StreamingWeights, WeightSource,
-    WriteWeightsOptions,
+    audit_safetensors_preflight, load_model_weights, load_model_weights_kquant,
+    load_model_weights_kquant_shard, load_model_weights_with_opts, write_model_weights,
+    write_model_weights_kquant, write_model_weights_kquant_with_opts,
+    write_model_weights_with_opts, DownProjFormat, ExtractProfiler, KquantWriteOptions,
+    LoadWeightsOptions, SafetensorsPreflightOptions, SafetensorsPreflightReport, ShapeMismatch,
+    StreamingWeights, TensorMetadata, WeightSource, WriteWeightsOptions,
 };
 
 // Patch
