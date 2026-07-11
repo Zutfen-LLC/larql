@@ -901,6 +901,52 @@ replay → drop, 5 cycles). **205/205 lib tests pass deterministically in both
 two-stream smoke tests vs the 204 pre-B3B). fmt + clippy clean (cuda + inference
 + cli `--features cuda`). Report: `bench/baselines/cuda-b3b-single-stream-2026-07-10.md`.
 
+## Session 35 (2026-07-11): LARQL-GPU-B4-CORRECTION — result accounting, tie parity, norm-weight residency, bench reproducibility (COMPLETE, OPT-IN)
+
+**Corrects four B4 evidence-integrity / parity gaps without expanding B4 into a
+**new optimization project.** Commit `5fa7c821`. (A) Result-readback accounting:
+**the greedy result buffers are now sized to `k`** (not `GREEDY_MAX_K`) and the
+two `clone_dtoh` calls (scores + ids) are recorded honestly as **2 DtoH ops ×
+k·4 B = 40 B for k=5** (pre-correction claimed 1 op / 40 B while actually doing
+2 calls / 64 B). (B) **Deterministic tie parity**: both reduction kernels now
+carry the **global token id** through every comparison and use one explicit
+**lexicographic (score desc, id asc)** comparator shared with the host
+reference; the pre-correction final kernel compared only `partial_scores` and
+broke ties on partial-buffer position / strided-scan order, which could select
+the wrong (higher) token id once the strided scan wrapped (>256 partials). 10
+adversarial `b4c_tie_*` tests added (within/across blocks, first-last row,
+strided scan, 2nd-5th ordering, negative, NaN/±∞-adjacent, padding-excluded,
+8× determinism) + a pure comparator unit test. (C) **Persistent final-norm
+weight**: resolved once via the existing f32 weight cache (`resolve_f32_weight`)
++ held on `GreedyHeadWorkspace`, passed to `launch_rms_norm_into` (reused from
+the B3A graph path); per-token final-norm HtoD **0 in steady state** (cold
+upload 1/generation in a dedicated counter). Parameter-free norm preserved.
+(§9) The overbroad `lm_head_full_score_dtoh` counter is **renamed
+`q4k_matvec_dtoh`** — `QuantMatVec::q4k_matvec` is a general op (also MoE/FFN).
+(D) **Benchmark reproducibility**: `scripts/bench_b4.sh` split into an
+**uninstrumented performance phase** (source of truth) + **instrumented
+structural phase**; `set -euo pipefail`; raw per-rep JSONL preserved; medians/
+MAD computed by `scripts/b4_aggregate.py` (pure self-test). The committed B4
+script set `LARQL_GPU_PROFILE=1` for perf runs.
+
+**Correctness (RTX 3060):** CUDA lib **230/230 in both `LARQL_CUDA_GRAPHS=0` and
+`=1`** (+15 `b4c_*` tests). larql-compute 750 / larql-vindex 1131 /
+larql-inference 1262 all pass. fmt + clippy clean (compute + vindex + inference
++ cuda + cli `--features cuda`). **Corrected uninstrumented perf (5 reps × 78
+measured steps; all early-stopped EOS at 78/79 consistently):** graph-off p50
+BaselineA 108.56 → B4A 108.53 (−0.03 %); graph-on BaselineB 107.88 → B4B
+108.22 (+0.32 %); MAD 0.19–0.39 ms. **B4 is wall-clock-neutral within noise**
+(<1 % gate, both directions); the graph-on sign flipped vs the prior report
+(prior −0.42 %), confirming prior per-rep values were inside noise. **Structural
+(B4A, instrumented):** host `lm_head` 12.721→0.000 ms/tok, hidden readback
+2.267→0.000 ms/tok, device-greedy **100 % engaged / 0 fallback / 0 failure**,
+result dtoh 2.1 ops/42.6 B per tok (2×k·4 B), final-norm-weight cold 1/gen +
+steady cache_hits (per-token HtoD 0). **Decision unchanged: B4 stays OPT-IN**
+(`LARQL_CUDA_DEVICE_GREEDY=1`); `LARQL_CUDA_GRAPHS` default unchanged. Reports:
+`bench/baselines/cuda-b4-correction-2026-07-11.{md,json}` +
+`bench/baselines/b4-correction-raw/`; prior `cuda-b4-device-greedy-2026-07-11.md`
+marked superseded for affected metrics.
+
 ## Session 34 (2026-07-11): LARQL-GPU-B4 — Device-side greedy lm-head (resident final norm + Q4_K lm-head + on-device top-K) (COMPLETE, OPT-IN)
 
 **B4 eliminates the final full-sized host boundary from eligible CUDA decode

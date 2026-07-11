@@ -1,5 +1,17 @@
 # LARQL-GPU-B4 — Resident final norm, Q4_K lm-head, device-side greedy selection
 
+> **SUPERSEDED (2026-07-11) for result-readback accounting, the lm-head
+> counter scope, final-norm-weight HtoD, and the performance methodology** by
+> `cuda-b4-correction-2026-07-11.md` (slice `LARQL-GPU-B4-CORRECTION`). The
+> architecture description, correctness gate, and the opt-in decision below
+> remain valid. The correction found: (A) the result readback was 2 DtoH ops /
+> 64 B (not 1 / 40 B); (B) exact-tie behaviour was not guaranteed and is now
+> lexicographic (score desc, id asc); (C) the final-norm weight was uploaded
+> every token (now once/generation); (§9) the `lm_head_full_score_dtoh`
+> counter was overbroad (renamed `q4k_matvec_dtoh`); (D) the committed bench
+> script was instrumented. The corrected uninstrumented re-run confirms B4 is
+> wall-clock-neutral (graph-off −0.03 %, graph-on +0.32 %), so B4 stays opt-in.
+
 **Date:** 2026-07-11  **Host:** NVIDIA RTX 3060 12 GB (sm_86), CUDA driver 610.43.03, NVRTC 12.4.127
 **Slice:** `LARQL-GPU-B4`  **Vindex:** production-default Qwen2.5-3B Q4_K_M
 **Decision:** **opt-in** (`LARQL_CUDA_DEVICE_GREEDY=1`); kill switch `LARQL_LM_HEAD_SKIP_Q4K=1`.

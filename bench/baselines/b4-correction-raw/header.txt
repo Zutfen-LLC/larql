@@ -1,0 +1,9 @@
+# LARQL-GPU-B4-CORRECTION benchmark (2026-07-11T11:57:33-04:00)
+# sha=5fa7c821757421d71d99851bf50da25402fc539e
+# bin=/home/zutfen/code/larql/target/release/larql
+# vindex=/home/zutfen/models/qwen2.5-3b-q4k.vindex
+# gpu=NVIDIA GeForce RTX 3060, 610.43.03
+# nvrtc=/home/zutfen/cuda-lib/libnvrtc-builtins.so.12
+# prompt="Write a step by step guide on how to bake a cake from scratch."
+# tokens=79 warmup=5 reps=5
+# effective LARQL_* env at script start:
