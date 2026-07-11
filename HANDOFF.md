@@ -900,5 +900,70 @@ replay → drop, 5 cycles). **205/205 lib tests pass deterministically in both
 `LARQL_CUDA_GRAPHS=0` and `LARQL_CUDA_GRAPHS=1`** (+3 single-stream tests, −2
 two-stream smoke tests vs the 204 pre-B3B). fmt + clippy clean (cuda + inference
 + cli `--features cuda`). Report: `bench/baselines/cuda-b3b-single-stream-2026-07-10.md`.
-**Next:** B4 (lm-head on device — the 21% lm-head fraction is now the largest
-single decode cost), or profile-driven polish.
+
+## Session 34 (2026-07-11): LARQL-GPU-B4 — Device-side greedy lm-head (resident final norm + Q4_K lm-head + on-device top-K) (COMPLETE, OPT-IN)
+
+**B4 eliminates the final full-sized host boundary from eligible CUDA decode
+steps for plain greedy generation.** The final transformer hidden state stays
+on the CUDA stream through the final RMSNorm, the Q4_K lm-head GEMV, and a
+two-stage top-K reduction; only a fixed-size candidate result (~40 B) is read
+back. Token sequence, score, callback-probability, tokenizer, EOS, and
+logical-vocabulary behaviour are all preserved; every non-greedy / penalised /
+constrained / non-Q4_K / non-CUDA path keeps the exact existing host
+norm→lm-head→sample path.
+
+**Architecture (additive, `decode_token` semantics unchanged):** substrate types
+`GreedyDecodeOutput` (`DevicePick`|`HostHidden`), `DeviceGreedyPick`,
+`GreedyQ4kHeadSpec` (+`validate()`) in `larql-compute/src/backend/greedy.rs`;
+`Capability::DeviceGreedyLmHead`; additive `DecodeBackend::decode_token_greedy_q4k`
+(default → `HostHidden`). Narrow vindex accessor
+`VectorIndex::lm_head_representation()` → `LmHeadRepresentation`
+(`Q4K{..}`|`F16`|`F32`|`Absent`) in `larql-vindex`. CUDA: extracted
+`host_decode_layers_resident` from `host_decode_token_resident` so the device
+finalizer consumes the final hidden in its native residency (owned `CudaSlice` /
+graph-arena slot / host fallback). Device chain = `launch_rms_norm_into_dev` →
+`launch_q4k_matvec_into` over `[0, min(logical,physical))` rows → two new
+reduction kernels `greedy_topk_partial` + `greedy_topk_final` (bounded k≤8
+sequential argmax, strict `>` tie-break, non-finite→`-inf` via
+`__int_as_float(0xff800000)` — NVRTC has no `INFINITY`, **no FP atomics**) →
+fixed-size readback. Generation-scoped `GreedyHeadWorkspace` (rebuilt on shape
+change, dropped at `reset_kv_cache`). **KV-append invariant:** on any device-chain
+failure after the layers advanced KV, the already-computed hidden is materialised
+once and returned `HostHidden` (never `None` unless readback fails) — the token
+step is never re-run. Inference routing in `decode_loop` resolves eligibility
+once (`is_greedy && !has_repetition_penalty && !skip_q4k &&
+device_greedy_enabled && supports(DeviceGreedyLmHead) && !has_per_layer_ffn &&
+spec.is_some()`); `DevicePick` emits via `emit_preselected_greedy` (no
+re-sampling). Gated counters added to `ProfileCountersSnapshot` +
+`device_greedy_diag`. **Bug found & fixed along the way:** the `larql bench`
+local-runtime path did not load the Q4K lm-head (`load_lm_head_kquant`), so its
+lm-head stage was timing the f32/f16 fallback (~25.8 ms) instead of the
+production Q4K path (~12.7 ms); fixed to mirror `open_inference_vindex` /
+`remote_ffn_runtime`.
+
+**Correctness (RTX 3060):** token-ID sequence **IDENTICAL** baseline-vs-B4 (3
+reps × 40 tokens); winner always < logical_vocab (unit-tested + structural);
+5-hit callback probability preserved. **215/215 CUDA lib tests pass in both
+`LARQL_CUDA_GRAPHS=0` and `=1`** (+11 B4 tests: reduction parity across
+distributions/non-finite/all-non-finite/candidate-width, full chain parity vs
+host norm+lmhead+topk, logical-vocab padding protection, norm-weight honouring,
+scaffold `HostHidden`). larql-compute 750 / larql-vindex 1131 / larql-inference
+generate 279 all pass. fmt + clippy clean (compute + cuda + vindex + inference +
+cli `--features cuda`).
+
+**Structural gate PASS:** host `final_norm` 0.006→0.000 ms/tok, host `lm_head`
+12.66→0.000 ms/tok, **final-hidden readback 2.839→0.000 ms/tok**, dtoh
+13.19→12.41 MiB/tok (−0.78), device-greedy engagement **100%** of eligible steps,
+0 fallbacks/failures, no per-token lm-head upload (cached).
+
+**Performance gate NOT MET (≤1% in both graph modes).** 5 reps × 79 decode
+steps, production Qwen2.5-3B Q4_K_M: graph-off p50 108.31→108.72 ms (+0.38%),
+graph-on p50 108.43→107.97 ms (−0.42%); MAD ≤ 0.07 ms. **Why neutral:** the
+Q4_K lm-head GEMV was already device-resident (B4 §2.2), so eliminating the host
+boundary removes only ~0.4 ms of wall time — the device GEMV + new reduction
+absorb the rest. **Decision per B4 §14.3: B4 stays OPT-IN**
+(`LARQL_CUDA_DEVICE_GREEDY=1`); `LARQL_CUDA_GRAPHS` default unchanged. Report:
+`bench/baselines/cuda-b4-device-greedy-2026-07-11.{md,json}`. **Next
+(evidence-ranked):** the D6-recommended resident-hidden path for the mixed
+Q4_K_M **attention** triple ranks above a fused GEMV+reduction kernel (the
+measured ~0.4% net does not justify fusion).

@@ -32,6 +32,11 @@ pub(super) fn run_larql(
     let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)?;
     index.load_attn_kquant(vindex_path)?;
     index.load_interleaved_kquant(vindex_path)?;
+    // LARQL-GPU-B4: load the Q4K lm-head so the bench reflects the
+    // production `run` path (which loads it via `open_inference_vindex`)
+    // rather than the f32/f16 fallback. Best-effort: tied-embedding
+    // vindexes have no dedicated lm-head file.
+    let _ = index.load_lm_head_kquant(vindex_path);
 
     let cfg = larql_vindex::load_vindex_config(vindex_path)?;
     if cfg.quant != larql_vindex::QuantFormat::Q4K {

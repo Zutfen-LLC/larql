@@ -6,15 +6,17 @@
 //! Profile timings (`LARQL_PROFILE_DECODE`/`LARQL_PROFILE_SPLIT`) are
 //! accumulated here and returned via [`DecodeLoopOutcome`].
 
-use super::sampling_step::sample_and_emit;
+use super::sampling_step::{emit_preselected_greedy, sample_and_emit};
 use crate::layer_graph::generate::detok::Detokenizer;
 use crate::layer_graph::generate::eos::EosConfig;
-use crate::layer_graph::generate::lm_head::lm_head_topk_with_policy;
+use crate::layer_graph::generate::lm_head::{
+    build_q4k_head_spec, device_greedy_enabled, lm_head_topk_with_policy,
+};
 use crate::layer_graph::generate::policy::GenerationRuntimeConfig;
 use crate::layer_graph::generate::sampling::Sampler;
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
-use larql_compute::FullPipelineLayer;
+use larql_compute::{FullPipelineLayer, GreedyDecodeOutput};
 
 /// Aggregated output of the decode-loop phase.
 pub(super) struct DecodeLoopOutcome {
@@ -78,6 +80,33 @@ where
     let mut t_lmhead = 0.0f64;
     let mut t_detok = 0.0f64;
 
+    // LARQL-GPU-B4: resolve the device-greedy eligibility ONCE. The config,
+    // vindex, and weights are stable across the decode loop, so the head
+    // spec + eligibility are computed up-front and reused per step. The
+    // per-step branch then either takes the additive device-greedy method
+    // or the exact existing host norm → lm-head → sample path.
+    //
+    // Eligibility (B4 §9):
+    //   * plain unpenalised greedy (`is_greedy()` && !has_repetition_penalty())
+    //   * `LARQL_LM_HEAD_SKIP_Q4K` not set
+    //   * `LARQL_CUDA_DEVICE_GREEDY` opted in (dev gate; performance gate
+    //     decides default-on later)
+    //   * backend advertises `DeviceGreedyLmHead`
+    //   * the active lm-head is a verified Q4_K matrix (build_q4k_head_spec)
+    //   * not a per-layer-FFN (MoE) model
+    //   * not a state-dump / split-profile step (those force the host path)
+    let plain_greedy = sampler.config().is_greedy() && !sampler.config().has_repetition_penalty();
+    let b4_capable = device_greedy_enabled()
+        && !runtime.lm_head.skip_q4k
+        && backend.supports(Capability::DeviceGreedyLmHead)
+        && !weights.has_per_layer_ffn();
+    let b4_head_spec: Option<larql_compute::GreedyQ4kHeadSpec<'_>> = if plain_greedy && b4_capable {
+        build_q4k_head_spec(index, weights, hidden, knn_k)
+    } else {
+        None
+    };
+    let b4_eligible = b4_head_spec.is_some();
+
     for step in 1..max_tokens {
         let decode_start = std::time::Instant::now();
 
@@ -111,34 +140,94 @@ where
         if let Some(upload) = upload_ple {
             upload(current_token_id, &x_dec);
         }
-        let result = run_one_decode_step(
-            weights,
-            backend,
-            layers,
-            hidden,
-            intermediate,
-            &x_dec,
-            profile_split,
-            step,
-        );
+        // LARQL-GPU-B4: take the additive device-greedy method when
+        // eligible AND this step would take the plain decode path (the
+        // split-profile diagnostic step forces the host path; MoE is
+        // already excluded by `b4_eligible`).
+        let use_b4 = b4_eligible && !(profile_split && step == 2);
+        enum StepAction {
+            DevicePick(larql_compute::DeviceGreedyPick),
+            HostHidden(Vec<f32>),
+        }
+        let action: StepAction = if use_b4 {
+            let head = b4_head_spec.as_ref().expect("b4_eligible implies spec");
+            match backend.decode_token_greedy_q4k(layers, &x_dec, hidden, intermediate, head) {
+                Some(GreedyDecodeOutput::DevicePick(p)) => StepAction::DevicePick(p),
+                Some(GreedyDecodeOutput::HostHidden(h)) => StepAction::HostHidden(h),
+                None => {
+                    if profile {
+                        eprintln!(
+                            "[profile] step={step} — B4 decode returned None; stopping generation"
+                        );
+                    }
+                    break;
+                }
+            }
+        } else {
+            match run_one_decode_step(
+                weights,
+                backend,
+                layers,
+                hidden,
+                intermediate,
+                &x_dec,
+                profile_split,
+                step,
+            ) {
+                Some(h) => StepAction::HostHidden(h),
+                None => {
+                    if profile {
+                        eprintln!(
+                            "[profile] step={step} — GPU decode returned None; stopping generation"
+                        );
+                    }
+                    break;
+                }
+            }
+        };
         let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-        if profile && step <= 2 {
-            log_step_diagnostic(step, result.as_deref());
+        // B4 device-pick path: the device already selected the winner and
+        // the candidate set. Emit directly WITHOUT calling the sampler
+        // again (B4 §9). No host final norm / lm-head.
+        if let StepAction::DevicePick(pick) = action {
+            let step_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+            decode_ms.push(step_ms);
+            let t4 = std::time::Instant::now();
+            let Some(picked) =
+                emit_preselected_greedy(detok, tokenizer, weights, eos, &pick, on_token)
+            else {
+                if profile {
+                    eprintln!("[profile] step={step} — device greedy emit failed; break");
+                }
+                break;
+            };
+            let detok_ms = t4.elapsed().as_secs_f64() * 1000.0;
+            if profile {
+                eprintln!(
+                    "[profile] step={step} [B4 device-greedy] total={step_ms:.1}ms  embed={embed_ms:.2}  gpu={gpu_ms:.1}  detok={detok_ms:.2}"
+                );
+            }
+            t_embed += embed_ms;
+            t_gpu += gpu_ms;
+            t_detok += detok_ms;
+            tokens.push((picked.text, picked.prob));
+            generated_ids.push(picked.id);
+            current_token_id = picked.id;
+            if picked.is_eos {
+                break;
+            }
+            continue;
         }
 
-        let Some(h_out) = result else {
-            // GPU returned None mid-decode. The caller routes
-            // non-fused-Q4 backends (today: CPU) to a full CPU Q4K path at
-            // the top, so this branch can only fire when a GPU backend that
-            // passed `backend_supports_fused_q4_pipeline` subsequently fails
-            // a single decode step. Treat as early-stop rather than re-run
-            // the O(N²) CPU path mid-loop without a kept id list.
-            if profile {
-                eprintln!("[profile] step={step} — GPU decode returned None; stopping generation");
-            }
-            break;
+        // Host finalization (non-B4 decode OR B4 HostHidden fallback).
+        let h_out = match action {
+            StepAction::HostHidden(h) => h,
+            StepAction::DevicePick(_) => unreachable!("handled above"),
         };
+        if profile && step <= 2 {
+            log_step_diagnostic(step, Some(&h_out));
+        }
 
         let t2 = std::time::Instant::now();
         let h_arr = ndarray::Array2::from_shape_vec((1, hidden), h_out).unwrap();

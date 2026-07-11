@@ -66,8 +66,8 @@ pub use error::VindexError;
 // Index
 pub use index::core::{
     FeatureMeta, FfnRowAccess, Fp4FfnAccess, GateIndex, GateLookup, IndexLoadCallbacks,
-    NativeFfnAccess, PatchOverrides, QuantizedFfnAccess, SilentLoadCallbacks, StorageBucket,
-    VectorIndex, WalkHit, WalkTrace,
+    LmHeadRepresentation, NativeFfnAccess, PatchOverrides, QuantizedFfnAccess, SilentLoadCallbacks,
+    StorageBucket, VectorIndex, WalkHit, WalkTrace,
 };
 pub use index::residency::{LayerState, ResidencyManager};
 pub use index::router::{RouteResult, RouterIndex};

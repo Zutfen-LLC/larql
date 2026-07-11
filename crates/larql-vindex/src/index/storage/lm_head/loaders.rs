@@ -11,6 +11,7 @@ use larql_models::quant::ggml::K_QUANT_BLOCK_ELEMS;
 
 use crate::error::VindexError;
 use crate::format::filenames::*;
+use crate::index::core::LmHeadRepresentation;
 use crate::index::core::VectorIndex;
 use crate::mmap_util::mmap_optimized;
 
@@ -158,5 +159,33 @@ impl VectorIndex {
     /// Whether lm_head is loaded for vindex logits.
     pub fn has_lm_head(&self) -> bool {
         self.storage.has_lm_head_f32() && self.vocab_size > 0
+    }
+
+    /// LARQL-GPU-B4: the active lm-head representation, as discovered by
+    /// the narrow vindex accessor. Used by the inference decode loop to
+    /// build a [`larql_compute::backend::greedy::GreedyQ4kHeadSpec`] when
+    /// the vindex carries a verified Q4_K lm-head, and to reject f16 / f32
+    /// / absent heads cleanly (keeping the existing host path).
+    ///
+    /// The Q4_K variant is returned only when the bytes form a whole
+    /// number of Q4_K super-blocks for `(hidden, vocab)`; a malformed or
+    /// short buffer reports [`LmHeadRepresentation::Absent`].
+    pub fn lm_head_representation(&self) -> LmHeadRepresentation<'_> {
+        use crate::index::core::lm_head_repr::classify_q4k;
+        if let Some(q4k) = self.storage.lm_head_kquant_view() {
+            return classify_q4k(
+                q4k.as_ref(),
+                self.hidden_size,
+                self.vocab_size,
+                self.logical_vocab_size,
+            );
+        }
+        if self.has_lm_head_f16() {
+            return LmHeadRepresentation::F16;
+        }
+        if self.has_lm_head() {
+            return LmHeadRepresentation::F32;
+        }
+        LmHeadRepresentation::Absent
     }
 }

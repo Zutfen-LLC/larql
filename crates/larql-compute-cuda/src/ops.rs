@@ -160,6 +160,35 @@ pub const PREFILL_ATTENTION_KERNEL: KernelHandle = KernelHandle::new(
     },
 );
 
+/// LARQL-GPU-B4: block size for the greedy top-K partial-reduction kernel.
+/// One block reduces a `GREEDY_BLOCK_SIZE`-element slice of the score
+/// vector to its top-`k` finite candidates. 256 matches the attention
+/// kernels' block size and keeps the shared-memory footprint tiny (256
+/// floats = 1 KB per block).
+pub const GREEDY_BLOCK_SIZE: usize = 256;
+/// LARQL-GPU-B4: compile-time cap on the greedy candidate width. The
+/// production candidate width is five (the existing greedy candidate
+/// width); eight leaves headroom and keeps the device result struct a
+/// power-of-two-friendly 64 bytes. The host reads back only
+/// `candidate_width` slots.
+pub const GREEDY_MAX_K: usize = 8;
+
+pub const GREEDY_TOPK_PARTIAL_KERNEL: KernelHandle = KernelHandle::new(
+    "greedy_topk_partial",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [256, 1, 1],
+    },
+);
+
+pub const GREEDY_TOPK_FINAL_KERNEL: KernelHandle = KernelHandle::new(
+    "greedy_topk_final",
+    DispatchGeometry {
+        workgroups: [1, 1, 1],
+        threads_per_group: [256, 1, 1],
+    },
+);
+
 pub const Q4K_MATVEC_CUDA_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -1554,6 +1583,191 @@ extern "C" __global__ void prefill_attention(
             acc += scores[i] * v[v_base + (unsigned long long)d];
         }
         out[out_row + (unsigned long long)d] = acc;
+    }
+}
+"#;
+
+// ── LARQL-GPU-B4 greedy top-K reduction kernels ────────────────────────────
+//
+// Two-stage bounded reduction over the logical-vocabulary score vector
+// produced by the resident Q4_K lm-head GEMV. Stage 1 (partial) reduces
+// each `GREEDY_BLOCK_SIZE`-element slice to its top-`k` finite candidates;
+// stage 2 (final) reduces the per-block partials to the final sorted top-`k`.
+//
+// Design constraints (see the B4 packet §8.2):
+//   * No floating-point atomics as the primary reduction design. Each
+//     stage does `k` sequential argmax passes (k ≤ GREEDY_MAX_K = 8), each
+//     pass a standard 256-way max reduction in shared memory.
+//   * Strict `>` comparison so the lowest-index row wins on ties, matching
+//     the host `top_k_sorted` / `backend_lm_head_topk` contract.
+//   * Non-finite scores (NaN, ±∞) are treated as `-INFINITY` candidates
+//     and never win; a slice with fewer than `k` finite values fills the
+//     remaining partial slots with the `-INFINITY` / `0xFFFFFFFF` sentinel.
+//   * The reduction operates ONLY over `[0, logical_rows)` — padded
+//     physical rows above `logical_rows` are never read, so an invalid
+//     padded row can never win (VINDEX-001 / B4 §2.4).
+
+/// Partial top-K reduction. Grid: `ceil(logical_rows / GREEDY_BLOCK_SIZE)`
+/// blocks, `GREEDY_BLOCK_SIZE` threads per block. Each block writes `k`
+/// `(score, id)` pairs into `partial_scores[bid*k .. bid*k+k]` and
+/// `partial_ids[bid*k .. bid*k+k]`. Unfilled slots are the
+/// `(-INFINITY, 0xFFFFFFFF)` sentinel.
+pub const GREEDY_TOPK_PARTIAL_CUDA_SRC: &str = r#"
+#define GREEDY_BLK 256u
+// Device-safe negative infinity (NVRTC doesn't define the C99 INFINITY
+// macro under device compilation). Matches `decode_attention`'s
+// `__int_as_float(0xff800000)` sentinel.
+#define NEG_INF (__int_as_float(0xff800000u))
+
+extern "C" __global__ void greedy_topk_partial(
+    const float* scores,
+    float* partial_scores,
+    unsigned int* partial_ids,
+    const unsigned int logical_rows,
+    const unsigned int k)
+{
+    const unsigned int bid = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int base = bid * GREEDY_BLK;
+
+    // Load this block's slice into shared memory. Out-of-range slots AND
+    // non-finite scores (NaN, ±∞) become NEG_INF so they can never win —
+    // matching the host `top_k_sorted` / `backend_lm_head_topk` `is_finite()`
+    // filter (B4 §8.2).
+    __shared__ float shm[GREEDY_BLK];
+    {
+        const unsigned int idx = base + tid;
+        const float v = (idx < logical_rows) ? scores[idx] : NEG_INF;
+        shm[tid] = isfinite(v) ? v : NEG_INF;
+    }
+    __syncthreads();
+
+    // k sequential argmax reductions over the slice. Each pass: copy the
+    // (masked) slice into a reduction buffer, reduce to a single max, then
+    // mask the winner at NEG_INF for the next pass. A shared index array
+    // carries the within-slice position so we can compute the global id.
+    __shared__ float red_val[GREEDY_BLK];
+    __shared__ unsigned int red_idx[GREEDY_BLK];
+
+    for (unsigned int kk = 0u; kk < k; ++kk) {
+        // Initialise the reduction buffer from the (masked) slice.
+        red_val[tid] = shm[tid];
+        red_idx[tid] = tid;
+        __syncthreads();
+
+        // In-place tree reduction (256 -> 1) keeping the max + its index.
+        for (unsigned int off = GREEDY_BLK / 2u; off > 0u; off >>= 1u) {
+            if (tid < off) {
+                const float a = red_val[tid];
+                const float b = red_val[tid + off];
+                // Strict >: lowest index wins on ties (a is the lower index).
+                if (b > a) {
+                    red_val[tid] = b;
+                    red_idx[tid] = red_idx[tid + off];
+                }
+            }
+            __syncthreads();
+        }
+
+        // Thread 0 records the winner and masks it for the next pass.
+        if (tid == 0u) {
+            const float win_val = red_val[0u];
+            const unsigned int local_idx = red_idx[0u];
+            const unsigned int global_id = base + local_idx;
+            const unsigned int slot = bid * k + kk;
+            if (win_val > NEG_INF) {
+                partial_scores[slot] = win_val;
+                partial_ids[slot] = global_id;
+            } else {
+                // No finite candidate left in this slice; sentinel + leave
+                // remaining slots as sentinels too (shm is exhausted).
+                partial_scores[slot] = NEG_INF;
+                partial_ids[slot] = 0xFFFFFFFFu;
+            }
+            // Mask the winner so it can't win the next pass.
+            shm[local_idx] = NEG_INF;
+        }
+        __syncthreads();
+    }
+}
+"#;
+
+/// Final top-K reduction. Single block, `GREEDY_BLK` threads. Strided
+/// scan over the `num_partials = num_blocks * k` partial candidates,
+/// `k` sequential argmax passes (each thread keeps a register-local best,
+/// then a 256-way shared-memory reduction). Writes the final sorted
+/// (descending) top-`k` into `result_scores[k]` / `result_ids[k]`.
+/// Unfilled slots (fewer than `k` finite candidates overall) are the
+/// `(-INFINITY, 0xFFFFFFFF)` sentinel.
+pub const GREEDY_TOPK_FINAL_CUDA_SRC: &str = r#"
+#define GREEDY_BLK 256u
+#define NEG_INF (__int_as_float(0xff800000u))
+
+extern "C" __global__ void greedy_topk_final(
+    float* partial_scores,
+    const unsigned int* partial_ids,
+    float* result_scores,
+    unsigned int* result_ids,
+    const unsigned int num_partials,
+    const unsigned int k)
+{
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_dim = blockDim.x;
+
+    // k sequential argmax passes over the partial buffer. Each pass:
+    // every thread strides over the buffer keeping its register-local best,
+    // then a 256-way shared reduction picks the global winner, which thread
+    // 0 records and masks (set to NEG_INF) for the next pass.
+    __shared__ float red_val[GREEDY_BLK];
+    __shared__ unsigned int red_idx[GREEDY_BLK];
+
+    for (unsigned int kk = 0u; kk < k; ++kk) {
+        // Per-thread register-local best (init to -inf so unfilled partials
+        // never win).
+        float best_val = NEG_INF;
+        unsigned int best_idx = 0xFFFFFFFFu;
+
+        for (unsigned int i = tid; i < num_partials; i += block_dim) {
+            const float v = partial_scores[i];
+            // Skip non-finite (NaN/±∞) — host `is_finite()` contract.
+            if (isfinite(v) && v > best_val) {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+
+        red_val[tid] = best_val;
+        red_idx[tid] = best_idx;
+        __syncthreads();
+
+        // 256-way tree reduction keeping the max + its partial-buffer index.
+        for (unsigned int off = block_dim / 2u; off > 0u; off >>= 1u) {
+            if (tid < off) {
+                const float a = red_val[tid];
+                const float b = red_val[tid + off];
+                if (b > a) {
+                    red_val[tid] = b;
+                    red_idx[tid] = red_idx[tid + off];
+                }
+            }
+            __syncthreads();
+        }
+
+        // Thread 0 records the winner and masks it in the partial buffer.
+        if (tid == 0u) {
+            const float win_val = red_val[0u];
+            const unsigned int win_partial_idx = red_idx[0u];
+            if (win_partial_idx != 0xFFFFFFFFu && win_val > NEG_INF) {
+                result_scores[kk] = win_val;
+                result_ids[kk] = partial_ids[win_partial_idx];
+                // Mask the winner so it can't win the next pass.
+                partial_scores[win_partial_idx] = NEG_INF;
+            } else {
+                result_scores[kk] = NEG_INF;
+                result_ids[kk] = 0xFFFFFFFFu;
+            }
+        }
+        __syncthreads();
     }
 }
 "#;

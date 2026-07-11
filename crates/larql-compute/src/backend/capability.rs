@@ -99,4 +99,17 @@ pub enum Capability {
     /// predict path. The backing KV cache is owned by the backend and
     /// is opaque to the engine.
     HybridAttention,
+    /// LARQL-GPU-B4: backend can keep the final transformer hidden state
+    /// resident and run the final norm + Q4_K lm-head + top-K candidate
+    /// reduction on-device, returning only a fixed-size candidate result
+    /// (see [`crate::backend::greedy`] +
+    /// [`crate::DecodeBackend::decode_token_greedy_q4k`]). CUDA advertises
+    /// this only when a native runtime is present; every other backend
+    /// (CPU, Metal, scaffolds, mocks) keeps the default `false` so the
+    /// inference loop takes the existing host norm → lm-head → sample
+    /// path. Advertised capability is necessary but not sufficient: the
+    /// additive method still returns `HostHidden` per-call for any
+    /// dynamic ineligibility (unsupported final norm, malformed Q4_K
+    /// bytes, decode that ended host-side, etc.).
+    DeviceGreedyLmHead,
 }

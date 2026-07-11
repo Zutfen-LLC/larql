@@ -364,7 +364,58 @@ impl CudaBackend {
                 StateDumpMask::None,
             );
         }
+        let runtime = self.runtime()?;
+        let (mut h, arena_out_flip) =
+            self.host_decode_layers_resident(runtime, layers, x, hidden, inter, abs_position)?;
+        // Final decode output: ensure host, return the `[hidden]` vector.
+        // B3B: if the last layer left the hidden in the arena, read it back
+        // here (the single end-of-token hidden readback).
+        if let Some(f) = arena_out_flip {
+            let v = self.read_arena_output_to_host(runtime, f, hidden)?;
+            h = DecodeHiddenState::Host(Array2::from_shape_vec((1, hidden), v).ok()?);
+        }
+        // LARQL-GPU-PROFILE-001: time the single end-of-token hidden-state
+        // readback (the device→host copy that returns the decode output). This
+        // is the cost B4 (device lm-head) eliminates.
+        let rt0 = if crate::options::gpu_profile_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        if !h.ensure_host(runtime) {
+            return None;
+        }
+        if let Some(t0) = rt0 {
+            self.note_hidden_readback(t0.elapsed().as_nanos() as u64);
+            self.note_final_hidden_readback_bytes(hidden * 4);
+        }
+        Some(h.as_host().row(0).to_vec())
+    }
 
+    /// The resident-hidden decode layer loop, extracted so both the
+    /// host-readback finalizer ([`host_decode_token_resident`]) and the
+    /// B4 device-greedy finalizer ([`host_decode_token_greedy_q4k`]) can
+    /// consume the final hidden state in its native residency. Runs every
+    /// layer's attention + FFN with the hidden state threaded
+    /// device-resident across eligible layers (GPU-007), advancing the KV
+    /// mirror exactly once per layer. Returns the final hidden state plus
+    /// the arena flip when the last layer left the hidden in the graph
+    /// arena (B3B) — the caller decides whether to read it back or consume
+    /// it on-device.
+    ///
+    /// **KV-append invariant**: this helper appends K/V exactly once per
+    /// layer. A caller that fails after this point MUST NOT re-run the
+    /// transformer layers; it must materialise the returned hidden state
+    /// and fall back to the host lm-head path.
+    fn host_decode_layers_resident(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        layers: &[FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        abs_position: usize,
+    ) -> Option<(DecodeHiddenState, Option<bool>)> {
         let num_layers = layers.len();
         if x.len() != hidden {
             return None;
@@ -380,7 +431,6 @@ impl CudaBackend {
             }
         }
 
-        let runtime = self.runtime()?;
         let mut h = DecodeHiddenState::Host(Array2::from_shape_vec((1, hidden), x.to_vec()).ok()?);
         // B3B: when the graph path is active across consecutive layers, the
         // hidden state lives in the arena (carried by flip) rather than in `h`.
@@ -662,27 +712,271 @@ impl CudaBackend {
             h = DecodeHiddenState::Host(h_post_ffn);
         }
 
-        // Final decode output: ensure host, return the `[hidden]` vector.
-        // B3B: if the last layer left the hidden in the arena, read it back
-        // here (the single end-of-token hidden readback).
-        if let Some(f) = arena_out_flip.take() {
+        Some((h, arena_out_flip))
+    }
+
+    /// LARQL-GPU-B4: decode one token and, when eligible, keep the final
+    /// hidden state resident through the final RMSNorm + Q4_K lm-head +
+    /// top-K reduction, returning a fixed-size device pick instead of the
+    /// full hidden vector. The device-resident terminal twin of
+    /// [`host_decode_token_resident`].
+    ///
+    /// Eligibility is dynamic: the descriptor must validate (Q4_K bytes +
+    /// dims), a runtime must be present, and the final hidden state must be
+    /// device-resident (either an owned `CudaSlice` or the graph-arena
+    /// output slot). When the decode ended host-side (a layer fell back),
+    /// or the device chain fails after KV advancement, this returns
+    /// `HostHidden` with the already-computed hidden state — never `None`
+    /// unless even that readback fails (so the engine never re-runs the
+    /// transformer layers and double-appends K/V).
+    pub(crate) fn host_decode_token_greedy_q4k(
+        &self,
+        layers: &[FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        abs_position: usize,
+        head: &larql_compute::backend::greedy::GreedyQ4kHeadSpec<'_>,
+    ) -> Option<larql_compute::backend::greedy::GreedyDecodeOutput> {
+        self.note_device_greedy_attempt();
+        // No runtime, or a malformed/ineligible descriptor: run the ordinary
+        // host decode once and hand the hidden state back. KV advances
+        // exactly once via the ordinary path.
+        if !self.native_runtime_available() || head.validate().is_none() {
+            let v = self.host_decode_token_resident(layers, x, hidden, inter, abs_position)?;
+            return Some(larql_compute::backend::greedy::GreedyDecodeOutput::HostHidden(v));
+        }
+        let runtime = self.runtime()?;
+        let logical = head.validate()?;
+
+        // Run the resident layer loop (advances the KV mirror exactly once
+        // per layer). After this point, the token step MUST NOT be re-run.
+        let (h, arena_flip) =
+            match self.host_decode_layers_resident(runtime, layers, x, hidden, inter, abs_position)
+            {
+                Some(v) => v,
+                None => {
+                    self.note_device_greedy_failure();
+                    return None;
+                }
+            };
+
+        // Attempt the device greedy chain.
+        match self.try_device_greedy(runtime, &h, arena_flip, head, logical, hidden) {
+            Some(pick) => {
+                self.note_device_greedy_engaged();
+                Some(larql_compute::backend::greedy::GreedyDecodeOutput::DevicePick(pick))
+            }
+            None => {
+                // Fallback: materialise the already-computed hidden state
+                // once and hand it to the host lm-head path.
+                let host_v = self.materialize_final_hidden(runtime, h, arena_flip, hidden)?;
+                self.note_device_greedy_fallback();
+                Some(larql_compute::backend::greedy::GreedyDecodeOutput::HostHidden(host_v))
+            }
+        }
+    }
+
+    /// Resolve the final device hidden state and run the device greedy
+    /// chain (final norm → Q4_K lm-head → reduction). Returns `None` when
+    /// the hidden is host-resident (a layer fell back) or the chain fails;
+    /// the caller falls back to `HostHidden`. Holds the arena lock across
+    /// the chain launches when the hidden lives in the graph arena (no D2D
+    /// handoff — B4 §5.1).
+    fn try_device_greedy(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        h: &DecodeHiddenState,
+        arena_flip: Option<bool>,
+        head: &larql_compute::backend::greedy::GreedyQ4kHeadSpec<'_>,
+        logical: usize,
+        hidden: usize,
+    ) -> Option<larql_compute::backend::greedy::DeviceGreedyPick> {
+        match arena_flip {
+            Some(f) => {
+                // Borrow the arena output directly (no D2D handoff). The lock
+                // spans the chain launches; decode is single-threaded so this
+                // is the only holder, and the arena isn't mutated during the
+                // greedy finalization.
+                let guard = self.arena.lock().ok()?;
+                let arena = guard.as_ref()?;
+                let out = arena.output(f);
+                self.run_greedy_chain_on_device(runtime, out, head, logical, hidden)
+            }
+            None => match h {
+                DecodeHiddenState::Device { dev, .. } => {
+                    self.run_greedy_chain_on_device(runtime, dev, head, logical, hidden)
+                }
+                DecodeHiddenState::Host(_) => None,
+            },
+        }
+    }
+
+    /// Run the device greedy chain against a borrowed final device hidden
+    /// state: final RMSNorm → Q4_K lm-head GEMV (logical rows only) →
+    /// two-stage top-K reduction → fixed-size result readback. Reuses the
+    /// generation-scoped workspace so no full score/scratch buffer is
+    /// allocated per token. Returns `None` on any launch/readback failure
+    /// (caller falls back to `HostHidden`).
+    fn run_greedy_chain_on_device(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        final_hidden_dev: &CudaSlice<f32>,
+        head: &larql_compute::backend::greedy::GreedyQ4kHeadSpec<'_>,
+        logical: usize,
+        hidden: usize,
+    ) -> Option<larql_compute::backend::greedy::DeviceGreedyPick> {
+        use larql_compute::backend::greedy::DeviceGreedyPick;
+
+        let k = head.candidate_width.min(crate::ops::GREEDY_MAX_K);
+
+        // Resolve / rebuild the workspace for this (logical, hidden, k).
+        {
+            let mut ws_guard = self.greedy_workspace.lock().ok()?;
+            let needs_build = match ws_guard.as_ref() {
+                Some(ws) => !ws.matches(logical, hidden, head.candidate_width),
+                None => true,
+            };
+            if needs_build {
+                let stream = runtime.stream();
+                *ws_guard = Some(
+                    crate::greedy_workspace::GreedyHeadWorkspace::build(
+                        stream,
+                        logical,
+                        hidden,
+                        head.candidate_width,
+                    )
+                    .ok()?,
+                );
+            }
+        }
+        let mut ws_guard = self.greedy_workspace.lock().ok()?;
+        let ws = ws_guard.as_mut()?;
+
+        // 1. Final RMSNorm into the workspace's normalised-hidden buffer.
+        //    rows=1 (single-token decode), cols=hidden. Epsilon + offset
+        //    exactly match the host `apply_norm` path.
+        runtime
+            .launch_rms_norm_into_dev(
+                final_hidden_dev,
+                &mut ws.normed_hidden,
+                head.final_norm_weight,
+                1,
+                hidden,
+                head.final_norm_eps,
+                head.final_norm_offset,
+            )
+            .ok()?;
+
+        // 2. Q4_K lm-head GEMV over the LOGICAL rows only. Pass the byte
+        //    prefix covering `[0, logical)` and `num_rows = logical` so no
+        //    padded physical row is read or can win (B4 §2.4 / §7.1).
+        let row_bytes = (hidden / 256).checked_mul(144)?;
+        let logical_bytes = logical.checked_mul(row_bytes)?;
+        if head.lm_head_bytes.len() < logical_bytes {
+            return None;
+        }
+        let lm_head_logical = &head.lm_head_bytes[..logical_bytes];
+        let w_dev = runtime.resolve_q4k_weight(lm_head_logical).ok()?;
+        runtime
+            .launch_q4k_matvec_into(
+                runtime.stream(),
+                &w_dev,
+                &ws.normed_hidden,
+                &mut ws.scores,
+                logical,
+                hidden,
+            )
+            .ok()?;
+
+        // 3-4. Two-stage top-K reduction.
+        let num_blocks = ws.num_blocks;
+        runtime
+            .launch_greedy_topk_partial(
+                &ws.scores,
+                &mut ws.partial_scores,
+                &mut ws.partial_ids,
+                logical,
+                num_blocks,
+                k,
+            )
+            .ok()?;
+        let partial_len = num_blocks.checked_mul(k)?;
+        runtime
+            .launch_greedy_topk_final(
+                &mut ws.partial_scores,
+                &ws.partial_ids,
+                &mut ws.result_scores,
+                &mut ws.result_ids,
+                partial_len,
+                k,
+            )
+            .ok()?;
+
+        // 5. Single sync + read back ONLY the fixed-size result (k scores
+        //    + k ids). This is the only DtoH on the B4 path.
+        runtime.stream().synchronize().ok()?;
+        if crate::options::gpu_profile_enabled() {
+            runtime.note_sync();
+            runtime.note_dtoh(k * 8);
+        }
+        self.note_lm_head_result_dtoh(k * 8);
+        let scores_host = runtime.stream().clone_dtoh(&ws.result_scores).ok()?;
+        let ids_host = runtime.stream().clone_dtoh(&ws.result_ids).ok()?;
+
+        // 6. Build the pick. The result is sorted descending; sentinels
+        //    (-inf / 0xFFFFFFFF) mark unfilled slots (fewer than k finite
+        //    candidates) and terminate the candidate set.
+        let mut hits: Vec<(u32, f32)> = Vec::with_capacity(k);
+        let mut winner_id = 0u32;
+        let mut winner_score = 0.0f32;
+        for i in 0..k {
+            let id = ids_host.get(i).copied().unwrap_or(u32::MAX);
+            let s = scores_host.get(i).copied().unwrap_or(f32::NEG_INFINITY);
+            if id == u32::MAX || !s.is_finite() {
+                break;
+            }
+            if i == 0 {
+                winner_id = id;
+                winner_score = s;
+            }
+            hits.push((id, s));
+        }
+        if hits.is_empty() {
+            return None;
+        }
+        // Hard invariant: the winner must be a logical token id.
+        if winner_id as usize >= logical {
+            return None;
+        }
+        Some(DeviceGreedyPick {
+            token_id: winner_id,
+            score: winner_score,
+            probability_hits: hits,
+        })
+    }
+
+    /// Materialise the already-computed final hidden state to the host,
+    /// used when the device greedy chain fails after KV advancement.
+    /// Mirrors the tail of the pre-B4 `host_decode_token_resident`. The
+    /// hidden state is read back exactly once; the caller wraps it in
+    /// `HostHidden` and the inference loop runs the existing host lm-head
+    /// path. Returns `None` only when even this readback fails.
+    fn materialize_final_hidden(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        mut h: DecodeHiddenState,
+        arena_flip: Option<bool>,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        if let Some(f) = arena_flip {
             let v = self.read_arena_output_to_host(runtime, f, hidden)?;
             h = DecodeHiddenState::Host(Array2::from_shape_vec((1, hidden), v).ok()?);
         }
-        // LARQL-GPU-PROFILE-001: time the single end-of-token hidden-state
-        // readback (the device→host copy that returns the decode output). This
-        // is the cost B4 (device lm-head) would eliminate.
-        let rt0 = if crate::options::gpu_profile_enabled() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         if !h.ensure_host(runtime) {
             return None;
         }
-        if let Some(t0) = rt0 {
-            self.note_hidden_readback(t0.elapsed().as_nanos() as u64);
-        }
+        self.note_final_hidden_readback_bytes(hidden * 4);
         Some(h.as_host().row(0).to_vec())
     }
 

@@ -1,0 +1,106 @@
+{
+  "slice": "LARQL-GPU-B4",
+  "title": "Resident final norm, Q4_K lm-head, and device-side greedy selection",
+  "date": "2026-07-11",
+  "host": {
+    "gpu": "NVIDIA GeForce RTX 3060 12 GB",
+    "compute_capability": "sm_86",
+    "cuda_driver": "610.43.03",
+    "nvrtc": "12.4.127"
+  },
+  "model": {
+    "vindex": "/home/zutfen/models/qwen2.5-3b-q4k.vindex",
+    "family": "Qwen2.5-3B Q4_K_M",
+    "lm_head_representation": "Q4_K",
+    "lm_head_manifest_kind": "tensor_q4k",
+    "lm_head_bytes": 175030272,
+    "hidden_size": 2048,
+    "physical_vocab_size": 151936,
+    "logical_vocab_size": 151643,
+    "final_norm_type": "RmsNorm",
+    "final_norm_key": "norm.weight",
+    "final_norm_weight_length": 2048,
+    "final_norm_eps": 1e-6,
+    "final_norm_offset": 0.0,
+    "candidate_width": 5
+  },
+  "methodology": {
+    "prompt": "Write a step by step guide on how to bake a cake from scratch.",
+    "warmup_steps": 5,
+    "measured_decode_steps": 79,
+    "reps": 5,
+    "greedy": true,
+    "one_long_lived_process_per_run": true,
+    "uninstrumented_release_source_of_truth": true,
+    "separate_instrumented_run_for_counters": true
+  },
+  "performance": {
+    "BaselineA": {
+      "graphs": 0, "b4": 0,
+      "p50_ms_median": 108.31, "p50_mad": 0.01,
+      "mean_ms_median": 108.32, "mean_mad": 0.02,
+      "tok_s": 9.2
+    },
+    "B4A": {
+      "graphs": 0, "b4": 1,
+      "p50_ms_median": 108.72, "p50_mad": 0.05,
+      "mean_ms_median": 108.75, "mean_mad": 0.04,
+      "tok_s": 9.2
+    },
+    "BaselineB": {
+      "graphs": 1, "b4": 0,
+      "p50_ms_median": 108.43, "p50_mad": 0.07,
+      "mean_ms_median": 108.43, "mean_mad": 0.04,
+      "tok_s": 9.3
+    },
+    "B4B": {
+      "graphs": 1, "b4": 1,
+      "p50_ms_median": 107.97, "p50_mad": 0.01,
+      "mean_ms_median": 107.99, "mean_mad": 0.03,
+      "tok_s": 9.3
+    },
+    "delta_graph_off_p50_ms": 0.41,
+    "delta_graph_off_p50_pct": 0.38,
+    "delta_graph_on_p50_ms": -0.46,
+    "delta_graph_on_p50_pct": -0.42,
+    "gate_1pct_met": false
+  },
+  "structural_counters": {
+    "baseline": {
+      "final_norm_ms_per_tok": 0.005,
+      "lm_head_ms_per_tok": 12.663,
+      "hidden_readback_ms_per_tok": 2.839,
+      "dtoh_copies_per_tok": 146.9,
+      "dtoh_mib_per_tok": 13.193,
+      "syncs_per_tok": 146.9,
+      "launches_per_tok": 985.6
+    },
+    "b4_on": {
+      "final_norm_ms_per_tok": 0.0,
+      "lm_head_ms_per_tok": 0.0,
+      "hidden_readback_ms_per_tok": 0.0,
+      "dtoh_copies_per_tok": 145.6,
+      "dtoh_mib_per_tok": 12.410,
+      "syncs_per_tok": 145.6,
+      "launches_per_tok": 989.6
+    },
+    "hidden_readback_removed_ms_per_tok": 2.839,
+    "dtoh_removed_mib_per_tok": 0.783,
+    "device_greedy_engagement_pct": 100.0,
+    "device_greedy_fallbacks": 0,
+    "device_greedy_failures": 0,
+    "invalid_token_ids": 0
+  },
+  "correctness": {
+    "token_sequence_parity": "IDENTICAL (3 reps x 40 tokens, baseline vs B4-on)",
+    "logical_vocab_protection": "winner always < 151643 (unit-tested + structural)",
+    "graph_off_cuda_tests": "215/215 pass",
+    "graph_on_cuda_tests": "215/215 pass"
+  },
+  "decision": {
+    "default_on": false,
+    "opt_in_env": "LARQL_CUDA_DEVICE_GREEDY=1",
+    "kill_switch_env": "LARQL_LM_HEAD_SKIP_Q4K=1",
+    "rationale": "Structural gate passes (host final norm + lm-head boundary eliminated; final-hidden readback 2.839ms/tok -> 0; dtoh -0.78 MiB/tok) and correctness is proven, but the Q4_K lm-head GEMV was already device-resident, so eliminating the host boundary yields a net decode change of ~0.4% (within 1% gate) in both graph modes. Per B4 section 14.3 decision rule, B4 stays opt-in."
+  }
+}

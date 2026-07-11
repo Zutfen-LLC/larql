@@ -5,6 +5,78 @@ use larql_compute::prelude::*;
 
 const ENV_LM_HEAD_SKIP_Q4K: &str = "LARQL_LM_HEAD_SKIP_Q4K";
 
+/// LARQL-GPU-B4 env-var (presence-as-truth) that opts the decode loop into
+/// the device-side greedy lm-head path. Read through
+/// `larql_compute::options::env_opt_in` so tests can toggle it via the
+/// thread-local override. Default-off during development; the performance
+/// gate decides whether it becomes default-on.
+const ENV_CUDA_DEVICE_GREEDY: &str = "LARQL_CUDA_DEVICE_GREEDY";
+
+/// `true` when the B4 device-greedy path is opted in
+/// (`LARQL_CUDA_DEVICE_GREEDY=1`). Read once per generation start.
+pub(super) fn device_greedy_enabled() -> bool {
+    larql_compute::options::env_opt_in(ENV_CUDA_DEVICE_GREEDY)
+}
+
+/// LARQL-GPU-B4: build the narrow Q4_K head descriptor for the device-side
+/// greedy path, or `None` when the active vindex lm-head is not a verified
+/// Q4_K matrix (f16 / f32 / absent / malformed). The descriptor carries
+/// the Q4_K bytes, dims, and the architecture's final-norm weight + eps +
+/// offset. The inference loop rejects f16/f32 heads here and keeps the
+/// existing host path.
+pub(super) fn build_q4k_head_spec<'a>(
+    index: &'a larql_vindex::VectorIndex,
+    weights: &'a ModelWeights,
+    hidden: usize,
+    candidate_width: usize,
+) -> Option<larql_compute::GreedyQ4kHeadSpec<'a>> {
+    use larql_models::NormType;
+    // Only RMSNorm has a device kernel; LayerNorm / other final norms stay
+    // on the host path (B4 §6).
+    if weights.arch.norm_type() != NormType::RmsNorm {
+        return None;
+    }
+    let repr = index.lm_head_representation();
+    let (lm_head_bytes, physical_vocab, logical_vocab, repr_hidden) = match repr {
+        larql_vindex::LmHeadRepresentation::Q4K {
+            bytes,
+            physical_vocab,
+            logical_vocab,
+            hidden: repr_hidden,
+        } => (bytes, physical_vocab, logical_vocab, repr_hidden),
+        // f16 / f32 / absent → not eligible for the device Q4_K path.
+        _ => return None,
+    };
+    // The descriptor's hidden must match the model hidden.
+    if repr_hidden != hidden {
+        return None;
+    }
+    let final_norm_weight = weights
+        .vectors
+        .get(weights.arch.final_norm_key())
+        .map(|v| v.as_slice());
+    // The weight (when present) must match hidden; the device launcher also
+    // validates this, but checking here keeps the descriptor honest.
+    if let Some(w) = final_norm_weight {
+        if w.len() != hidden {
+            return None;
+        }
+    }
+    let spec = larql_compute::GreedyQ4kHeadSpec {
+        lm_head_bytes,
+        hidden_size: hidden,
+        physical_vocab_size: physical_vocab,
+        logical_vocab_size: logical_vocab,
+        final_norm_weight,
+        final_norm_eps: weights.arch.norm_eps() as f64,
+        final_norm_offset: weights.arch.norm_weight_offset(),
+        candidate_width,
+    };
+    // Final shape/byte validation (Q4_K super-block geometry).
+    let _logical_rows = spec.validate()?;
+    Some(spec)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LmHeadPolicy {
     pub skip_q4k: bool,
@@ -563,5 +635,44 @@ mod tests {
         )
         .expect("greedy pick under tight mask");
         assert_eq!(id, target_id);
+    }
+
+    // ── LARQL-GPU-B4 build_q4k_head_spec eligibility ─────────────────
+
+    /// `build_q4k_head_spec` returns `None` when the vindex has no verified
+    /// Q4_K lm-head (the synthetic fixture has neither a Q4_K lm-head nor a
+    /// hidden size that's a multiple of 256). The inference loop must keep
+    /// the host path for such vindexes.
+    #[test]
+    fn build_q4k_head_spec_returns_none_when_vindex_has_no_q4k_lm_head() {
+        let f = fx();
+        let spec = build_q4k_head_spec(&f.index, &f.weights, f.weights.hidden_size, 5);
+        assert!(
+            spec.is_none(),
+            "synthetic fixture (no Q4_K lm-head / hidden<256) must be ineligible"
+        );
+    }
+
+    /// `device_greedy_enabled` honours the `LARQL_CUDA_DEVICE_GREEDY` env
+    /// override (truthy → on, everything else → off). Toggled via the
+    /// thread-local override (NOT `set_var`, which races concurrent getenv).
+    #[test]
+    fn device_greedy_enabled_honours_env_override() {
+        const VAR: &str = "LARQL_CUDA_DEVICE_GREEDY";
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                larql_compute::options::clear_fast_path_overrides();
+            }
+        }
+        let _clear = Clear;
+        larql_compute::options::set_env_override(VAR, None);
+        assert!(!device_greedy_enabled());
+        for &v in &["1", "true", "on", "yes"] {
+            larql_compute::options::set_env_override(VAR, Some(v));
+            assert!(device_greedy_enabled(), "value {v:?} should be truthy");
+        }
+        larql_compute::options::set_env_override(VAR, Some("no"));
+        assert!(!device_greedy_enabled());
     }
 }

@@ -16,6 +16,7 @@ pub mod buffers;
 pub mod decode;
 pub mod ffn_graph;
 pub mod ffn_graph_state;
+pub mod greedy_workspace;
 pub mod kernels;
 pub mod kv_cache;
 pub mod kv_dispatch_impl;
@@ -5803,5 +5804,530 @@ mod tests {
         // But resident-hidden must still be 100% active.
         let rh = b.resident_hidden_diag().expect("resident-hidden diag");
         assert_eq!(parse_diag_count(&rh, "fallbacks="), 0);
+    }
+
+    // =======================================================================
+    // LARQL-GPU-B4 device-side greedy lm-head tests
+    // =======================================================================
+    //
+    // Two layers: (1) the reduction kernels in isolation (partial + final)
+    // against the host `VectorIndex::top_k_sorted` reference; (2) the full
+    // device chain (final RMSNorm → Q4_K lm-head GEMV → reduction) against
+    // the host norm + CPU Q4_K matvec + top_k reference. Both layers run on
+    // the real CUDA runtime; all are no-ops on hosts without CUDA.
+
+    /// Host top-K reference, matching `lm_head_knn_backend`'s contract:
+    // descending by score, non-finite skipped, capped at `k`.
+    fn host_topk(scores: &[f32], k: usize) -> Vec<(u32, f32)> {
+        let mut indexed: Vec<(u32, f32)> = scores
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, s)| s.is_finite())
+            .map(|(i, s)| (i as u32, s))
+            .collect();
+        // Min-heap isn't needed for the small test sizes; sort + truncate.
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.truncate(k);
+        indexed
+    }
+
+    /// Run the two-stage device reduction in isolation against a host score
+    /// vector and return the device top-K. Mirrors what
+    /// `run_greedy_chain_on_device` does after the lm-head GEMV.
+    fn device_reduce_topk(b: &CudaBackend, scores: &[f32], k: usize) -> Vec<(u32, f32)> {
+        let runtime = b.runtime().expect("native runtime");
+        let logical = scores.len();
+        let k = k.min(crate::ops::GREEDY_MAX_K);
+        let num_blocks = logical.div_ceil(crate::ops::GREEDY_BLOCK_SIZE);
+        let partial_len = (num_blocks * k).max(crate::ops::GREEDY_MAX_K);
+        let scores_dev = runtime.upload_f32(scores).expect("upload scores");
+        let mut partial_scores = runtime
+            .stream()
+            .alloc_zeros::<f32>(partial_len)
+            .expect("alloc partial_scores");
+        let mut partial_ids = runtime
+            .stream()
+            .alloc_zeros::<u32>(partial_len)
+            .expect("alloc partial_ids");
+        let mut result_scores = runtime
+            .stream()
+            .alloc_zeros::<f32>(crate::ops::GREEDY_MAX_K)
+            .expect("alloc result_scores");
+        let mut result_ids = runtime
+            .stream()
+            .alloc_zeros::<u32>(crate::ops::GREEDY_MAX_K)
+            .expect("alloc result_ids");
+        runtime
+            .launch_greedy_topk_partial(
+                &scores_dev,
+                &mut partial_scores,
+                &mut partial_ids,
+                logical,
+                num_blocks,
+                k,
+            )
+            .expect("partial reduction");
+        runtime
+            .launch_greedy_topk_final(
+                &mut partial_scores,
+                &partial_ids,
+                &mut result_scores,
+                &mut result_ids,
+                num_blocks * k,
+                k,
+            )
+            .expect("final reduction");
+        let sh = runtime.stream().synchronize();
+        sh.expect("sync");
+        let scores_host = runtime
+            .stream()
+            .clone_dtoh(&result_scores)
+            .expect("dtoh scores");
+        let ids_host = runtime.stream().clone_dtoh(&result_ids).expect("dtoh ids");
+        let mut out = Vec::with_capacity(k);
+        for i in 0..k {
+            let id = ids_host[i];
+            let s = scores_host[i];
+            if id == u32::MAX || !s.is_finite() {
+                break;
+            }
+            out.push((id, s));
+        }
+        out
+    }
+
+    #[test]
+    fn b4_supports_device_greedy_lm_head_when_runtime_available() {
+        let b = backend();
+        assert_eq!(
+            b.supports(Capability::DeviceGreedyLmHead),
+            b.native_runtime_available()
+        );
+    }
+
+    #[test]
+    fn b4_reduction_winner_at_beginning_middle_end() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let k = 3;
+        // Winner at the beginning.
+        let s = vec![10.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(device_reduce_topk(&b, &s, k)[0].0, 0);
+        // Winner in the middle.
+        let s = vec![1.0f32, 2.0, 50.0, 3.0, 4.0, 5.0];
+        assert_eq!(device_reduce_topk(&b, &s, k)[0].0, 2);
+        // Winner at the end.
+        let s = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 99.0];
+        assert_eq!(device_reduce_topk(&b, &s, k)[0].0, 5);
+    }
+
+    #[test]
+    fn b4_reduction_matches_host_topk_across_distributions() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // Spanning multiple blocks + a non-multiple tail (513 = 2*256 + 1).
+        let cases: Vec<Vec<f32>> = vec![
+            // monotonic increasing
+            (0..513).map(|i| i as f32 * 0.1).collect(),
+            // monotonic decreasing
+            (0..513).map(|i| (513 - i) as f32 * 0.1).collect(),
+            // random-ish (deterministic)
+            (0..1000)
+                .map(|i| (i as f32 * 7.3).sin() * 10.0 + (i as f32).fract())
+                .collect(),
+            // negative scores
+            (0..300).map(|i| -(i as f32)).collect(),
+        ];
+        for (ci, scores) in cases.iter().enumerate() {
+            for &k in &[1usize, 3, 5] {
+                let dev = device_reduce_topk(&b, scores, k);
+                let host = host_topk(scores, k);
+                assert_eq!(dev.len(), host.len(), "case {ci} k={k}: len mismatch");
+                // The winner must always match.
+                assert_eq!(dev[0].0, host[0].0, "case {ci} k={k}: winner mismatch");
+                // The candidate SET must match (order may differ only on
+                // exact ties, which these fixtures avoid).
+                let dev_set: std::collections::HashSet<u32> = dev.iter().map(|(t, _)| *t).collect();
+                let host_set: std::collections::HashSet<u32> =
+                    host.iter().map(|(t, _)| *t).collect();
+                assert_eq!(dev_set, host_set, "case {ci} k={k}: set mismatch");
+                // Scores within Q4_K-free tolerance (reduction is exact here).
+                for ((dt, ds), (ht, hs)) in dev.iter().zip(host.iter()) {
+                    assert_eq!(dt, ht, "case {ci} k={k}: token order");
+                    assert!((ds - hs).abs() < 1e-4, "case {ci} k={k}: score drift");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn b4_reduction_skips_non_finite_scores() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let mut scores = vec![0.5f32; 300];
+        scores[10] = f32::NAN;
+        scores[11] = f32::INFINITY;
+        scores[12] = f32::NEG_INFINITY;
+        scores[5] = 9.0; // the real winner
+        let dev = device_reduce_topk(&b, &scores, 3);
+        let host = host_topk(&scores, 3);
+        assert_eq!(dev[0].0, 5);
+        assert_eq!(dev[0].0, host[0].0, "winner must skip non-finite");
+    }
+
+    #[test]
+    fn b4_reduction_all_non_finite_returns_empty() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let scores = vec![f32::NAN; 300];
+        let dev = device_reduce_topk(&b, &scores, 3);
+        assert!(dev.is_empty(), "all-non-finite must yield no candidates");
+    }
+
+    #[test]
+    fn b4_reduction_candidate_width_larger_than_finite_count() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        // Only 2 finite values, k=5.
+        let mut scores = vec![f32::NAN; 300];
+        scores[3] = 2.0;
+        scores[7] = 5.0;
+        let dev = device_reduce_topk(&b, &scores, 5);
+        assert_eq!(dev.len(), 2, "only finite candidates returned");
+        assert_eq!(dev[0].0, 7);
+        assert_eq!(dev[1].0, 3);
+    }
+
+    /// Build a deterministic f32 lm-head `[vocab, hidden]` and quantize to
+    /// Q4_K. Each row peaks at a distinct column so the winner is
+    /// unambiguous for a one-hot-ish query.
+    fn make_q4k_lmhead(vocab: usize, hidden: usize) -> Vec<u8> {
+        let mut f32_rows = vec![0.0f32; vocab * hidden];
+        for v in 0..vocab {
+            for h in 0..hidden {
+                let dist = ((h as f32) - (v as f32 % hidden as f32)).abs();
+                f32_rows[v * hidden + h] = (-dist * 0.05).exp() + 0.001 * (h as f32);
+            }
+        }
+        quantize_q4_k(&f32_rows)
+    }
+
+    /// Run the full device greedy chain (final RMSNorm → Q4_K lm-head GEMV →
+    /// reduction) against a host hidden vector and return the device pick.
+    /// Mirrors `run_greedy_chain_on_device` without the decode pipeline.
+    #[allow(clippy::too_many_arguments)]
+    fn device_greedy_chain(
+        b: &CudaBackend,
+        hidden_dev: &cudarc::driver::CudaSlice<f32>,
+        lm_head_q4k: &[u8],
+        norm_weight: Option<&[f32]>,
+        hidden: usize,
+        logical: usize,
+        eps: f64,
+        offset: f32,
+        k: usize,
+    ) -> larql_compute::DeviceGreedyPick {
+        use larql_compute::backend::greedy::GreedyQ4kHeadSpec;
+        let spec = GreedyQ4kHeadSpec {
+            lm_head_bytes: lm_head_q4k,
+            hidden_size: hidden,
+            physical_vocab_size: lm_head_q4k.len() / ((hidden / 256) * 144),
+            logical_vocab_size: logical,
+            final_norm_weight: norm_weight,
+            final_norm_eps: eps,
+            final_norm_offset: offset,
+            candidate_width: k,
+        };
+        let runtime = b.runtime().expect("native runtime");
+        // Reuse the backend's greedy workspace machinery by calling the
+        // chain through a tiny wrapper. Since `run_greedy_chain_on_device`
+        // is private, replicate the launch sequence here against fresh
+        // scratch buffers (the test doesn't need the workspace reuse).
+        let kk = k.min(crate::ops::GREEDY_MAX_K);
+        let num_blocks = logical.div_ceil(crate::ops::GREEDY_BLOCK_SIZE);
+        let partial_len = (num_blocks * kk).max(crate::ops::GREEDY_MAX_K);
+        let mut normed = runtime.stream().alloc_zeros::<f32>(hidden).unwrap();
+        runtime
+            .launch_rms_norm_into_dev(hidden_dev, &mut normed, norm_weight, 1, hidden, eps, offset)
+            .unwrap();
+        let row_bytes = (hidden / 256) * 144;
+        let w_dev = runtime
+            .resolve_q4k_weight(&lm_head_q4k[..logical * row_bytes])
+            .unwrap();
+        let mut scores = runtime.stream().alloc_zeros::<f32>(logical).unwrap();
+        runtime
+            .launch_q4k_matvec_into(
+                runtime.stream(),
+                &w_dev,
+                &normed,
+                &mut scores,
+                logical,
+                hidden,
+            )
+            .unwrap();
+        let mut partial_scores = runtime.stream().alloc_zeros::<f32>(partial_len).unwrap();
+        let mut partial_ids = runtime.stream().alloc_zeros::<u32>(partial_len).unwrap();
+        let mut result_scores = runtime
+            .stream()
+            .alloc_zeros::<f32>(crate::ops::GREEDY_MAX_K)
+            .unwrap();
+        let mut result_ids = runtime
+            .stream()
+            .alloc_zeros::<u32>(crate::ops::GREEDY_MAX_K)
+            .unwrap();
+        runtime
+            .launch_greedy_topk_partial(
+                &scores,
+                &mut partial_scores,
+                &mut partial_ids,
+                logical,
+                num_blocks,
+                kk,
+            )
+            .unwrap();
+        runtime
+            .launch_greedy_topk_final(
+                &mut partial_scores,
+                &partial_ids,
+                &mut result_scores,
+                &mut result_ids,
+                num_blocks * kk,
+                kk,
+            )
+            .unwrap();
+        runtime.stream().synchronize().unwrap();
+        let sh = runtime.stream().clone_dtoh(&result_scores).unwrap();
+        let ih = runtime.stream().clone_dtoh(&result_ids).unwrap();
+        let _ = spec; // suppress unused warning
+        let mut hits = Vec::with_capacity(kk);
+        let mut winner_id = 0u32;
+        let mut winner_score = 0.0f32;
+        for i in 0..kk {
+            let id = ih[i];
+            let s = sh[i];
+            if id == u32::MAX || !s.is_finite() {
+                break;
+            }
+            if i == 0 {
+                winner_id = id;
+                winner_score = s;
+            }
+            hits.push((id, s));
+        }
+        larql_compute::DeviceGreedyPick {
+            token_id: winner_id,
+            score: winner_score,
+            probability_hits: hits,
+        }
+    }
+
+    #[test]
+    fn b4_greedy_chain_matches_host_norm_lmhead_topk() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let hidden = 256usize;
+        let vocab = 600usize; // spans multiple reduction blocks + tail
+        let k = 5usize;
+        let lm_head_q4k = make_q4k_lmhead(vocab, hidden);
+        // A learned final-norm weight (all-ones → identity-ish).
+        let norm_weight: Vec<f32> = vec![1.0; hidden];
+        // A hidden vector that peaks toward token 42's row.
+        let mut hidden_vec = vec![0.0f32; hidden];
+        hidden_vec[42 % hidden] = 1.0;
+        for (h, v) in hidden_vec.iter_mut().enumerate() {
+            *v += 0.01 * (h as f32);
+        }
+
+        let runtime = b.runtime().unwrap();
+        let hidden_dev = runtime.upload_f32(&hidden_vec).unwrap();
+        let dev_pick = device_greedy_chain(
+            &b,
+            &hidden_dev,
+            &lm_head_q4k,
+            Some(&norm_weight),
+            hidden,
+            vocab,
+            1e-6,
+            1.0,
+            k,
+        );
+
+        // Host reference: rms_norm → CPU Q4_K matvec → top_k.
+        use larql_compute::CpuBackend;
+        use larql_compute::QuantMatVec;
+        let cpu = CpuBackend;
+        let normed_host: Vec<f32> = {
+            let sq_sum: f64 = hidden_vec.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+            let rms = (sq_sum / hidden as f64 + 1e-6f64).sqrt() as f32;
+            hidden_vec
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| v / rms * (1.0 + norm_weight[i]))
+                .collect()
+        };
+        let scores_host = cpu
+            .q4k_matvec(&lm_head_q4k, &normed_host, vocab, hidden)
+            .expect("cpu q4k matvec");
+        let host_top = host_topk(&scores_host, k);
+
+        assert!(!host_top.is_empty());
+        // The device winner must match the host winner.
+        assert_eq!(
+            dev_pick.token_id, host_top[0].0,
+            "device greedy winner must match host"
+        );
+        // The candidate set must match.
+        let dev_set: std::collections::HashSet<u32> =
+            dev_pick.probability_hits.iter().map(|(t, _)| *t).collect();
+        let host_set: std::collections::HashSet<u32> = host_top.iter().map(|(t, _)| *t).collect();
+        assert_eq!(dev_set, host_set, "candidate set must match");
+        // Winner score within Q4_K matvec tolerance.
+        let host_win_score = host_top[0].1;
+        assert!(
+            (dev_pick.score - host_win_score).abs() < 1e-2,
+            "winner score drift: dev={} host={}",
+            dev_pick.score,
+            host_win_score
+        );
+    }
+
+    #[test]
+    fn b4_greedy_chain_logical_vocab_protects_padding() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let hidden = 256usize;
+        let logical = 300usize;
+        // Physical = 600; the padding rows [300..600) are engineered to
+        // dominate the query so they WOULD win without logical restriction.
+        let mut f32_rows = vec![0.0f32; 600 * hidden];
+        // Logical rows: small values.
+        for v in 0..logical {
+            for h in 0..hidden {
+                f32_rows[v * hidden + h] =
+                    (-((h as f32 - v as f32 % hidden as f32).abs()) * 0.05).exp();
+            }
+        }
+        // Padding rows: huge values (would dominate).
+        for v in logical..600 {
+            for h in 0..hidden {
+                f32_rows[v * hidden + h] = 100.0;
+            }
+        }
+        let lm_head_q4k = quantize_q4_k(&f32_rows);
+        let hidden_vec: Vec<f32> = (0..hidden).map(|h| 1.0 + 0.01 * (h as f32)).collect();
+
+        let runtime = b.runtime().unwrap();
+        let hidden_dev = runtime.upload_f32(&hidden_vec).unwrap();
+        let dev_pick = device_greedy_chain(
+            &b,
+            &hidden_dev,
+            &lm_head_q4k,
+            None,
+            hidden,
+            logical,
+            1e-6,
+            1.0,
+            5,
+        );
+        // The winner MUST be a logical token (< 300), never a padded row.
+        assert!(
+            (dev_pick.token_id as usize) < logical,
+            "padded row {} must never win; logical={logical}",
+            dev_pick.token_id
+        );
+        for (id, _) in &dev_pick.probability_hits {
+            assert!((*id as usize) < logical, "padded candidate in hits");
+        }
+    }
+
+    #[test]
+    fn b4_greedy_chain_respects_final_norm_weight() {
+        let b = backend();
+        if !b.native_runtime_available() {
+            return;
+        }
+        let hidden = 256usize;
+        let vocab = 256usize;
+        let lm_head_q4k = make_q4k_lmhead(vocab, hidden);
+        let hidden_vec = vec![2.0f32; hidden];
+
+        let runtime = b.runtime().unwrap();
+        let hidden_dev = runtime.upload_f32(&hidden_vec).unwrap();
+        // With a uniform norm weight of 2.0 vs 0.5, the winner should be
+        // the same (RMSNorm is scale-equivariant under uniform weight for
+        // the argmax), but the SCORES differ. Run both and confirm the
+        // winner is stable while scores differ.
+        let pick_a = device_greedy_chain(
+            &b,
+            &hidden_dev,
+            &lm_head_q4k,
+            Some(&vec![2.0; hidden]),
+            hidden,
+            vocab,
+            1e-6,
+            1.0,
+            3,
+        );
+        let pick_b = device_greedy_chain(
+            &b,
+            &hidden_dev,
+            &lm_head_q4k,
+            Some(&vec![0.5; hidden]),
+            hidden,
+            vocab,
+            1e-6,
+            1.0,
+            3,
+        );
+        assert_eq!(
+            pick_a.token_id, pick_b.token_id,
+            "argmax stable under uniform weight"
+        );
+        // Scores differ (the lm-head sees a scaled input).
+        assert!(
+            (pick_a.score - pick_b.score).abs() > 1e-3,
+            "scores should differ under different norm weights"
+        );
+    }
+
+    #[test]
+    fn b4_decode_token_greedy_q4k_returns_hosthidden_on_scaffold() {
+        let b = backend();
+        if b.native_runtime_available() {
+            return;
+        }
+        // Scaffold: the additive method must fall back to HostHidden (the
+        // default-impl behaviour) rather than panic.
+        use larql_compute::backend::greedy::{GreedyDecodeOutput, GreedyQ4kHeadSpec};
+        let head = GreedyQ4kHeadSpec {
+            lm_head_bytes: &[],
+            hidden_size: 0,
+            physical_vocab_size: 0,
+            logical_vocab_size: 0,
+            final_norm_weight: None,
+            final_norm_eps: 1e-6,
+            final_norm_offset: 1.0,
+            candidate_width: 5,
+        };
+        let layers: Vec<larql_compute::FullPipelineLayer<'_>> =
+            vec![larql_compute::FullPipelineLayer::default()];
+        let out = b.decode_token_greedy_q4k(&layers, &[0.0; 4], 4, 4, &head);
+        // Scaffold decode_token returns None → the greedy method returns None.
+        assert!(out.is_none() || matches!(out, Some(GreedyDecodeOutput::HostHidden(_))));
     }
 }

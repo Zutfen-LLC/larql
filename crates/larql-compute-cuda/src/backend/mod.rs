@@ -53,6 +53,8 @@ pub struct CudaBackend {
     /// `graph_diag()` / `take_profile_counters()`.
     #[allow(dead_code)]
     graph_profile: GraphProfileCounters,
+    /// LARQL-GPU-B4 device-greedy profiling counters.
+    greedy_profile: GreedyProfileCounters,
     /// B3A: generation-scoped cache of per-layer resident-FFN executable
     /// graphs. Allocated lazily; reset (graphs destroyed, generation
     /// advanced) at every `reset_kv_cache` BEFORE the weight cache flushes.
@@ -63,6 +65,12 @@ pub struct CudaBackend {
     /// it; dropped (with the graphs) at generation reset.
     #[allow(dead_code)]
     pub(crate) arena: std::sync::Mutex<Option<crate::ffn_graph_state::ResidentDecodeArena>>,
+    /// LARQL-GPU-B4: generation-scoped device-side greedy-head workspace.
+    /// `None` until the first eligible greedy decode token allocates it;
+    /// rebuilt when `(logical_rows, hidden, candidate_width)` changes;
+    /// dropped at generation reset (`reset_kv_cache`).
+    pub(crate) greedy_workspace:
+        std::sync::Mutex<Option<crate::greedy_workspace::GreedyHeadWorkspace>>,
     /// Test-only eligibility hook for exercising a resident → fallback →
     /// resident transition without changing any layer math.
     #[cfg(test)]
@@ -123,6 +131,31 @@ struct GraphProfileCounters {
     graph_cross_stream_syncs: std::sync::atomic::AtomicU64,
 }
 
+/// LARQL-GPU-B4 device-greedy profiling counters. All `AtomicU64` with
+/// `Ordering::Relaxed`; only mutated when `LARQL_GPU_PROFILE=1` (the
+/// recorder methods short-circuit otherwise). Surfaced via
+/// `take_profile_counters()`.
+#[derive(Default)]
+pub(crate) struct GreedyProfileCounters {
+    /// Calls to `decode_token_greedy_q4k` on an eligible plain-greedy step.
+    pub(crate) attempts: std::sync::atomic::AtomicU64,
+    /// Device returned a `DevicePick`.
+    pub(crate) engaged: std::sync::atomic::AtomicU64,
+    /// Device computed the hidden state but returned `HostHidden`.
+    pub(crate) fallbacks: std::sync::atomic::AtomicU64,
+    /// Device could not even read back the hidden state.
+    pub(crate) failures: std::sync::atomic::AtomicU64,
+    /// Full lm-head score-vector DtoH copies on the host path.
+    pub(crate) lm_head_full_score_dtoh_copies: std::sync::atomic::AtomicU64,
+    pub(crate) lm_head_full_score_dtoh_bytes: std::sync::atomic::AtomicU64,
+    /// Fixed-size candidate-result DtoH copies on the B4 path.
+    pub(crate) lm_head_result_dtoh_copies: std::sync::atomic::AtomicU64,
+    pub(crate) lm_head_result_dtoh_bytes: std::sync::atomic::AtomicU64,
+    /// Final-hidden-state DtoH readbacks on the host path.
+    pub(crate) final_hidden_readbacks: std::sync::atomic::AtomicU64,
+    pub(crate) final_hidden_readback_bytes: std::sync::atomic::AtomicU64,
+}
+
 /// A consumed snapshot of the profile counters, returned by
 /// [`CudaBackend::take_profile_counters`] (the inherent method). Plain values
 /// (the atomics have been reset to zero). Distinct from the trait-level
@@ -160,6 +193,17 @@ pub struct CudaProfileSnapshot {
     pub d2d_submissions: u64,
     /// Explicit cross-stream `synchronize()` calls the graph path issues.
     pub graph_cross_stream_syncs: u64,
+    // ── LARQL-GPU-B4 device-greedy counters ─────────────────────────────
+    pub device_greedy_attempts: u64,
+    pub device_greedy_engaged: u64,
+    pub device_greedy_fallbacks: u64,
+    pub device_greedy_failures: u64,
+    pub lm_head_full_score_dtoh_copies: u64,
+    pub lm_head_full_score_dtoh_bytes: u64,
+    pub lm_head_result_dtoh_copies: u64,
+    pub lm_head_result_dtoh_bytes: u64,
+    pub final_hidden_readbacks: u64,
+    pub final_hidden_readback_bytes: u64,
 }
 
 impl From<CudaProfileSnapshot> for larql_compute::ProfileCountersSnapshot {
@@ -182,6 +226,16 @@ impl From<CudaProfileSnapshot> for larql_compute::ProfileCountersSnapshot {
             graph_fallbacks: c.graph_fallbacks,
             d2d_submissions: c.d2d_submissions,
             graph_cross_stream_syncs: c.graph_cross_stream_syncs,
+            device_greedy_attempts: c.device_greedy_attempts,
+            device_greedy_engaged: c.device_greedy_engaged,
+            device_greedy_fallbacks: c.device_greedy_fallbacks,
+            device_greedy_failures: c.device_greedy_failures,
+            lm_head_full_score_dtoh_copies: c.lm_head_full_score_dtoh_copies,
+            lm_head_full_score_dtoh_bytes: c.lm_head_full_score_dtoh_bytes,
+            lm_head_result_dtoh_copies: c.lm_head_result_dtoh_copies,
+            lm_head_result_dtoh_bytes: c.lm_head_result_dtoh_bytes,
+            final_hidden_readbacks: c.final_hidden_readbacks,
+            final_hidden_readback_bytes: c.final_hidden_readback_bytes,
         }
     }
 }
@@ -235,10 +289,12 @@ impl CudaBackend {
                 profile: ProfileCounters::default(),
                 graph_mode,
                 graph_profile: GraphProfileCounters::default(),
+                greedy_profile: GreedyProfileCounters::default(),
                 graph_cache: std::sync::Mutex::new(
                     crate::ffn_graph_state::ResidentFfnGraphCache::new(),
                 ),
                 arena: std::sync::Mutex::new(None),
+                greedy_workspace: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
                     usize::MAX,
@@ -257,10 +313,12 @@ impl CudaBackend {
                 profile: ProfileCounters::default(),
                 graph_mode,
                 graph_profile: GraphProfileCounters::default(),
+                greedy_profile: GreedyProfileCounters::default(),
                 graph_cache: std::sync::Mutex::new(
                     crate::ffn_graph_state::ResidentFfnGraphCache::new(),
                 ),
                 arena: std::sync::Mutex::new(None),
+                greedy_workspace: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 resident_hidden_forced_fallback_layer: std::sync::atomic::AtomicUsize::new(
                     usize::MAX,
@@ -575,6 +633,24 @@ impl CudaBackend {
         ))
     }
 
+    /// LARQL-GPU-B4 diagnostic: device-side greedy lm-head engagement, or
+    /// `None` when no device-greedy step has run. Surfaced through
+    /// `device_info()` when `LARQL_GPU_DIAG` is set.
+    pub fn device_greedy_diag(&self) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let attempts = self.greedy_profile.attempts.load(Ordering::Relaxed);
+        let engaged = self.greedy_profile.engaged.load(Ordering::Relaxed);
+        let fallbacks = self.greedy_profile.fallbacks.load(Ordering::Relaxed);
+        let failures = self.greedy_profile.failures.load(Ordering::Relaxed);
+        if attempts == 0 {
+            return None;
+        }
+        let rate = format!("{:.1}%", (engaged as f64 / attempts as f64) * 100.0);
+        Some(format!(
+            "cuda device-greedy lm-head: attempts={attempts}, engaged={engaged}, fallbacks={fallbacks}, failures={failures}, engage_rate={rate}"
+        ))
+    }
+
     // ── B3A graph profiling recorders (capture-aware, point 8) ──────────
     //
     // The structural counters (builds, submissions, failures, fallbacks) are
@@ -722,6 +798,85 @@ impl CudaBackend {
         }
     }
 
+    // ── LARQL-GPU-B4 device-greedy recorders (profile-gated) ────────────
+    //
+    // All gate on `gpu_profile_enabled()` so normal decode is a no-op branch.
+    // The engagement counters (attempts/engaged/fallbacks/failures) are
+    // UNCONDITIONAL when device-greedy is in use so the diagnostic surface
+    // always reports engagement rate; only the byte/copy decomposition is
+    // profile-gated.
+
+    /// Record one device-greedy attempt (a call to the additive greedy
+    /// method on an eligible plain-greedy step). Unconditional.
+    pub(crate) fn note_device_greedy_attempt(&self) {
+        self.greedy_profile
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record one device-greedy engagement (device returned `DevicePick`).
+    /// Unconditional.
+    pub(crate) fn note_device_greedy_engaged(&self) {
+        self.greedy_profile
+            .engaged
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record one device-greedy fallback (device returned `HostHidden`
+    /// after computing the hidden state). Unconditional.
+    pub(crate) fn note_device_greedy_fallback(&self) {
+        self.greedy_profile
+            .fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record one device-greedy failure (device could not even read back the
+    /// hidden state). Unconditional.
+    pub(crate) fn note_device_greedy_failure(&self) {
+        self.greedy_profile
+            .failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record a full lm-head score-vector DtoH copy on the host path (the
+    /// transfer B4 eliminates). Profile-gated.
+    pub(crate) fn note_lm_head_full_score_dtoh(&self, bytes: usize) {
+        if crate::options::gpu_profile_enabled() {
+            self.greedy_profile
+                .lm_head_full_score_dtoh_copies
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.greedy_profile
+                .lm_head_full_score_dtoh_bytes
+                .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record a fixed-size candidate-result DtoH copy on the B4 path.
+    /// Profile-gated.
+    pub(crate) fn note_lm_head_result_dtoh(&self, bytes: usize) {
+        if crate::options::gpu_profile_enabled() {
+            self.greedy_profile
+                .lm_head_result_dtoh_copies
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.greedy_profile
+                .lm_head_result_dtoh_bytes
+                .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record a final-hidden-state DtoH readback on the host path (the
+    /// transfer B4 eliminates). Profile-gated.
+    pub(crate) fn note_final_hidden_readback_bytes(&self, bytes: usize) {
+        if crate::options::gpu_profile_enabled() {
+            self.greedy_profile
+                .final_hidden_readbacks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.greedy_profile
+                .final_hidden_readback_bytes
+                .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// A multi-line diagnostic string summarising the profile counters, or
     /// `None` when nothing has been recorded (counters at zero). Surfaced
     /// through `device_info()` when `LARQL_GPU_DIAG` is set. Reads the
@@ -806,11 +961,51 @@ impl CudaBackend {
             .graph_profile
             .graph_cross_stream_syncs
             .swap(0, Ordering::Relaxed);
+        // ── LARQL-GPU-B4 device-greedy counters (consumed + reset) ──
+        let device_greedy_attempts = self.greedy_profile.attempts.swap(0, Ordering::Relaxed);
+        let device_greedy_engaged = self.greedy_profile.engaged.swap(0, Ordering::Relaxed);
+        let device_greedy_fallbacks = self.greedy_profile.fallbacks.swap(0, Ordering::Relaxed);
+        let device_greedy_failures = self.greedy_profile.failures.swap(0, Ordering::Relaxed);
+        let lm_head_full_score_dtoh_copies = self
+            .greedy_profile
+            .lm_head_full_score_dtoh_copies
+            .swap(0, Ordering::Relaxed);
+        let lm_head_full_score_dtoh_bytes = self
+            .greedy_profile
+            .lm_head_full_score_dtoh_bytes
+            .swap(0, Ordering::Relaxed);
+        let lm_head_result_dtoh_copies = self
+            .greedy_profile
+            .lm_head_result_dtoh_copies
+            .swap(0, Ordering::Relaxed);
+        let lm_head_result_dtoh_bytes = self
+            .greedy_profile
+            .lm_head_result_dtoh_bytes
+            .swap(0, Ordering::Relaxed);
+        let final_hidden_readbacks = self
+            .greedy_profile
+            .final_hidden_readbacks
+            .swap(0, Ordering::Relaxed);
+        let final_hidden_readback_bytes = self
+            .greedy_profile
+            .final_hidden_readback_bytes
+            .swap(0, Ordering::Relaxed);
+        let greedy_active = device_greedy_attempts != 0
+            || device_greedy_engaged != 0
+            || device_greedy_fallbacks != 0
+            || device_greedy_failures != 0
+            || lm_head_full_score_dtoh_copies != 0
+            || final_hidden_readbacks != 0;
         let graph_active = graph_submissions != 0
             || graph_builds != 0
             || graph_failures != 0
             || graph_fallbacks != 0;
-        if rt.is_none() && mirror_append_ns == 0 && hidden_readback_ns == 0 && !graph_active {
+        if rt.is_none()
+            && mirror_append_ns == 0
+            && hidden_readback_ns == 0
+            && !graph_active
+            && !greedy_active
+        {
             return None;
         }
         let rt = rt.unwrap_or_default();
@@ -832,6 +1027,16 @@ impl CudaBackend {
             graph_fallbacks,
             d2d_submissions,
             graph_cross_stream_syncs,
+            device_greedy_attempts,
+            device_greedy_engaged,
+            device_greedy_fallbacks,
+            device_greedy_failures,
+            lm_head_full_score_dtoh_copies,
+            lm_head_full_score_dtoh_bytes,
+            lm_head_result_dtoh_copies,
+            lm_head_result_dtoh_bytes,
+            final_hidden_readbacks,
+            final_hidden_readback_bytes,
         })
     }
 
@@ -1330,6 +1535,13 @@ impl CudaBackend {
         // drop it so the next generation allocates fresh stable-address buffers.
         if let Ok(mut arena) = self.arena.lock() {
             arena.take();
+        }
+        // LARQL-GPU-B4: the greedy-head workspace is generation-scoped too;
+        // drop it so the next generation (possibly a different lm-head shape)
+        // rebuilds it. The weight-cache flush below also drops the cached
+        // logical-row lm-head prefix, so a stale buffer can't be served.
+        if let Ok(mut ws) = self.greedy_workspace.lock() {
+            ws.take();
         }
         if let Some(runtime) = self.runtime.as_ref() {
             runtime.flush_weight_cache();

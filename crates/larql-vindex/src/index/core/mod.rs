@@ -35,9 +35,12 @@ pub use super::types::*;
 
 mod fp4_ffn;
 mod gate_lookup;
+pub mod lm_head_repr;
 mod native_ffn;
 mod patch_overrides;
 mod quantized_ffn;
+
+pub use lm_head_repr::LmHeadRepresentation;
 
 /// The full model as a local vector index.
 ///
