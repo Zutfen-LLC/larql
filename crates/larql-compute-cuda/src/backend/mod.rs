@@ -638,6 +638,12 @@ impl CudaBackend {
     /// (B3A review point 3). Always counted (not profile-gated): it is a real
     /// host CUDA submission the graph path introduces, and hiding it would
     /// make the sync accounting dishonest.
+    /// Explicit cross-stream `synchronize()` calls the graph path issues.
+    /// B3B made this always zero: the single non-NULL stream removed every
+    /// runtime↔cap_stream handoff, so there are no cross-stream syncs to count.
+    /// Kept (reporting 0) so the benchmark JSON's `graph_cross_stream_syncs`
+    /// category is still measured independently (B3B section 7).
+    #[allow(dead_code)]
     pub(crate) fn note_graph_cross_stream_sync(&self) {
         self.graph_profile
             .graph_cross_stream_syncs

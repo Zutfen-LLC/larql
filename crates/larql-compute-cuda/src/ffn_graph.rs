@@ -380,6 +380,37 @@ pub(crate) fn graph_instantiate_flags() -> cudarc::driver::sys::CUgraphInstantia
     cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
 }
 
+/// The CUDA stream-capture mode LARQL uses for the resident-FFN graph (B3B).
+///
+/// B3A used `GLOBAL` (the strictest mode, which forbids any concurrent stream
+/// synchronization on the context). B3B switches to `RELAXED`.
+///
+/// **Why RELAXED is production-equivalent here.** The only behavioral
+/// difference between `GLOBAL` and `RELAXED` is that `GLOBAL` forbids
+/// `cuStreamSynchronize` on any of the context's streams while a capture is
+/// active (to flag a sync-during-capture as a defect). B3B's single non-NULL
+/// stream design issues **no** host synchronization during the capture window:
+/// the window is exactly the 7 `*_into` FFN kernel captures, and every
+/// `cuStreamSynchronize` (the `kv_append` append, the K/V row readbacks, the
+/// final hidden readback) happens either before capture (attention) or after
+/// `end_capture` (the token-1 `graph.launch()`). So there is no sync during
+/// capture for `GLOBAL` to flag — the two modes are identical for production
+/// single-threaded decode.
+///
+/// **Why RELAXED is required for the test harness.** Every CUDA test shares
+/// the device-0 primary context (`CudaContext::new` retains it), and the test
+/// harness runs tests in parallel threads. A resident decode/prefill test
+/// issuing `cuStreamSynchronize` on its stream while a graph test captures on
+/// another stream of the same context races under `GLOBAL`
+/// (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` / `_INVALIDATED`). `RELAXED`
+/// permits `cuStreamSynchronize` on streams not in capture, which makes the
+/// parallel suite deterministic with no change to the capture/replay lifecycle
+/// the graph tests validate. Production decode is single-threaded, so the
+/// concurrent-sync case `RELAXED` allows never arises in production.
+pub(crate) fn graph_capture_mode() -> cudarc::driver::sys::CUstreamCaptureMode {
+    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

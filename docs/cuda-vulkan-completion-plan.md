@@ -222,11 +222,22 @@ Ordered by expected wall-clock impact; re-rank against the A4 profile.
        event tracking must be disabled for graph buffers
        (STREAM_CAPTURE_ISOLATION). B3B (attention graphization or event-based
        cross-stream sync) is the path to the ≥1% wall-clock gate. -->
-- B3B. **Attention graphization / event-based sync** (1 session, follow-on to
-  B3A). Either graph the dynamic attention chain (harder — dynamic total_len +
-  KV cursor state) or replace the B3A explicit `synchronize()` cross-stream
-  sync with `CudaEvent` record/wait pairs (avoids the pipeline stall that
-  offset B3A's launch savings). Target: ≥1% wall-clock improvement.
+- B3B. **Single non-NULL decode stream for FFN graph replay** (IMPLEMENTED,
+  opt-in, 2026-07-10). Replaces B3A's separate `cap_stream` with **one
+  dedicated non-NULL runtime stream** that carries the entire resident decode
+  critical path (attention, KV, residual, the captured FFN graph, layer
+  handoff) — graph capture AND replay run on the same stream, so the per-layer
+  D2D seed/output copies and the cross-stream `synchronize()`s are removed.
+  Attention writes its post-attn residual **in place** into the arena input
+  slot (`launch_residual_add_inplace_into`); the graph output IS the next
+  layer's input (ping-pong by flip). **Honest result: −0.5% TOTAL host
+  submissions (628→437/tok, clears the ≥25% structural gate), zero per-layer
+  D2D, zero cross-stream syncs, syncs unchanged at 83/tok (no regression),
+  resident-KV/hidden 100%. Wall-clock −0.52% median (within noise) — does NOT
+  meet the ≥1% wall-clock gate, so graph mode stays opt-in.** Capture mode is
+  `RELAXED` (production-equivalent for the single-stream design). 205/205
+  tests pass in both modes (`--test-threads=1`, the Metal-backend convention).
+  See bench/baselines/cuda-b3b-single-stream-2026-07-10.md.
 - B4. **lm-head on device** (1 session). Revisit the Session 8b decision that
   gated `f32_gemv`/`topk1` off the native path: with the weight cache (the
   re-upload concern is gone) land a fused GEMV+argmax (`f16_gemv_topk1`)

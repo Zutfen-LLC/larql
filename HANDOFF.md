@@ -833,3 +833,72 @@ cross-stream syncs, or attention graphization) is the path to a net win.
 - **Default graph mode = Disabled** (under honest accounting B3A delivers
   neither gate: 18.2% submission < 25%, flat wall-clock < 1%, +91% syncs);
   opt-in via `LARQL_CUDA_GRAPHS=1`.
+
+## Session 33 (2026-07-10): LARQL-GPU-B3B — Single non-NULL decode stream for FFN graph replay (COMPLETE, OPT-IN)
+
+**B3B landed on `fix/cuda-b3a-graph-accounting` atop the B3A accounting
+correction (`1bc22890`).** It replaces B3A's separate `cap_stream` with **one
+dedicated non-NULL runtime stream** that carries the entire resident decode
+critical path — attention, KV append, residual, the captured FFN graph, and the
+layer-to-layer hidden handoff — so graph capture AND replay run on the same
+stream as every other decode kernel, and the per-layer D2D seed/output copies +
+cross-stream `synchronize()`s are removed entirely.
+
+- **Runtime stream** (`backend/runtime.rs::initialize_impl`):
+  `context.default_stream()` (the NULL stream, which CUDA forbids capturing) →
+  `context.new_stream()` (a real `CU_STREAM_NON_BLOCKING` stream) + a one-time
+  context-wide `disable_event_tracking()`. Sound because the runtime stream is
+  now the only stream — stream submission order is the only ordering. Every
+  consumer takes the stream as a `&Arc<CudaStream>` parameter (weight cache, KV
+cache, every launch), so weight-cache uploads, KV alloc/append, resident-KV
+  attention, resident-hidden decode, prefill, state-dump readbacks, truncate/reset,
+  final hidden readback, and teardown all move onto it with no independent stream
+  creation (audit item — B3B section 4).
+- **Arena** (`ffn_graph_state.rs`): the `cap_stream` field is removed; the arena
+  keeps `hidden_a`/`hidden_b`/`generation` and allocates its two `[hidden]`
+  buffers on the runtime stream.
+- **Attention → arena input** (`pipeline.rs`): new `attention_into_arena` runs
+  the shared attention chain (`resident_attention_chain_to_o_dev`, extracted from
+  `host_attention_block_device_resident` so the non-graph and graph paths share
+  one source) then writes the post-attn residual **in place** into the arena
+  input slot via new `launch_residual_add_inplace_into` (binds one buffer as both
+  read base + write output — element-wise independent, sound on a single stream).
+- **Graph build/replay** (`pipeline.rs`): `build_ffn_graph_single_stream` /
+  `replay_ffn_graph_single_stream` capture+replay on `runtime.stream()`
+  (`CudaGraph` stores the stream it captured on → `launch()` lands there). The
+  seed `memcpy_dtod`, the output `clone_dtod`, and all four cross-stream
+  `synchronize()`s are deleted. Capture mode is `RELAXED`
+  (`ffn_graph::graph_capture_mode`) — production-equivalent for B3B (no syncs
+  occur during the capture window) and required for the parallel test harness.
+- **Decode loop** (`host_decode_token_resident`): new `host_graph_decode_layer`
+  drives one graph-eligible layer end-to-end (place hidden into the arena input
+  slot → attention in place → K/V mirror append → graph build/replay) and reports
+  a `GraphLayerOutcome` (`ArenaOut { flip }` / `DeviceFallback` / `NotAttempted`).
+  The loop carries `arena_out_flip`; consecutive graph layers pass hidden by flip
+  alone (layer 0 re-uploads the embedding each token — HtoD not D2D; re-entry
+  after a non-graph/scalar layer is one boundary D2D).
+
+**Measured (RTX 3060, Qwen2.5-3B Q4_K_M, 79 steps, 5 reps × 2 modes):** TOTAL
+host submissions 627.9→436.6/tok = **−0.5%** (clears the ≥25% structural gate);
+**graph d2d=0, cross_stream_syncs=0** (B3A two-stream was +75/+76); syncs
+unchanged at 83.1/tok (no regression); resident-KV/hidden 100%. Wall-clock
+median p50 121.50→120.87ms = **−0.52%** (within the GRAPHS=0 run-to-run spread
+of 0.81ms) — does **not** meet the ≥1% wall-clock gate, so graph mode **stays
+opt-in (default Disabled)**. The eliminated ~191 launches/tok are a small
+fraction of the 122ms/token (dominated by lm-head 25.8ms + GPU fwd 96ms).
+
+**Test reliability:** CUDA stream capture on the shared device-0 primary
+context is single-threaded (the driver does not support two concurrent captures
+on one context), so the parallel test harness races. The `larql-compute-cuda`
+suite runs **`--test-threads=1`** — the existing `larql-compute-metal`
+convention — and a `CUDA_CAPTURE_TEST_LOCK` serializes the capture-performing
+tests. The old flaky two-stream `b3a_smoke_repeated_capture_teardown_lifecycle`
+is replaced by a stronger single-stream lifecycle test
+(`b3b_single_stream_repeated_capture_reset_rebuild_lifecycle`: create → capture
+→ instantiate → token-1 launch → token-2+ replay → reset → destroy → rebuild →
+replay → drop, 5 cycles). **205/205 lib tests pass deterministically in both
+`LARQL_CUDA_GRAPHS=0` and `LARQL_CUDA_GRAPHS=1`** (+3 single-stream tests, −2
+two-stream smoke tests vs the 204 pre-B3B). fmt + clippy clean (cuda + inference
++ cli `--features cuda`). Report: `bench/baselines/cuda-b3b-single-stream-2026-07-10.md`.
+**Next:** B4 (lm-head on device — the 21% lm-head fraction is now the largest
+single decode cost), or profile-driven polish.
