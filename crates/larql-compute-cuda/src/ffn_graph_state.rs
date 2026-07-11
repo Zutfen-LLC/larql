@@ -1,59 +1,55 @@
-//! LARQL-GPU-B3A: resident decode arena + FFN graph state (B3A-3/5/6).
+//! LARQL-GPU-B3B: resident decode arena + FFN graph state.
 //!
 //! This module owns the **device side** of the CUDA Graph replay for the
 //! resident decode FFN. The pure plan/identity contract lives in
 //! [`crate::ffn_graph`]; this module holds the graph-captured state, the
 //! stable scratch buffers, and the generation-scoped cache.
 //!
-//! NOTE: the structures here are constructed/referenced by the B3A-5 pipeline
-//! integration (build + replay) which lands in the next commit. Until that
-//! wiring is in place the `dead_code` allows below silence the "never used"
-//! warnings. They are removed once the pipeline integration lands.
-#![allow(dead_code)]
+//! ## Architecture (B3B single non-NULL decode stream)
 //!
-//! ## Architecture (B3A review points 2, 3, 6, 7)
+//! ### One stream for everything
 //!
-//! ### Why a dedicated capture stream (B3A-SMOKE finding)
+//! B3B replaced the NULL/default runtime stream with a single dedicated
+//! non-NULL stream (see `CudaRuntime::initialize_impl`) and removed B3A's
+//! separate `cap_stream`. Graph capture AND replay now run on the runtime
+//! stream — the same stream attention, KV append, residual, and every other
+//! decode kernel use. Layer-to-layer ordering is therefore by stream
+//! submission alone: zero per-layer D2D and zero per-layer cross-stream syncs.
 //!
-//! The LARQL runtime's default stream is the NULL stream (`cudarc`'s
-//! `default_stream()` returns `cu_stream = null_mut`), and CUDA forbids
-//! capturing it (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`). Graph capture and
-//! replay therefore happen on a **dedicated non-NULL stream** created via
-//! `CudaContext::new_stream()`.
+//! ### Arena slot flip/ownership (the ping-pong that powers zero-copy replay)
 //!
-//! Additionally, `cudarc` enables per-slice `CudaEvent` tracking by default.
-//! During capture, `launch_builder.arg(&CudaSlice)` injects `cuStreamWaitEvent`
-//! for prior write events → `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`. Event
-//! tracking is therefore **disabled** for graph buffers (the stream orders
-//! captured work explicitly; cross-stream ordering is managed by this module
-//! via explicit synchronization).
+//! The arena owns two stable `[hidden]` buffers (`hidden_a`, `hidden_b`),
+//! allocated once per generation on the runtime stream and reused by address
+//! for the whole generation (graph capture binds their device addresses).
+//! Per layer `flip = li % 2 == 1`:
 //!
-//! ### Cross-stream synchronization
+//! - **`input(flip)`** is the layer's hidden input AND the FFN graph's input
+//!   slot. Attention reads it for the input norm, then writes its post-attn
+//!   residual **in place** into it (`launch_residual_add_inplace_into`) — so
+//!   the graph reads the post-attn residual from the exact address it
+//!   captured, with no D2D seed copy.
+//! - **`output(flip)`** is the FFN graph's output slot (= the next layer's
+//!   `input(¬flip)`). The graph writes the post-FFN state there; the next
+//!   layer's attention reads it directly — no D2D output copy.
 //!
-//! The resident decode loop runs attention + KV mirror on the runtime's NULL
-//! stream, but the FFN graph replays on the dedicated capture stream. The
-//! arena manages the handoff:
+//! Because `output(flip) == input(¬flip)`, layer N's input is layer N-1's
+//! graph output, carried by flip alone. Layer 0 re-uploads each token's
+//! embedding into `input(false)` (a normal HtoD, not a D2D). The in-place
+//! residual is sound: `residual_add` is element-wise independent, and a single
+//! stream guarantees no concurrent access to the slot.
 //!
-//! 1. Attention writes the post-attn hidden state into the arena's **input**
-//!    buffer (via `launch_residual_add_into` on the NULL stream).
-//! 2. Before graph replay, the capture stream **waits** on the NULL stream
-//!    (an event recorded after the attention write), so the graph sees the
-//!    fresh input.
-//! 3. The graph replays on the capture stream, writing the post-FFN state
-//!    into the arena's **output** buffer.
-//! 4. The NULL stream **waits** on the capture stream before the next layer's
-//!    attention reads the output.
+//! ### Capture safety
 //!
-//! This ping-pong keeps hidden state device-resident across layers with **zero
-//! host crossings and zero per-token allocations** (the two stable buffers are
-//! allocated once per generation and reused by address).
-
-use std::sync::Arc;
+//! CudaEvent tracking is disabled context-wide at runtime init, so
+//! `launch_builder.arg(&CudaSlice)` injects no `cuStreamWaitEvent` during
+//! capture (which would yield `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`). On one
+//! stream, submission order is the only ordering needed.
 
 use crate::backend::CudaRuntime;
 use crate::backend::RuntimeError;
 use crate::ffn_graph::GraphGenerationId;
-use cudarc::driver::{CudaGraph, CudaSlice, CudaStream, DriverError};
+use cudarc::driver::{CudaGraph, CudaSlice, DriverError};
+use std::sync::Arc;
 
 /// One layer's captured resident-FFN graph + its referenced buffers.
 ///
@@ -81,6 +77,10 @@ pub(crate) struct ResidentFfnGraph {
 /// the slices carry no `CudaEvent` handles) and held for the graph's lifetime.
 /// Their device addresses are what the captured kernel nodes bind; they must
 /// not move or be reallocated until the graph is destroyed.
+// NOTE: the fields are never *read* via Rust — they exist to pin the device
+// addresses the captured graph binds for the graph's lifetime (their `Drop`
+// frees the device memory after the graph is destroyed).
+#[allow(dead_code)]
 pub(crate) struct ResidentFfnGraphScratch {
     /// Normalized input `[hidden]` (pre-FFN RMSNorm output).
     pub(crate) normed_input: CudaSlice<f32>,
@@ -99,7 +99,11 @@ pub(crate) struct ResidentFfnGraphScratch {
 /// Retained weight-buffer handles that pin the device addresses the graph
 /// captured. Dropping these would free the weights while the graph still
 /// references them.
+// NOTE: fields pin device addresses for the graph's lifetime (see
+// `ResidentFfnGraphScratch`); they are dropped, not read.
+#[allow(dead_code)]
 pub(crate) struct RetainedWeights {
+    #[allow(dead_code)]
     pub(crate) gate: Arc<CudaSlice<u8>>,
     pub(crate) up: Arc<CudaSlice<u8>>,
     pub(crate) down: Arc<CudaSlice<u8>>,
@@ -218,88 +222,61 @@ impl Default for ResidentFfnGraphCache {
     }
 }
 
-/// The resident decode arena: two stable hidden-state ping-pong buffers +
-/// the dedicated capture/replay stream.
+/// The resident decode arena: two stable hidden-state ping-pong buffers.
 ///
 /// Allocated once per generation (lazily, at the first decode token where the
-/// graph path is eligible). The two `[hidden]` buffers are the I/O slots the
-/// attention block and the FFN graph write into by stable address; their
-/// contents change every token but their addresses are fixed for the arena's
-/// lifetime (B3A review point 2 — the graph never owns these; the arena does).
+/// graph path is eligible) on the runtime stream. The two `[hidden]` buffers
+/// are the I/O slots the attention block and the FFN graph write into by stable
+/// address; their contents change every token but their addresses are fixed
+/// for the arena's lifetime (graph capture binds these addresses).
 ///
-/// **Ownership**:
-/// - `hidden_a` / `hidden_b`: owned here. Attention writes one; the FFN graph
-///   writes the other. The `flip` flag tracks which is "current input".
-/// - `cap_stream`: the dedicated non-NULL stream for capture + replay.
-///
-/// **Cross-stream sync**: attention runs on the runtime's NULL stream; the
-/// graph replays on `cap_stream`. The decode loop inserts a sync between them
-/// at each layer boundary (see the pipeline integration in B3A-5).
+/// **Ownership / flip semantics** (B3B single stream):
+/// - `hidden_a` / `hidden_b`: owned here. Per layer `flip = li % 2 == 1`:
+///   `input(flip)` is the layer's hidden input AND the FFN graph's input slot
+///   (attention writes its post-attn residual into it in place);
+///   `output(flip)` is the FFN graph's output slot and equals
+///   `input(¬flip)` (the next layer's input). Layer 0 re-uploads each
+///   token's embedding into `input(false)` (an HtoD, not a D2D).
+/// - There is no longer a dedicated capture stream: capture + replay run on
+///   the runtime stream (`CudaRuntime::stream`), so layer-to-layer ordering is
+///   by stream submission alone (zero per-layer D2D, zero cross-stream syncs).
 pub(crate) struct ResidentDecodeArena {
-    /// Stable hidden-state buffer A `[hidden]`.
+    /// Stable hidden-state buffer A `[hidden]` = `input(false)` / `output(true)`.
     pub(crate) hidden_a: CudaSlice<f32>,
-    /// Stable hidden-state buffer B `[hidden]`.
+    /// Stable hidden-state buffer B `[hidden]` = `input(true)` / `output(false)`.
     pub(crate) hidden_b: CudaSlice<f32>,
-    /// The dedicated capture/replay stream (non-NULL, event-tracking disabled).
-    pub(crate) cap_stream: Arc<CudaStream>,
     /// The generation this arena was allocated for. Stale after a reset.
     pub(crate) generation: GraphGenerationId,
 }
 
 impl ResidentDecodeArena {
-    /// Allocate the arena for a generation: two `[hidden]` buffers + a
-    /// dedicated capture stream. Disables event tracking on the context so
-    /// graph buffers don't carry `CudaEvent` handles (which would break
-    /// capture — see B3A-SMOKE finding #2).
-    ///
-    /// SAFETY: `disable_event_tracking` is unsafe because slices created
-    /// before the call won't be tracked. The arena creates all its buffers
-    /// AFTER this call, and the decode path is single-threaded, so all
-    /// cross-stream synchronization is explicit (managed by the pipeline's
-    /// layer-boundary syncs). This is the documented configuration for graph
-    /// capture.
+    /// Allocate the arena for a generation: two `[hidden]` buffers on the
+    /// runtime stream. Event tracking is already disabled context-wide at
+    /// runtime init (B3B), so the buffers carry no `CudaEvent` handles —
+    /// capture-safe with no further action.
     pub(crate) fn new(
         runtime: &CudaRuntime,
         hidden: usize,
         generation: GraphGenerationId,
     ) -> Result<Self, RuntimeError> {
-        let ctx = runtime.stream().context().clone();
-        let cap_stream = ctx
-            .new_stream()
-            .map_err(|err| RuntimeError::context("creating graph capture stream", err))?;
-        // Disable event tracking so graph buffers carry no CudaEvent handles.
-        // SAFETY: the arena manages all synchronization explicitly on cap_stream
-        // + the runtime stream; no graph buffer is used on a third stream.
-        // Created BEFORE the buffers below so they carry no events.
-        unsafe {
-            cap_stream.context().disable_event_tracking();
-        }
-        let hidden_a = cap_stream
+        let stream = runtime.stream();
+        let hidden_a = stream
             .alloc_zeros::<f32>(hidden)
             .map_err(|err| RuntimeError::context("allocating arena hidden_a", err))?;
-        let hidden_b = cap_stream
+        let hidden_b = stream
             .alloc_zeros::<f32>(hidden)
             .map_err(|err| RuntimeError::context("allocating arena hidden_b", err))?;
         Ok(Self {
             hidden_a,
             hidden_b,
-            cap_stream,
             generation,
         })
     }
 
-    /// The "input" buffer for the current layer (the one attention just wrote).
-    /// Layers alternate: even layers read A, odd layers read B (flip by index).
-    /// Returns `&mut` so the graph-build/replay path can D2D-copy into it.
-    pub(crate) fn input_mut(&mut self, flip: bool) -> &mut CudaSlice<f32> {
-        if flip {
-            &mut self.hidden_b
-        } else {
-            &mut self.hidden_a
-        }
-    }
-
-    /// Borrow the input buffer immutably (for graph capture — the graph reads it).
+    /// Borrow the input buffer immutably. The layer's hidden input AND the FFN
+    /// graph's input slot: attention reads it for the input norm, then writes
+    /// its post-attn residual into it in place (`launch_residual_add_inplace_
+    /// into`), and the graph reads the post-attn residual from this address.
     pub(crate) fn input(&self, flip: bool) -> &CudaSlice<f32> {
         if flip {
             &self.hidden_b
@@ -308,21 +285,24 @@ impl ResidentDecodeArena {
         }
     }
 
-    /// Borrow the output buffer immutably (for reading after graph replay).
+    /// Borrow the input buffer mutably — for the layer-0 HtoD upload of the
+    /// embedding and for re-entry placement of a carried device buffer.
+    pub(crate) fn input_mut(&mut self, flip: bool) -> &mut CudaSlice<f32> {
+        if flip {
+            &mut self.hidden_b
+        } else {
+            &mut self.hidden_a
+        }
+    }
+
+    /// Borrow the output buffer immutably. The FFN graph writes the post-FFN
+    /// state here; it equals `input(¬flip)` (the next layer's input). The
+    /// final layer's output is read back here for the lm-head input.
     pub(crate) fn output(&self, flip: bool) -> &CudaSlice<f32> {
         if flip {
             &self.hidden_a
         } else {
             &self.hidden_b
-        }
-    }
-
-    /// Borrow the output buffer mutably (for graph capture — the graph writes it).
-    pub(crate) fn output_mut(&mut self, flip: bool) -> &mut CudaSlice<f32> {
-        if flip {
-            &mut self.hidden_a
-        } else {
-            &mut self.hidden_b
         }
     }
 
@@ -339,15 +319,5 @@ impl ResidentDecodeArena {
         } else {
             (&self.hidden_a, &mut self.hidden_b)
         }
-    }
-
-    /// Synchronize the capture stream with the runtime stream: the capture
-    /// stream waits for the runtime stream to finish writing the arena input.
-    /// Called before graph replay when the input was produced on the runtime
-    /// stream.
-    fn _doc_anchor(&self) {
-        // Method exists to anchor the cross-stream sync documentation; the
-        // actual sync is performed in the pipeline where both streams are
-        // accessible. See `CudaBackend::sync_graph_input` in pipeline.rs.
     }
 }

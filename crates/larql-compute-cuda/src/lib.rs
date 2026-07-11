@@ -39,6 +39,22 @@ pub fn cuda_backend_with_options(options: BackendOptions) -> Result<CudaBackend,
 }
 
 #[cfg(test)]
+/// LARQL-GPU-B3B: process-wide serialization lock for tests that perform
+/// CUDA stream capture (the dedicated smoke tests in
+/// `backend::runtime::b3b_single_stream_tests` and the `graph_q4km_*`
+/// pipeline tests in `tests`). All CUDA tests share the device-0 **primary**
+/// context (`CudaContext::new` retains it), and the CUDA driver does not
+/// support two concurrent stream captures on the same context — so two
+/// capture-performing tests running in parallel threads race with
+/// `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`. (Concurrent capture-vs-sync is
+/// handled by `RELAXED` capture mode — see `ffn_graph::graph_capture_mode` —
+/// which permits `cuStreamSynchronize` on non-capturing streams; this lock
+/// only needs to serialize capture-performing tests against each other.)
+/// Capture tests acquire it for their whole body so no two capture windows
+/// overlap on the shared context.
+pub(crate) static CUDA_CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use larql_compute::cpu::ops::q4_common::{quantize_q4_0, quantize_to_q8};
@@ -5607,6 +5623,9 @@ mod tests {
             );
             return;
         }
+        // Serialize vs other capture tests (concurrent stream capture on the
+        // shared primary context is not supported — see CUDA_CAPTURE_TEST_LOCK).
+        let _g = crate::CUDA_CAPTURE_TEST_LOCK.lock().unwrap();
         let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
         let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
         let (weights, index, _seq_len, hidden, inter, _) =
@@ -5660,6 +5679,7 @@ mod tests {
             eprintln!("graph_multi_token: LARQL_CUDA_GRAPHS not set — skipping");
             return;
         }
+        let _g = crate::CUDA_CAPTURE_TEST_LOCK.lock().unwrap();
         let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
         let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
         let (weights, index, _seq_len, hidden, inter, _) =
@@ -5713,6 +5733,7 @@ mod tests {
             eprintln!("graph_reset: LARQL_CUDA_GRAPHS not set — skipping");
             return;
         }
+        let _g = crate::CUDA_CAPTURE_TEST_LOCK.lock().unwrap();
         let num_layers = larql_models::test_fixtures::Q4K_TEST_NUM_LAYERS;
         let token_ids = resident_kv_prompt(RESIDENT_KV_PROMPT_LEN);
         let (weights, index, _seq_len, hidden, inter, _) =

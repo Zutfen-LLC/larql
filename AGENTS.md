@@ -96,6 +96,7 @@ cargo build --release --features gpu              # GPU backend (Metal today; Vu
 cargo test                                        # entire workspace
 cargo test -p larql-lql                           # single crate (272 tests)
 cargo test -p larql-inference --features gpu      # +GPU tests (Metal on Apple Silicon)
+cargo test -p larql-compute-cuda -- --test-threads=1   # CUDA backend (Linux+NVIDIA); single-threaded like Metal (stream capture on the shared primary context is single-threaded). Set LARQL_CUDA_GRAPHS=0|1 to toggle FFN graph replay.
 cargo test -p <crate> <test_name>                 # single test
 make ci                                           # fmt-check + clippy -D warnings + test
 make fmt                                          # cargo fmt --all

@@ -149,6 +149,24 @@ impl DecodeHiddenState {
     }
 }
 
+/// Outcome of one B3B single-stream graph-path layer attempt. The decode loop
+/// branches on this to carry the hidden state correctly across the arena
+/// boundary (see [`CudaBackend::host_graph_decode_layer`]).
+enum GraphLayerOutcome {
+    /// The graph succeeded; the post-FFN hidden now lives in `arena.output(flip)`
+    /// (carried by the flip — no owned buffer to clone between graph layers).
+    ArenaOut { flip: bool },
+    /// The graph was attempted but failed AFTER attention already appended
+    /// K/V; the resident device FFN ran on the cloned post-attn state and
+    /// produced this owned buffer. The caller carries it as a
+    /// `DecodeHiddenState::Device`.
+    DeviceFallback(CudaSlice<f32>),
+    /// The graph path was not eligible/disabled, OR attention bailed before
+    /// appending K/V (the input hidden was restored). The caller runs the
+    /// existing non-graph attention + FFN path for this layer.
+    NotAttempted,
+}
+
 impl CudaBackend {
     /// Borrow the host KV mirror (allocate-empty on first access).
     pub(crate) fn lock_host_kv(&self) -> std::sync::MutexGuard<'_, HostKv> {
@@ -364,6 +382,10 @@ impl CudaBackend {
 
         let runtime = self.runtime()?;
         let mut h = DecodeHiddenState::Host(Array2::from_shape_vec((1, hidden), x.to_vec()).ok()?);
+        // B3B: when the graph path is active across consecutive layers, the
+        // hidden state lives in the arena (carried by flip) rather than in `h`.
+        // `Some(flip)` means the current hidden is `arena.output(flip)`.
+        let mut arena_out_flip: Option<bool> = None;
 
         for (li, layer) in layers.iter().enumerate() {
             // PLE / remote-FFN bail (same rationale as `host_decode_token`):
@@ -372,11 +394,87 @@ impl CudaBackend {
                 return None;
             }
 
-            // Resident path: device-resident hidden state through attention →
-            // (K/V host mirror append) → FFN, producing a device-resident
-            // post-layer hidden state. MoE layers stay host-shaped (the dense
-            // slab + outer combine is host-orchestrated), so resident hidden
-            // state is dense-only for this slice.
+            // ── B3B single-stream graph path (opt-in via LARQL_CUDA_GRAPHS=1) ──
+            // The whole layer — attention writing its post-attn residual in
+            // place into the arena input slot, the K/V host-mirror append, and
+            // the FFN graph build/replay — runs on the one runtime stream with
+            // zero per-layer D2D and zero cross-stream syncs. Falls back to the
+            // non-graph resident/host path when not eligible or on a bail.
+            let graph_eligible = layer.moe.is_none()
+                && h.hidden() == hidden
+                && self.resident_hidden_layer_eligible(layer, hidden, inter, li)
+                && self.graph_mode().enabled();
+            if graph_eligible {
+                match self.host_graph_decode_layer(
+                    runtime,
+                    layer,
+                    &mut h,
+                    &mut arena_out_flip,
+                    li,
+                    abs_position,
+                    hidden,
+                    inter,
+                    layers.len(),
+                ) {
+                    GraphLayerOutcome::ArenaOut { flip } => {
+                        arena_out_flip = Some(flip);
+                        let scalar = layer.layer_scalar;
+                        if scalar != 0.0 && scalar != 1.0 {
+                            // Rare non-identity per-layer scalar: read the
+                            // arena output back once, scale, carry host-side.
+                            let Some(v) = self.read_arena_output_to_host(runtime, flip, hidden)
+                            else {
+                                self.note_resident_hidden(false);
+                                return None;
+                            };
+                            let mut scaled = v;
+                            scaled.iter_mut().for_each(|x| *x *= scalar);
+                            h = DecodeHiddenState::Host(
+                                Array2::from_shape_vec((1, hidden), scaled).ok()?,
+                            );
+                            arena_out_flip = None;
+                        }
+                        self.note_resident_hidden(true);
+                        continue;
+                    }
+                    GraphLayerOutcome::DeviceFallback(dev) => {
+                        arena_out_flip = None;
+                        let scalar = layer.layer_scalar;
+                        if scalar != 0.0 && scalar != 1.0 {
+                            let mut hh = DecodeHiddenState::Device { dev, hidden };
+                            if !hh.ensure_host(runtime) {
+                                self.note_resident_hidden(false);
+                                return None;
+                            }
+                            let mut scaled = hh.as_host().clone();
+                            scaled.mapv_inplace(|v| v * scalar);
+                            h = DecodeHiddenState::Host(scaled);
+                        } else {
+                            h = DecodeHiddenState::Device { dev, hidden };
+                        }
+                        self.note_resident_hidden(true);
+                        continue;
+                    }
+                    GraphLayerOutcome::NotAttempted => { /* fall through below */ }
+                }
+            }
+
+            // Exiting the arena (a non-graph layer follows, or the graph path
+            // bailed): read the arena output back to host once (a boundary D2D,
+            // not per-layer steady state).
+            if let Some(f) = arena_out_flip.take() {
+                let v = match self.read_arena_output_to_host(runtime, f, hidden) {
+                    Some(v) => v,
+                    None => {
+                        self.note_resident_hidden(false);
+                        return None;
+                    }
+                };
+                h = DecodeHiddenState::Host(Array2::from_shape_vec((1, hidden), v).ok()?);
+            }
+
+            // Non-graph resident path: device-resident hidden state through
+            // attention → (K/V host mirror append) → resident device FFN.
             let resident_ok = layer.moe.is_none()
                 && h.hidden() == hidden
                 && self.resident_hidden_layer_eligible(layer, hidden, inter, li);
@@ -426,31 +524,17 @@ impl CudaBackend {
                         }
                     }
 
-                    // FFN chain consumes the device-resident post-attn state.
-                    // B3A-5: try the CUDA-Graph replay path first (opt-in via
-                    // LARQL_CUDA_GRAPHS=1). On `None` (disabled / ineligible /
-                    // build-or-replay failure), fall back to the existing
-                    // resident device FFN chain — never directly to CPU.
-                    let h_post_ffn_dev_opt = self.host_ffn_block_device_resident_graph(
+                    // FFN chain consumes the device-resident post-attn state
+                    // via the resident device FFN (the CUDA-graph path is
+                    // handled above in `host_graph_decode_layer`; this non-graph
+                    // branch never uses graphs).
+                    let h_post_ffn_dev_opt = self.host_ffn_block_device_resident(
                         runtime,
                         layer,
                         &h_post_attn_dev,
                         hidden,
                         inter,
-                        li,
-                        layers.len(),
                     );
-                    let h_post_ffn_dev_opt = if h_post_ffn_dev_opt.is_some() {
-                        h_post_ffn_dev_opt
-                    } else {
-                        self.host_ffn_block_device_resident(
-                            runtime,
-                            layer,
-                            &h_post_attn_dev,
-                            hidden,
-                            inter,
-                        )
-                    };
                     if let Some(h_post_ffn_dev) = h_post_ffn_dev_opt {
                         // Per-layer scalar (Gemma 4). Skip 0.0 (absent) and
                         // 1.0 (identity). When present and non-identity
@@ -579,6 +663,12 @@ impl CudaBackend {
         }
 
         // Final decode output: ensure host, return the `[hidden]` vector.
+        // B3B: if the last layer left the hidden in the arena, read it back
+        // here (the single end-of-token hidden readback).
+        if let Some(f) = arena_out_flip.take() {
+            let v = self.read_arena_output_to_host(runtime, f, hidden)?;
+            h = DecodeHiddenState::Host(Array2::from_shape_vec((1, hidden), v).ok()?);
+        }
         // LARQL-GPU-PROFILE-001: time the single end-of-token hidden-state
         // readback (the device→host copy that returns the decode output). This
         // is the cost B4 (device lm-head) would eliminate.
@@ -1755,23 +1845,27 @@ impl CudaBackend {
     /// `None` (caller falls back to the host path) when `h` isn't
     /// device-resident, the norm path bails, or any chained launch returns `Err`.
     #[allow(clippy::too_many_arguments)]
-    fn host_attention_block_device_resident(
+    /// The device-resident attention chain **up to the O projection** (B3B
+    /// extraction): input norm → Q/K/V proj → QK-norm/V-norm → RoPE → resident-
+    /// KV decode attention → O projection. Returns `(o_dev, k_new_row,
+    /// v_new_row)` with everything device-resident (the only host crossings are
+    /// the K/V row readbacks that maintain the host mirror — GPU-006 invariant).
+    ///
+    /// Shared by [`host_attention_block_device_resident`] (non-graph path:
+    /// fresh-buffer residual add) and [`attention_into_arena`] (B3B graph path:
+    /// in-place residual add into the arena input slot) so the Q/K/V → attention
+    /// → O chain has a single source and cannot drift between them. Any launch
+    /// error maps to `None` (the host path is the fallback).
+    #[allow(clippy::too_many_arguments)]
+    fn resident_attention_chain_to_o_dev(
         &self,
         runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
         layer: &FullPipelineLayer<'_>,
-        h: &DecodeHiddenState,
+        h_dev: &CudaSlice<f32>,
+        hidden: usize,
         li: usize,
         abs_position: usize,
     ) -> Option<(CudaSlice<f32>, Vec<f32>, Vec<f32>)> {
-        // The resident path needs the device-resident input hidden state.
-        let hidden = h.hidden();
-        let h_dev = match h {
-            DecodeHiddenState::Device { dev, .. } => dev,
-            DecodeHiddenState::Host(_) => return None,
-        };
-        if h_dev.len() != hidden {
-            return None;
-        }
         // RmsNorm-only (no LayerNorm device kernel) — the eligibility gate
         // already enforces this, but keep the defensive check.
         if layer.norm_type != NormType::RmsNorm {
@@ -1828,144 +1922,164 @@ impl CudaBackend {
         let qk_eps = larql_compute::residual::DEFAULT_EPS;
         let qk_off = layer.qk_norm_offset;
 
-        // Drive the device chain (mirrors `host_attention_block_device`). Any
-        // launch error maps to `None` (the host path is the fallback). All
+        // Drive the device chain (mirrors `host_attention_block_device`). All
         // launches run on the same stream (stream-ordered); intermediates are
         // distinct bindings kept alive until the block-end K/V readback.
-        let (o_dev, k_new_row, v_new_row): (CudaSlice<f32>, Vec<f32>, Vec<f32>) = {
-            // Q/K/V projections share the normed input resident.
-            let q_proj =
-                matvec_dev_by_fmt(runtime, qf, layer.wq.data, &h_norm_dev, q_dim, hidden).ok()?;
-            let k_proj =
-                matvec_dev_by_fmt(runtime, kf, layer.wk.data, &h_norm_dev, kv_dim, hidden).ok()?;
-            let v_proj =
-                matvec_dev_by_fmt(runtime, vf, layer.wv.data, &h_norm_dev, kv_dim, hidden).ok()?;
-            // QK-norm / V-norm (seq_len = 1 decode).
-            let q_normed = match layer.q_norm_weight {
-                Some(w) => runtime
-                    .launch_rms_norm_heads_dev(&q_proj, Some(w), 1, num_q, head_dim, qk_eps, qk_off)
-                    .ok()?,
-                None => q_proj,
-            };
-            let k_normed = match layer.k_norm_weight {
-                Some(w) => runtime
-                    .launch_rms_norm_heads_dev(
-                        &k_proj,
-                        Some(w),
-                        1,
-                        num_kv,
-                        head_dim,
-                        qk_eps,
-                        qk_off,
-                    )
-                    .ok()?,
-                None => k_proj,
-            };
-            let v_normed = if layer.has_v_norm {
-                runtime
-                    .launch_rms_norm_heads_dev(&v_proj, None, 1, num_kv, head_dim, qk_eps, 0.0)
-                    .ok()?
-            } else {
-                v_proj
-            };
-            // RoPE on Q and K at `abs_position`.
-            let inv_freq_dev = runtime.upload_f64(&inv_freq).ok()?;
-            let q_rope = runtime
-                .launch_rope_dev_with_invfreq(
-                    &inv_freq_dev,
-                    &q_normed,
-                    1,
-                    num_q,
-                    head_dim,
-                    half_rotary,
-                    abs_position,
-                    pos_div,
-                )
-                .ok()?;
-            let k_rope = runtime
-                .launch_rope_dev_with_invfreq(
-                    &inv_freq_dev,
-                    &k_normed,
-                    1,
-                    num_kv,
-                    head_dim,
-                    half_rotary,
-                    abs_position,
-                    pos_div,
-                )
-                .ok()?;
-            // Read back the new K/V row (host mirror append + state dump +
-            // GPU-006 invariant — unchanged from `host_attention_block_device`).
-            let k_new_row = runtime.sync_dtoh_f32(&k_rope).ok()?;
-            let v_new_row = runtime.sync_dtoh_f32(&v_normed).ok()?;
-            if k_new_row.len() != kv_dim || v_new_row.len() != kv_dim {
-                return None;
-            }
-            // GPU-006: prefer the resident-KV device path (unchanged).
-            let resident = self.resident_kv_decode_attention(
-                runtime,
-                li,
-                &q_rope,
-                &k_new_row,
-                &v_new_row,
-                prev,
-                scale as f32,
-                softcap_opt,
+        // Q/K/V projections share the normed input resident.
+        let q_proj =
+            matvec_dev_by_fmt(runtime, qf, layer.wq.data, &h_norm_dev, q_dim, hidden).ok()?;
+        let k_proj =
+            matvec_dev_by_fmt(runtime, kf, layer.wk.data, &h_norm_dev, kv_dim, hidden).ok()?;
+        let v_proj =
+            matvec_dev_by_fmt(runtime, vf, layer.wv.data, &h_norm_dev, kv_dim, hidden).ok()?;
+        // QK-norm / V-norm (seq_len = 1 decode).
+        let q_normed = match layer.q_norm_weight {
+            Some(w) => runtime
+                .launch_rms_norm_heads_dev(&q_proj, Some(w), 1, num_q, head_dim, qk_eps, qk_off)
+                .ok()?,
+            None => q_proj,
+        };
+        let k_normed = match layer.k_norm_weight {
+            Some(w) => runtime
+                .launch_rms_norm_heads_dev(&k_proj, Some(w), 1, num_kv, head_dim, qk_eps, qk_off)
+                .ok()?,
+            None => k_proj,
+        };
+        let v_normed = if layer.has_v_norm {
+            runtime
+                .launch_rms_norm_heads_dev(&v_proj, None, 1, num_kv, head_dim, qk_eps, 0.0)
+                .ok()?
+        } else {
+            v_proj
+        };
+        // RoPE on Q and K at `abs_position`.
+        let inv_freq_dev = runtime.upload_f64(&inv_freq).ok()?;
+        let q_rope = runtime
+            .launch_rope_dev_with_invfreq(
+                &inv_freq_dev,
+                &q_normed,
+                1,
                 num_q,
+                head_dim,
+                half_rotary,
+                abs_position,
+                pos_div,
+            )
+            .ok()?;
+        let k_rope = runtime
+            .launch_rope_dev_with_invfreq(
+                &inv_freq_dev,
+                &k_normed,
+                1,
                 num_kv,
                 head_dim,
-                kv_dim,
-                reps,
-            );
-            let attn_dev = match resident {
-                Ok(Some(out)) => {
-                    self.note_resident_kv_decode(true);
-                    out
-                }
-                Ok(None) => {
-                    self.note_resident_kv_decode(false);
-                    self.decode_attention_full_upload(
-                        runtime,
-                        li,
-                        &q_rope,
-                        &k_new_row,
-                        &v_new_row,
-                        prev,
-                        total_len,
-                        kv_dim,
-                        num_q,
-                        head_dim,
-                        reps,
-                        scale as f32,
-                        softcap_opt,
-                    )
-                    .ok()?
-                }
-                Err(_) => {
-                    self.note_resident_kv_decode(false);
-                    self.decode_attention_full_upload(
-                        runtime,
-                        li,
-                        &q_rope,
-                        &k_new_row,
-                        &v_new_row,
-                        prev,
-                        total_len,
-                        kv_dim,
-                        num_q,
-                        head_dim,
-                        reps,
-                        scale as f32,
-                        softcap_opt,
-                    )
-                    .ok()?
-                }
-            };
-            // O projection: resident attention output → [hidden], stays resident.
-            let o_dev =
-                matvec_dev_by_fmt(runtime, of, layer.wo.data, &attn_dev, hidden, q_dim).ok()?;
-            (o_dev, k_new_row, v_new_row)
+                half_rotary,
+                abs_position,
+                pos_div,
+            )
+            .ok()?;
+        // Read back the new K/V row (host mirror append + state dump +
+        // GPU-006 invariant — unchanged from `host_attention_block_device`).
+        let k_new_row = runtime.sync_dtoh_f32(&k_rope).ok()?;
+        let v_new_row = runtime.sync_dtoh_f32(&v_normed).ok()?;
+        if k_new_row.len() != kv_dim || v_new_row.len() != kv_dim {
+            return None;
+        }
+        // GPU-006: prefer the resident-KV device path (unchanged).
+        let resident = self.resident_kv_decode_attention(
+            runtime,
+            li,
+            &q_rope,
+            &k_new_row,
+            &v_new_row,
+            prev,
+            scale as f32,
+            softcap_opt,
+            num_q,
+            num_kv,
+            head_dim,
+            kv_dim,
+            reps,
+        );
+        let attn_dev = match resident {
+            Ok(Some(out)) => {
+                self.note_resident_kv_decode(true);
+                out
+            }
+            Ok(None) => {
+                self.note_resident_kv_decode(false);
+                self.decode_attention_full_upload(
+                    runtime,
+                    li,
+                    &q_rope,
+                    &k_new_row,
+                    &v_new_row,
+                    prev,
+                    total_len,
+                    kv_dim,
+                    num_q,
+                    head_dim,
+                    reps,
+                    scale as f32,
+                    softcap_opt,
+                )
+                .ok()?
+            }
+            Err(_) => {
+                self.note_resident_kv_decode(false);
+                self.decode_attention_full_upload(
+                    runtime,
+                    li,
+                    &q_rope,
+                    &k_new_row,
+                    &v_new_row,
+                    prev,
+                    total_len,
+                    kv_dim,
+                    num_q,
+                    head_dim,
+                    reps,
+                    scale as f32,
+                    softcap_opt,
+                )
+                .ok()?
+            }
         };
+        // O projection: resident attention output → [hidden], stays resident.
+        let o_dev = matvec_dev_by_fmt(runtime, of, layer.wo.data, &attn_dev, hidden, q_dim).ok()?;
+        Some((o_dev, k_new_row, v_new_row))
+    }
+
+    /// Resident attention block for a single decode step (non-graph path):
+    /// runs [`resident_attention_chain_to_o_dev`] then the post-attn norm +
+    /// residual into a **fresh** device buffer. This is the resident-hidden
+    /// parity path + the fallback for the B3B graph path. Returns
+    /// `(h_post_attn_dev, k_new_row, v_new_row)`.
+    fn host_attention_block_device_resident(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        layer: &FullPipelineLayer<'_>,
+        h: &DecodeHiddenState,
+        li: usize,
+        abs_position: usize,
+    ) -> Option<(CudaSlice<f32>, Vec<f32>, Vec<f32>)> {
+        // The resident path needs the device-resident input hidden state.
+        let hidden = h.hidden();
+        let h_dev = match h {
+            DecodeHiddenState::Device { dev, .. } => dev,
+            DecodeHiddenState::Host(_) => return None,
+        };
+        if h_dev.len() != hidden {
+            return None;
+        }
+        let (o_dev, k_new_row, v_new_row) = self.resident_attention_chain_to_o_dev(
+            runtime,
+            layer,
+            h_dev,
+            hidden,
+            li,
+            abs_position,
+        )?;
 
         // Post-attention norm + residual on device (the resident-hidden
         // collapse: the residual base `h_dev` is resident, so no readback).
@@ -1990,6 +2104,73 @@ impl CudaBackend {
                 .ok()?
         };
         Some((h_post_attn_dev, k_new_row, v_new_row))
+    }
+
+    /// B3B single-stream graph path: resident attention block whose post-attn
+    /// residual is written **in place** into the arena input slot
+    /// (`arena.input(flip)`) via [`CudaRuntime::launch_residual_add_inplace_into`],
+    /// so the FFN graph reads the post-attn residual from the exact stable
+    /// address it captured — zero per-layer D2D seed copy. Runs the same
+    /// [`resident_attention_chain_to_o_dev`] as the non-graph path, then writes
+    /// `arena_input += res_mult * (post_attn_norm(o_dev) | o_dev)`. Returns the
+    /// new K/V rows for the host-mirror append (which happens between attention
+    /// and FFN, exactly as in the non-graph path).
+    ///
+    /// `arena_input` is borrowed by shared reference for the in-place add; the
+    /// device write happens through the `unsafe` kernel launch (element-wise
+    /// independent), and single-stream execution guarantees no concurrent
+    /// access. Returns `None` on any chain launch error (caller falls back to
+    /// the non-graph path before appending K/V).
+    fn attention_into_arena(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        layer: &FullPipelineLayer<'_>,
+        arena_input: &CudaSlice<f32>,
+        hidden: usize,
+        li: usize,
+        abs_position: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        let (o_dev, k_new_row, v_new_row) = self.resident_attention_chain_to_o_dev(
+            runtime,
+            layer,
+            arena_input,
+            hidden,
+            li,
+            abs_position,
+        )?;
+        // Post-attn norm + in-place residual into the arena input slot. The
+        // input norm earlier in the chain already consumed `arena_input` into a
+        // separate buffer, so reading it again here as the residual base is the
+        // original layer input; the in-place add leaves `arena_input` holding
+        // the post-attn residual that the FFN graph reads.
+        let res_mult = layer.residual_multiplier;
+        let stream = runtime.stream();
+        if layer.has_post_norms {
+            let normed_dev = runtime
+                .launch_rms_norm_dev(
+                    &o_dev,
+                    Some(layer.post_attn_norm),
+                    1,
+                    hidden,
+                    layer.eps as f64,
+                    layer.norm_offset,
+                )
+                .ok()?;
+            runtime
+                .launch_residual_add_inplace_into(
+                    stream,
+                    arena_input,
+                    &normed_dev,
+                    hidden,
+                    res_mult,
+                )
+                .ok()?;
+        } else {
+            runtime
+                .launch_residual_add_inplace_into(stream, arena_input, &o_dev, hidden, res_mult)
+                .ok()?;
+        }
+        Some((k_new_row, v_new_row))
     }
 
     /// One attention block for a single decode step:
@@ -2666,399 +2847,456 @@ impl CudaBackend {
         Some(h_post_ffn_dev)
     }
 
-    /// B3A-5: try the CUDA-Graph replay path for this layer's resident FFN.
+    // ───────────────────────────────────────────────────────────────────
+    // LARQL-GPU-B3B: single-stream CUDA-Graph decode layer. The whole graph
+    // path — attention into the arena input slot + K/V append + graph build/
+    // replay — runs on the one non-NULL runtime stream, replacing B3A's
+    // separate-cap_stream design and its per-layer D2D seed/output copies +
+    // cross-stream syncs with zero per-layer D2D and zero per-layer syncs.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// B3B: drive one graph-eligible decode layer on the single runtime stream.
     ///
-    /// On the first decode token of a generation: captures the 7-kernel FFN
-    /// chain into a `CudaGraph` on the arena's dedicated capture stream, then
-    /// **launches it** (token 1 must execute the graph after construction —
-    /// review point 1). On subsequent tokens: replays the existing executable
-    /// (one `graph.launch()` submission replaces 7 individual host launches).
-    /// Returns the post-FFN device-resident hidden state.
+    /// Runs the entire layer — place the hidden into the arena input slot,
+    /// resident attention writing its post-attn residual **in place** into that
+    /// slot, the K/V host-mirror append, then the FFN graph build (token 1) or
+    /// replay (token 2+) — and reports the outcome. The graph reads
+    /// `arena.input(flip)` (the in-place post-attn residual) and writes
+    /// `arena.output(flip)` (the next layer's input), so consecutive graph
+    /// layers carry hidden by flip alone with **zero per-layer D2D and zero
+    /// cross-stream syncs**.
     ///
-    /// **Cross-stream handoff**: attention ran on `runtime.stream` (the NULL
-    /// stream), producing `h_post_attn_dev`. The graph replays on the arena's
-    /// `cap_stream`. The handoff is: copy `h_post_attn_dev` into the arena's
-    /// stable input buffer (D2D, on the runtime stream) → `cap_stream` waits →
-    /// graph replay → runtime stream waits → copy the arena output out (D2D).
-    /// Each D2D is counted in `d2d_submissions` for honest accounting.
-    ///
-    /// **Fallback** (review point 10): any build/replay failure falls back to
-    /// [`host_ffn_block_device_resident`] (the existing resident device chain)
-    /// for this layer — never to CPU, never re-running attention or
-    /// double-appending KV. Returns `None` only when the graph path is disabled
-    /// or ineligible (so the caller proceeds exactly as before).
-    #[allow(clippy::too_many_lines)]
+    /// `arena_out_flip` is the carry: `Some(prev)` means the incoming hidden
+    /// already lives in `arena.output(prev)` (= `arena.input(this flip)`) from
+    /// the previous graph layer (no placement copy); `None` means the hidden is
+    /// in `h` (Host at layer 0, or a fresh Device after a non-graph/scalar
+    /// layer) and is placed into the arena (one HtoD upload at layer 0, one D2D
+    /// at a re-entry boundary — never per-layer in steady state).
     #[allow(clippy::too_many_arguments)]
-    fn host_ffn_block_device_resident_graph(
+    fn host_graph_decode_layer(
         &self,
         runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
         layer: &FullPipelineLayer<'_>,
-        h_post_attn_dev: &CudaSlice<f32>,
+        h: &mut DecodeHiddenState,
+        arena_out_flip: &mut Option<bool>,
+        li: usize,
+        abs_position: usize,
         hidden: usize,
         inter: usize,
-        li: usize,
         num_layers: usize,
-    ) -> Option<CudaSlice<f32>> {
+    ) -> GraphLayerOutcome {
+        use GraphLayerOutcome as O;
         // Gate 1: graph mode must be enabled (per-backend field, not env).
         if !self.graph_mode().enabled() {
-            return None;
+            return O::NotAttempted;
         }
-        // Gate 2: plan eligibility (reuse the existing checks so the graph path
-        // is a strict subset of the resident path — they can't diverge).
-        if h_post_attn_dev.len() != hidden {
-            return None;
-        }
+        // Gate 2: plan eligibility (a strict subset of the resident path so the
+        // two cannot diverge).
         if !Self::native_activation_worthwhile(inter) {
-            return None;
+            return O::NotAttempted;
         }
-        let gate_fmt = layer.gate.format;
-        let up_fmt = layer.up.format;
-        let down_fmt = layer.down.format;
-        if !supported_resident_ffn_triple(gate_fmt, up_fmt, down_fmt) {
-            return None;
+        if !supported_resident_ffn_triple(layer.gate.format, layer.up.format, layer.down.format) {
+            return O::NotAttempted;
         }
-        let stored_cols = down_stored_cols(layer, hidden, inter)?;
-        if stored_cols != inter || layer.norm_type != NormType::RmsNorm {
-            return None;
+        if down_stored_cols(layer, hidden, inter) != Some(inter)
+            || layer.norm_type != NormType::RmsNorm
+        {
+            return O::NotAttempted;
         }
 
-        // ── Ensure the arena is allocated for this generation ──
-        let gen = {
-            let cache = self.graph_cache.lock().ok()?;
-            cache.generation
+        // ── Ensure the arena + graph cache are ready for this generation ──
+        let gen = match self.graph_cache.lock() {
+            Ok(c) => c.generation,
+            Err(_) => return O::NotAttempted,
         };
         {
-            let mut arena_guard = self.arena.lock().ok()?;
+            let mut arena_guard = match self.arena.lock() {
+                Ok(g) => g,
+                Err(_) => return O::NotAttempted,
+            };
             let need_alloc = arena_guard
                 .as_ref()
                 .map(|a| a.generation != gen)
                 .unwrap_or(true);
             if need_alloc {
-                let arena =
-                    crate::ffn_graph_state::ResidentDecodeArena::new(runtime, hidden, gen).ok()?;
-                *arena_guard = Some(arena);
+                match crate::ffn_graph_state::ResidentDecodeArena::new(runtime, hidden, gen) {
+                    Ok(a) => *arena_guard = Some(a),
+                    Err(_) => return O::NotAttempted,
+                }
             }
         }
-        // Ensure the graph cache has a slot for this layer.
-        {
-            let mut cache = self.graph_cache.lock().ok()?;
+        if let Ok(mut cache) = self.graph_cache.lock() {
             cache.ensure_capacity(num_layers);
         }
 
-        // ── Replay path (token 2+) ──
-        let already_built = {
-            let cache = self.graph_cache.lock().ok()?;
-            cache.get(li).is_some()
-        };
-        if already_built {
-            return self.replay_ffn_graph(runtime, layer, h_post_attn_dev, hidden, li);
-        }
-
-        // ── Build path (token 1) ──
-        self.build_and_launch_ffn_graph(runtime, layer, h_post_attn_dev, hidden, inter, li, gen)
-    }
-
-    /// Replay an already-built FFN graph for one layer (B3A-5, token 2+).
-    fn replay_ffn_graph(
-        &self,
-        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
-        layer: &FullPipelineLayer<'_>,
-        h_post_attn_dev: &CudaSlice<f32>,
-        hidden: usize,
-        li: usize,
-    ) -> Option<CudaSlice<f32>> {
-        let mut arena_guard = self.arena.lock().ok()?;
-        let arena = arena_guard.as_mut()?;
         let flip = li % 2 == 1;
-        let cap_stream = arena.cap_stream.clone();
 
-        // The post-attn state was produced on the runtime stream; sync before
-        // cap_stream reads it. Counted as a graph cross-stream sync (point 3)
-        // — raw `synchronize()` bypasses `note_sync`.
-        runtime.stream().synchronize().ok()?;
-        self.note_graph_cross_stream_sync();
-        // Seed the arena input buffer from h_post_attn_dev (D2D on cap_stream).
-        cap_stream
-            .memcpy_dtod(h_post_attn_dev, arena.input_mut(flip))
-            .ok()?;
-        self.note_graph_d2d();
-        let _ = hidden;
+        // ── Place the layer input into arena.input(flip) if not already there ──
+        // When continuing from a previous graph layer, the hidden already lives
+        // in arena.output(prev) = arena.input(flip); no copy. Otherwise place it
+        // (HtoD upload at layer 0 / a fresh-token entry; D2D only at a re-entry
+        // boundary after a non-graph layer).
+        if arena_out_flip.is_none() {
+            let placed = {
+                let mut arena_guard = match self.arena.lock() {
+                    Ok(g) => g,
+                    Err(_) => return O::NotAttempted,
+                };
+                let arena = match arena_guard.as_mut() {
+                    Some(a) => a,
+                    None => return O::NotAttempted,
+                };
+                let target = arena.input_mut(flip);
+                match &*h {
+                    DecodeHiddenState::Host(arr) => {
+                        let row: Vec<f32> = arr.row(0).to_vec();
+                        if row.len() != hidden {
+                            return O::NotAttempted;
+                        }
+                        // HtoD upload of the layer-0 embedding into the arena
+                        // slot (the normal token-boundary upload — NOT a D2D).
+                        if crate::options::gpu_profile_enabled() {
+                            runtime.note_htod(row.len() * 4);
+                        }
+                        runtime.stream().memcpy_htod(&row, target).is_ok()
+                    }
+                    DecodeHiddenState::Device { dev, .. } => {
+                        // Re-entry from a non-graph layer: one D2D to place the
+                        // carried device buffer into the arena (boundary only).
+                        if runtime.stream().memcpy_dtod(dev, target).is_ok() {
+                            self.note_graph_d2d();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            };
+            if !placed {
+                return O::NotAttempted;
+            }
+        }
 
-        // Replay (one submission replaces 7 host launches).
-        let replay_result = {
-            let cache = self.graph_cache.lock().ok()?;
-            let graph = cache.get(li)?;
-            graph.replay()
+        // ── Attention: read arena.input(flip), write post-attn residual in place ──
+        let attn = {
+            let arena_guard = match self.arena.lock() {
+                Ok(g) => g,
+                Err(_) => return O::NotAttempted,
+            };
+            let arena = match arena_guard.as_ref() {
+                Some(a) => a,
+                None => return O::NotAttempted,
+            };
+            let input = arena.input(flip);
+            self.attention_into_arena(runtime, layer, input, hidden, li, abs_position)
         };
-        match replay_result {
-            Ok(()) => {
-                self.note_graph_submission();
-                // B3A review point 8: logical_graph_kernel_executions must
-                // accumulate per launch (not just at build). The replayed
-                // graph executes `resident_ffn_node_count` physical nodes.
-                self.note_graph_logical_exec(resident_ffn_node_count(layer.has_post_norms));
-                // The graph wrote into the arena output on cap_stream. Sync
-                // before the runtime stream reads it.
-                cap_stream.synchronize().ok()?;
-                self.note_graph_cross_stream_sync();
-                let out = runtime.stream().clone_dtod(arena.output(flip)).ok()?;
-                self.note_graph_d2d();
-                drop(arena_guard);
-                Some(out)
+        let (k_new_row, v_new_row) = match attn {
+            Some(kv) => kv,
+            None => {
+                // Attention bailed before the K/V host-mirror append. Restore
+                // the hidden out of the arena so the non-graph path runs on it.
+                self.restore_hidden_from_arena(runtime, h, flip, hidden);
+                *arena_out_flip = None;
+                return O::NotAttempted;
             }
-            Err(_) => {
-                self.note_graph_fallback();
-                None // caller falls back to host_ffn_block_device_resident
+        };
+
+        // Append the new K/V row to the host mirror (GPU-006 invariant: between
+        // attention and FFN, exactly once).
+        self.append_kv_row_to_host_mirror(layer, li, &k_new_row, &v_new_row);
+
+        // ── FFN graph: build (token 1) or replay (token 2+) on the runtime stream ──
+        let already_built = self
+            .graph_cache
+            .lock()
+            .ok()
+            .map(|c| c.get(li).is_some())
+            .unwrap_or(false);
+        let graph_ok = if already_built {
+            self.replay_ffn_graph_single_stream(layer, li)
+        } else {
+            self.build_ffn_graph_single_stream(runtime, layer, flip, hidden, inter, li, gen)
+        };
+        if graph_ok {
+            return O::ArenaOut { flip };
+        }
+
+        // Graph failed AFTER attention already appended K/V. Clone the post-attn
+        // residual out of the arena input and run the resident device FFN on it
+        // (never re-attend — that would double-append K/V).
+        self.note_graph_fallback();
+        let h_post_attn_dev = {
+            let arena_guard = match self.arena.lock() {
+                Ok(g) => g,
+                Err(_) => return O::NotAttempted,
+            };
+            let arena = match arena_guard.as_ref() {
+                Some(a) => a,
+                None => return O::NotAttempted,
+            };
+            match runtime.stream().clone_dtod(arena.input(flip)) {
+                Ok(d) => d,
+                Err(_) => return O::NotAttempted,
             }
+        };
+        self.note_graph_d2d(); // honest: failure-path clone (not steady-state)
+        *arena_out_flip = None;
+        match self.host_ffn_block_device_resident(runtime, layer, &h_post_attn_dev, hidden, inter) {
+            Some(dev) => O::DeviceFallback(dev),
+            None => O::NotAttempted,
         }
     }
 
-    /// Build (capture) the FFN graph for one layer and launch it for token 1
-    /// (B3A-5, review point 1).
+    /// Build (capture) the FFN graph for one layer on the runtime stream and
+    /// launch it for token 1 (B3B single stream). The graph reads
+    /// `arena.input(flip)` (the in-place post-attn residual) and writes
+    /// `arena.output(flip)`. No seed D2D, no cross-stream sync.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::too_many_arguments)]
-    fn build_and_launch_ffn_graph(
+    fn build_ffn_graph_single_stream(
         &self,
         runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
         layer: &FullPipelineLayer<'_>,
-        h_post_attn_dev: &CudaSlice<f32>,
+        flip: bool,
         hidden: usize,
         inter: usize,
         li: usize,
         gen: crate::ffn_graph::GraphGenerationId,
-    ) -> Option<CudaSlice<f32>> {
+    ) -> bool {
         let gate_fmt = layer.gate.format;
         let up_fmt = layer.up.format;
         let down_fmt = layer.down.format;
+        let stream = runtime.stream();
 
-        // ── Warm the weight cache so captured nodes bind stable addresses ──
-        let gate_w = self
-            .resolve_weight_by_fmt(runtime, gate_fmt, layer.gate.data)
-            .ok()?;
-        let up_w = self
-            .resolve_weight_by_fmt(runtime, up_fmt, layer.up.data)
-            .ok()?;
-        let down_w = self
-            .resolve_weight_by_fmt(runtime, down_fmt, layer.down.data)
-            .ok()?;
+        // Warm the weight cache so captured nodes bind stable addresses.
+        let gate_w = match self.resolve_weight_by_fmt(runtime, gate_fmt, layer.gate.data) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        let up_w = match self.resolve_weight_by_fmt(runtime, up_fmt, layer.up.data) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        let down_w = match self.resolve_weight_by_fmt(runtime, down_fmt, layer.down.data) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
 
-        // ── Upload norm weights once (stable device addresses) ──
+        // Upload norm weights once (stable device addresses).
         let pre_norm_slice = if layer.has_post_norms {
             layer.pre_ffn_norm
         } else {
             Some(layer.post_attn_norm)
         };
-        let pre_norm_dev = runtime.upload_rms_norm_weight(pre_norm_slice).ok()?;
+        let pre_norm_dev = match runtime.upload_rms_norm_weight(pre_norm_slice) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
         let post_norm_dev = if layer.has_post_norms {
-            Some(runtime.upload_rms_norm_weight(layer.post_ffn_norm).ok()?)
+            match runtime.upload_rms_norm_weight(layer.post_ffn_norm) {
+                Ok(d) => Some(d),
+                Err(_) => return false,
+            }
         } else {
             None
         };
 
-        let mut arena_guard = self.arena.lock().ok()?;
-        let arena = arena_guard.as_mut()?;
-        let cap_stream = arena.cap_stream.clone();
-        let flip = li % 2 == 1;
-
-        // ── Allocate scratch buffers on cap_stream (event tracking disabled) ──
-        let mut normed_input = cap_stream.alloc_zeros::<f32>(hidden).ok()?;
-        let mut gate_out = cap_stream.alloc_zeros::<f32>(inter).ok()?;
-        let mut up_out = cap_stream.alloc_zeros::<f32>(inter).ok()?;
-        let mut act = cap_stream.alloc_zeros::<f32>(inter).ok()?;
-        let mut down_out = cap_stream.alloc_zeros::<f32>(hidden).ok()?;
+        // Scratch buffers allocated on the runtime stream (event tracking is
+        // disabled context-wide at init, so they carry no CudaEvent handles).
+        let mut normed_input = match stream.alloc_zeros::<f32>(hidden) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let mut gate_out = match stream.alloc_zeros::<f32>(inter) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let mut up_out = match stream.alloc_zeros::<f32>(inter) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let mut act = match stream.alloc_zeros::<f32>(inter) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let mut down_out = match stream.alloc_zeros::<f32>(hidden) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
         let mut post_norm_out = if layer.has_post_norms {
-            Some(cap_stream.alloc_zeros::<f32>(hidden).ok()?)
+            match stream.alloc_zeros::<f32>(hidden) {
+                Ok(d) => Some(d),
+                Err(_) => return false,
+            }
         } else {
             None
         };
 
-        // Seed the arena input buffer from h_post_attn_dev (D2D on cap_stream).
-        runtime.stream().synchronize().ok()?;
-        self.note_graph_cross_stream_sync();
-        cap_stream
-            .memcpy_dtod(h_post_attn_dev, arena.input_mut(flip))
-            .ok()?;
-        self.note_graph_d2d();
-        // Sync cap_stream before capture (drain the seed copy + ensure the
-        // input is visible).
-        cap_stream.synchronize().ok()?;
-        self.note_graph_cross_stream_sync();
+        // The arena buffers' device addresses are what the graph captures, so
+        // they must stay live (in `self.arena`) for the whole generation. Hold
+        // the arena lock through the capture so the `input_buf`/`output_buf_slot`
+        // borrows are valid for the captured `*_into` launches; the borrows end
+        // after the capture closure, and the guard drops at function return.
+        let mut arena_guard = match self.arena.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let (input_buf, output_buf_slot) = match arena_guard.as_mut() {
+            Some(a) => a.input_output_mut(flip),
+            None => return false,
+        };
 
-        let (input_buf, output_buf_slot) = arena.input_output_mut(flip);
-
-        // ── Capture ──
-        // GLOBAL: the strictest mode. A forbidden sync inside capture is a
-        // defect (review point 5), not something to tolerate via RELAXED.
-        //
-        // B3A review point 8: the `CaptureExitGuard` marks the runtime as
-        // mid-capture so the 7 `*_into` launches below do NOT inflate
-        // `direct_kernel_submissions` (`note_launch` is suppressed while the
-        // depth is non-zero). They become graph NODES, counted once at build
-        // via `note_graph_captured_nodes`. The guard decrements on drop so
-        // every return path balances.
+        // ── Capture on the runtime stream ──
+        // GLOBAL: the strictest mode; a forbidden sync inside capture is a
+        // defect. The CaptureExitGuard suppresses note_launch/note_htod/
+        // note_dtoh/note_sync for the captured 7 launches (they become graph
+        // NODES, counted once via note_graph_captured_nodes at build).
         let _capture_guard = CaptureExitGuard::enter(runtime.as_ref());
-        cap_stream
-            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
-            .ok()?;
-
-        // The 7 *_into launches, each writing into a stable scratch/output
-        // buffer. These are the exact same kernel-arg layouts the _dev path
-        // uses (validated by B3A-4's 200 passing parity tests).
+        if stream
+            .begin_capture(crate::ffn_graph::graph_capture_mode())
+            .is_err()
+        {
+            return false;
+        }
         let eps = layer.eps as f64;
         let offset = layer.norm_offset;
         let res_mult = layer.residual_multiplier;
-        let capture_ok = (|| {
-            // 1. Pre-FFN RMSNorm → normed_input.
-            runtime.launch_rms_norm_into(
-                &cap_stream,
-                input_buf,
-                &pre_norm_dev,
-                &mut normed_input,
-                1,
-                hidden,
-                eps,
-                offset,
-                if pre_norm_slice.is_some() { 1 } else { 0 },
-            )?;
-            // 2. Gate matvec → gate_out.
-            match gate_fmt {
-                QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
-                    &cap_stream,
-                    &gate_w,
-                    &normed_input,
-                    &mut gate_out,
-                    inter,
-                    hidden,
-                )?,
-                QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
-                    &cap_stream,
-                    &gate_w,
-                    &normed_input,
-                    &mut gate_out,
-                    inter,
-                    hidden,
-                )?,
-                _ => unreachable!("gate fmt checked above"),
-            }
-            // 3. Up matvec → up_out.
-            match up_fmt {
-                QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
-                    &cap_stream,
-                    &up_w,
-                    &normed_input,
-                    &mut up_out,
-                    inter,
-                    hidden,
-                )?,
-                QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
-                    &cap_stream,
-                    &up_w,
-                    &normed_input,
-                    &mut up_out,
-                    inter,
-                    hidden,
-                )?,
-                _ => unreachable!("up fmt checked above"),
-            }
-            // 4. Activation → act.
-            match (layer.ffn_type, layer.activation) {
-                (FfnType::Gated, Activation::Silu) => runtime.launch_geglu_silu_into(
-                    &cap_stream,
-                    &gate_out,
-                    &up_out,
-                    &mut act,
-                    inter,
-                )?,
-                (FfnType::Gated, Activation::GeluTanh) => runtime.launch_geglu_gelu_tanh_into(
-                    &cap_stream,
-                    &gate_out,
-                    &up_out,
-                    &mut act,
-                    inter,
-                )?,
-                (FfnType::Standard, Activation::Silu) => {
-                    runtime.launch_activation_silu_into(&cap_stream, &up_out, &mut act, inter)?
-                }
-                (FfnType::Standard, Activation::GeluTanh) => runtime
-                    .launch_activation_gelu_tanh_into(&cap_stream, &up_out, &mut act, inter)?,
-                _ => unreachable!("activation checked by plan_graph_eligible"),
-            }
-            // 5. Down matvec → down_out.
-            match down_fmt {
-                QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
-                    &cap_stream,
-                    &down_w,
-                    &act,
-                    &mut down_out,
-                    hidden,
-                    inter,
-                )?,
-                QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
-                    &cap_stream,
-                    &down_w,
-                    &act,
-                    &mut down_out,
-                    hidden,
-                    inter,
-                )?,
-                _ => unreachable!("down fmt checked above"),
-            }
-            // 6. Optional post-FFN RMSNorm → post_norm_out.
-            // 7. Residual add → output_buf.
-            if layer.has_post_norms {
-                let pno = post_norm_out.as_mut().unwrap();
+        let capture_ok =
+            (|| {
+                // 1. Pre-FFN RMSNorm → normed_input.
                 runtime.launch_rms_norm_into(
-                    &cap_stream,
-                    &down_out,
-                    post_norm_dev.as_ref().unwrap(),
-                    pno,
+                    stream,
+                    input_buf,
+                    &pre_norm_dev,
+                    &mut normed_input,
                     1,
                     hidden,
                     eps,
                     offset,
-                    if layer.post_ffn_norm.is_some() { 1 } else { 0 },
+                    if pre_norm_slice.is_some() { 1 } else { 0 },
                 )?;
-                runtime.launch_residual_add_into(
-                    &cap_stream,
-                    input_buf,
-                    pno,
-                    output_buf_slot,
-                    hidden,
-                    res_mult,
-                )
-            } else {
-                runtime.launch_residual_add_into(
-                    &cap_stream,
-                    input_buf,
-                    &down_out,
-                    output_buf_slot,
-                    hidden,
-                    res_mult,
-                )
-            }
-        })();
+                // 2. Gate matvec → gate_out.
+                match gate_fmt {
+                    QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
+                        stream,
+                        &gate_w,
+                        &normed_input,
+                        &mut gate_out,
+                        inter,
+                        hidden,
+                    )?,
+                    QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
+                        stream,
+                        &gate_w,
+                        &normed_input,
+                        &mut gate_out,
+                        inter,
+                        hidden,
+                    )?,
+                    _ => unreachable!("gate fmt checked above"),
+                }
+                // 3. Up matvec → up_out.
+                match up_fmt {
+                    QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
+                        stream,
+                        &up_w,
+                        &normed_input,
+                        &mut up_out,
+                        inter,
+                        hidden,
+                    )?,
+                    QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
+                        stream,
+                        &up_w,
+                        &normed_input,
+                        &mut up_out,
+                        inter,
+                        hidden,
+                    )?,
+                    _ => unreachable!("up fmt checked above"),
+                }
+                // 4. Activation → act.
+                match (layer.ffn_type, layer.activation) {
+                    (FfnType::Gated, Activation::Silu) => runtime
+                        .launch_geglu_silu_into(stream, &gate_out, &up_out, &mut act, inter)?,
+                    (FfnType::Gated, Activation::GeluTanh) => runtime
+                        .launch_geglu_gelu_tanh_into(stream, &gate_out, &up_out, &mut act, inter)?,
+                    (FfnType::Standard, Activation::Silu) => {
+                        runtime.launch_activation_silu_into(stream, &up_out, &mut act, inter)?
+                    }
+                    (FfnType::Standard, Activation::GeluTanh) => runtime
+                        .launch_activation_gelu_tanh_into(stream, &up_out, &mut act, inter)?,
+                    _ => unreachable!("activation checked by plan_graph_eligible"),
+                }
+                // 5. Down matvec → down_out.
+                match down_fmt {
+                    QuantFormat::Q4_K => runtime.launch_q4k_matvec_into(
+                        stream,
+                        &down_w,
+                        &act,
+                        &mut down_out,
+                        hidden,
+                        inter,
+                    )?,
+                    QuantFormat::Q6_K => runtime.launch_q6k_matvec_into(
+                        stream,
+                        &down_w,
+                        &act,
+                        &mut down_out,
+                        hidden,
+                        inter,
+                    )?,
+                    _ => unreachable!("down fmt checked above"),
+                }
+                // 6/7. Optional post-FFN RMSNorm + residual add → output_buf.
+                if layer.has_post_norms {
+                    let pno = post_norm_out.as_mut().unwrap();
+                    runtime.launch_rms_norm_into(
+                        stream,
+                        &down_out,
+                        post_norm_dev.as_ref().unwrap(),
+                        pno,
+                        1,
+                        hidden,
+                        eps,
+                        offset,
+                        if layer.post_ffn_norm.is_some() { 1 } else { 0 },
+                    )?;
+                    runtime.launch_residual_add_into(
+                        stream,
+                        input_buf,
+                        pno,
+                        output_buf_slot,
+                        hidden,
+                        res_mult,
+                    )
+                } else {
+                    runtime.launch_residual_add_into(
+                        stream,
+                        input_buf,
+                        &down_out,
+                        output_buf_slot,
+                        hidden,
+                        res_mult,
+                    )
+                }
+            })();
 
-        // The mutable borrows of the arena (input_buf, output_buf_slot) end
-        // here at the close of the closure scope. The graph captured the
-        // device addresses; the Rust handles are no longer needed.
-
-        // B3A review point 5: instantiate flags via
-        // [`crate::ffn_graph::graph_instantiate_flags`] (see its docs for the
-        // cudarc-0.19.8 proof that a non-zero flag is required).
-        let graph = match cap_stream.end_capture(crate::ffn_graph::graph_instantiate_flags()) {
+        // Instantiate with the cudarc-forced AUTO_FREE_ON_LAUNCH flag (see
+        // `ffn_graph::graph_instantiate_flags`).
+        let graph = match stream.end_capture(crate::ffn_graph::graph_instantiate_flags()) {
             Ok(Some(g)) => g,
             _ => {
                 self.note_graph_failure();
-                return None;
+                return false;
             }
         };
         if capture_ok.is_err() {
             self.note_graph_failure();
-            return None;
+            return false;
         }
         let _ = graph.upload(); // pre-stage the first launch
 
-        // ── Token 1: launch the just-built graph (review point 1) ──
         let entry = crate::ffn_graph_state::ResidentFfnGraph {
             graph: Some(graph),
             scratch: Some(crate::ffn_graph_state::ResidentFfnGraphScratch {
@@ -3077,34 +3315,153 @@ impl CudaBackend {
                 post_norm_weight: post_norm_dev,
             }),
         };
+        // Token 1: launch the just-built graph (capture does not execute).
         match entry.replay() {
             Ok(()) => {
-                // Counters: build + submission + captured nodes + logical exec.
                 self.note_graph_build();
                 self.note_graph_submission();
                 let node_count = resident_ffn_node_count(layer.has_post_norms);
                 self.note_graph_captured_nodes(node_count);
                 self.note_graph_logical_exec(node_count);
-                // Sync cap_stream before reading the output on the runtime stream.
-                cap_stream.synchronize().ok()?;
-                self.note_graph_cross_stream_sync();
-                let out = runtime.stream().clone_dtod(arena.output(flip)).ok()?;
-                self.note_graph_d2d();
-                // Store the entry for future replays (only if gen unchanged).
                 if let Ok(mut cache) = self.graph_cache.lock() {
                     if cache.generation == gen && li < cache.layers.len() {
                         cache.layers[li] = Some(entry);
                     }
                 }
-                Some(out)
+                true
             }
             Err(_) => {
                 self.note_graph_failure();
-                None
+                false
             }
         }
     }
 
+    /// Replay an already-built FFN graph for one layer on the runtime stream
+    /// (B3B, token 2+). The graph reads the in-place post-attn residual from
+    /// `arena.input(flip)` and writes `arena.output(flip)` — one submission,
+    /// no D2D, no cross-stream sync. (The graph stores the stream it was
+    /// captured on — the runtime stream — so `launch` lands there.)
+    fn replay_ffn_graph_single_stream(&self, layer: &FullPipelineLayer<'_>, li: usize) -> bool {
+        let replay_result = {
+            let cache = match self.graph_cache.lock() {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            match cache.get(li) {
+                Some(graph) => graph.replay(),
+                None => return false,
+            }
+        };
+        match replay_result {
+            Ok(()) => {
+                self.note_graph_submission();
+                self.note_graph_logical_exec(resident_ffn_node_count(layer.has_post_norms));
+                true
+            }
+            Err(_) => {
+                self.note_graph_fallback();
+                false
+            }
+        }
+    }
+
+    /// Append one new K/V row to the host mirror for layer `li` (the GPU-006
+    /// host-mirror invariant: between attention and FFN, exactly once). Shared
+    /// by the B3B graph path; the resident/host fallbacks inline the same logic.
+    fn append_kv_row_to_host_mirror(
+        &self,
+        layer: &FullPipelineLayer<'_>,
+        li: usize,
+        k_new_row: &[f32],
+        v_new_row: &[f32],
+    ) {
+        let prof = crate::options::gpu_profile_enabled();
+        let mt0 = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut rows_copied = 0usize;
+        {
+            let mut kv = self.lock_host_kv();
+            if let Some((k_cache, v_cache)) = kv.get_mut(li) {
+                let kv_dim = layer.num_kv_heads * layer.head_dim;
+                let prev = k_cache.shape()[0];
+                rows_copied = prev;
+                let mut k_new = Array2::zeros((prev + 1, kv_dim));
+                let mut v_new = Array2::zeros((prev + 1, kv_dim));
+                if prev > 0 {
+                    k_new.slice_mut(ndarray::s![..prev, ..]).assign(k_cache);
+                    v_new.slice_mut(ndarray::s![..prev, ..]).assign(v_cache);
+                }
+                k_new.slice_mut(ndarray::s![prev..prev + 1, ..]).assign(
+                    &Array2::from_shape_vec((1, kv_dim), k_new_row.to_vec())
+                        .expect("k_new_row shape"),
+                );
+                v_new.slice_mut(ndarray::s![prev..prev + 1, ..]).assign(
+                    &Array2::from_shape_vec((1, kv_dim), v_new_row.to_vec())
+                        .expect("v_new_row shape"),
+                );
+                *k_cache = k_new;
+                *v_cache = v_new;
+            }
+        }
+        if let Some(t0) = mt0 {
+            self.note_mirror_append(t0.elapsed().as_nanos() as u64, rows_copied);
+        }
+    }
+
+    /// Restore the hidden state out of `arena.input(flip)` into `h` as a device
+    /// buffer, after a graph-path attention bail (so the non-graph path runs on
+    /// the correct layer input). The arena slot holds the original layer input
+    /// when attention bails (the in-place residual is the last step of
+    /// `attention_into_arena` and only runs on success).
+    fn restore_hidden_from_arena(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        h: &mut DecodeHiddenState,
+        flip: bool,
+        hidden: usize,
+    ) {
+        let dev = {
+            let arena_guard = match self.arena.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let Some(arena) = arena_guard.as_ref() else {
+                return;
+            };
+            match runtime.stream().clone_dtod(arena.input(flip)) {
+                Ok(d) => d,
+                Err(_) => return,
+            }
+        };
+        self.note_graph_d2d(); // honest: bail-restore clone (failure path only)
+        *h = DecodeHiddenState::Device { dev, hidden };
+    }
+
+    /// Read `arena.output(flip)` back to the host (a DtoH readback — no D2D:
+    /// `sync_dtoh_f32` reads the arena buffer directly via the stream). Used when
+    /// exiting the arena (a non-graph layer follows, or the per-layer scalar is
+    /// non-identity, or the final token output).
+    fn read_arena_output_to_host(
+        &self,
+        runtime: &std::sync::Arc<crate::backend::CudaRuntime>,
+        flip: bool,
+        hidden: usize,
+    ) -> Option<Vec<f32>> {
+        let v = {
+            let arena_guard = self.arena.lock().ok()?;
+            let arena = arena_guard.as_ref()?;
+            runtime.sync_dtoh_f32(arena.output(flip)).ok()?
+        };
+        if v.len() == hidden {
+            Some(v)
+        } else {
+            None
+        }
+    }
     /// Resolve a quant weight through the cache by format (B3A-5 helper).
     fn resolve_weight_by_fmt(
         &self,
