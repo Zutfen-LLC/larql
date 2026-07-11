@@ -170,6 +170,35 @@ pub struct ProfileCountersSnapshot {
     pub d2d_submissions: u64,
     /// Explicit cross-stream `synchronize()` calls the graph path issues.
     pub graph_cross_stream_syncs: u64,
+    // ── LARQL-GPU-B4 device-greedy counters ─────────────────────────────
+    // Populated only by backends with a device-side greedy lm-head (CUDA
+    // today). Other backends leave them at the `Default` zero. Zero-cost
+    // when profiling is disabled (recorders gate on `gpu_profile_enabled()`).
+    /// B4 attempts: calls to `decode_token_greedy_q4k` on an eligible
+    /// plain-greedy step.
+    pub device_greedy_attempts: u64,
+    /// B4 engagements: the device returned a `DevicePick`.
+    pub device_greedy_engaged: u64,
+    /// B4 fallbacks: the device computed the hidden state but returned
+    /// `HostHidden` (final norm / lm-head / reduction ineligible).
+    pub device_greedy_fallbacks: u64,
+    /// B4 failures: the device could not even read back the hidden state.
+    pub device_greedy_failures: u64,
+    /// Full lm-head score-vector device→host copies on the host path (the
+    /// transfer B4 eliminates). Counted even when B4 is off so the two
+    /// paths can be compared.
+    pub lm_head_full_score_dtoh_copies: u64,
+    /// Bytes transferred by the full lm-head score-vector DtoH copies.
+    pub lm_head_full_score_dtoh_bytes: u64,
+    /// Fixed-size candidate-result device→host copies on the B4 path.
+    pub lm_head_result_dtoh_copies: u64,
+    /// Bytes transferred by the fixed-size candidate-result DtoH copies.
+    pub lm_head_result_dtoh_bytes: u64,
+    /// Final-hidden-state device→host readbacks on the host path (the
+    /// transfer B4 eliminates).
+    pub final_hidden_readbacks: u64,
+    /// Bytes transferred by the final-hidden-state readbacks.
+    pub final_hidden_readback_bytes: u64,
 }
 
 impl ProfileTimings {
@@ -473,6 +502,44 @@ pub trait DecodeBackend {
         None
     }
 
+    /// LARQL-GPU-B4 additive decode method: decode one token and, when
+    /// eligible, keep the final hidden state resident through the final
+    /// norm + Q4_K lm-head + top-K candidate reduction, returning a
+    /// fixed-size [`crate::backend::greedy::DeviceGreedyPick`] instead of
+    /// the full hidden vector. See [`crate::backend::greedy`] for the
+    /// contract and the descriptor shape.
+    ///
+    /// The default implementation preserves every existing backend: it
+    /// runs the ordinary `decode_token` and wraps the result in
+    /// [`crate::backend::greedy::GreedyDecodeOutput::HostHidden`] so the
+    /// caller runs the existing host final norm → lm-head → sample path.
+    /// Backends with a device-resident terminal path (CUDA) override this
+    /// to return [`crate::backend::greedy::GreedyDecodeOutput::DevicePick`]
+    /// when the runtime + descriptor + final norm are all eligible.
+    ///
+    /// **KV-append invariant**: on any failure after the transformer
+    /// layers have advanced the KV cache, the override MUST materialise the
+    /// already-computed final hidden state once and return `HostHidden`
+    /// (never `None` unless even that readback fails). Returning `None`
+    /// after KV advancement would let the engine re-run the transformer
+    /// layers and double-append K/V.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_token_greedy_q4k(
+        &self,
+        layers: &[crate::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        head: &crate::backend::greedy::GreedyQ4kHeadSpec<'_>,
+    ) -> Option<crate::backend::greedy::GreedyDecodeOutput> {
+        // Default: run the ordinary decode and hand the hidden state back
+        // to the host. This is behaviour-preserving for every backend
+        // without a device-resident terminal path.
+        let _ = head;
+        self.decode_token(layers, x, hidden, inter)
+            .map(crate::backend::greedy::GreedyDecodeOutput::HostHidden)
+    }
+
     /// Like `prefill_kquant` but replaces one attention head's residual contribution
     /// at `target_layer` with `replacement_delta` — the AHORD Mode D injection path.
     ///
@@ -767,5 +834,28 @@ mod tests {
         );
         // Default delegates to `prefill_kquant` (None).
         assert!(r.is_none());
+    }
+
+    // ── B4 decode_token_greedy_q4k default ─────────────────────────────
+
+    #[test]
+    fn default_decode_token_greedy_q4k_returns_none_when_decode_token_is_none() {
+        // StubDecode::decode_token is `None` by default, so the greedy
+        // method (which delegates to it) must also be `None`.
+        let b = StubDecode;
+        let layers = stub_layers();
+        let head = crate::backend::greedy::GreedyQ4kHeadSpec {
+            lm_head_bytes: &[],
+            hidden_size: 0,
+            physical_vocab_size: 0,
+            logical_vocab_size: 0,
+            final_norm_weight: None,
+            final_norm_eps: 1e-6,
+            final_norm_offset: 1.0,
+            candidate_width: 5,
+        };
+        assert!(b
+            .decode_token_greedy_q4k(&layers, &[0.0; 4], 4, 4, &head)
+            .is_none());
     }
 }

@@ -153,6 +153,11 @@ impl QuantMatVec for CudaBackend {
         hidden: usize,
     ) -> Option<Vec<f32>> {
         if let Ok(Some(native)) = self.native_q4k_matvec(q4k_data, x, num_rows, hidden) {
+            // LARQL-GPU-B4 diagnostic: this is the full score-vector DtoH
+            // the device-greedy path eliminates. The dominant decode-time
+            // caller is the host lm-head path; count it so the B4 engagement
+            // report can show the transfer going to zero when B4 engages.
+            self.note_lm_head_full_score_dtoh(num_rows * 4);
             return Some(native);
         }
         CPU.q4k_matvec(q4k_data, x, num_rows, hidden)
@@ -371,6 +376,33 @@ impl DecodeBackend for CudaBackend {
         self.host_decode_token_resident(layers, x, hidden, inter, pos)
     }
 
+    /// LARQL-GPU-B4 additive device-greedy decode. Delegates to the
+    /// device-resident terminal path in `pipeline.rs`, which runs the
+    /// resident layer loop, keeps the final hidden on-device, applies the
+    /// final RMSNorm + Q4_K lm-head + top-K reduction, and returns a
+    /// fixed-size `DevicePick` — or `HostHidden` for any dynamic
+    /// ineligibility. The KV-append invariant (never re-run the
+    /// transformer layers on failure) is upheld inside the pipeline method.
+    fn decode_token_greedy_q4k(
+        &self,
+        layers: &[larql_compute::FullPipelineLayer<'_>],
+        x: &[f32],
+        hidden: usize,
+        inter: usize,
+        head: &larql_compute::backend::greedy::GreedyQ4kHeadSpec<'_>,
+    ) -> Option<larql_compute::backend::greedy::GreedyDecodeOutput> {
+        if !self.native_runtime_available() {
+            // Scaffold: fall back to the ordinary decode → HostHidden
+            // (default-impl behaviour, but explicit so the attempt counter
+            // still records the B4 probe).
+            self.note_device_greedy_attempt();
+            let v = self.decode_token(layers, x, hidden, inter)?;
+            return Some(larql_compute::backend::greedy::GreedyDecodeOutput::HostHidden(v));
+        }
+        let pos = self.host_kv_len();
+        self.host_decode_token_greedy_q4k(layers, x, hidden, inter, pos, head)
+    }
+
     fn decode_token_with_state_dump(
         &self,
         layers: &[larql_compute::FullPipelineLayer<'_>],
@@ -476,6 +508,10 @@ impl ComputeBackend for CudaBackend {
                 info.push('\n');
                 info.push_str(&diag);
             }
+            if let Some(diag) = self.device_greedy_diag() {
+                info.push('\n');
+                info.push_str(&diag);
+            }
             if let Some(diag) = self.graph_diag() {
                 info.push('\n');
                 info.push_str(&diag);
@@ -504,12 +540,22 @@ impl ComputeBackend for CudaBackend {
         // path keeps everything `false` so callers route through the CPU
         // reference. `QuantMatVec` is advertised because the per-format
         // `supports_quant` reports Q4_K / Q6_K under the same gate.
+        //
+        // LARQL-GPU-B4: `DeviceGreedyLmHead` is advertised under the same
+        // native-runtime gate. The additive `decode_token_greedy_q4k` method
+        // still returns `HostHidden` per-call for any dynamic ineligibility
+        // (unsupported final norm, malformed Q4_K bytes, host-fallback
+        // decode, etc.), so advertising the capability is necessary but not
+        // sufficient.
         if !self.native_runtime_available() {
             return false;
         }
         matches!(
             cap,
-            Capability::QuantMatVec | Capability::DecodeToken | Capability::PrefillQ4
+            Capability::QuantMatVec
+                | Capability::DecodeToken
+                | Capability::PrefillQ4
+                | Capability::DeviceGreedyLmHead
         )
     }
 

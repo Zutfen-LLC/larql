@@ -10,8 +10,9 @@ use crate::ops::{
     ACTIVATION_GELU_TANH_CUDA_SRC, ACTIVATION_GELU_TANH_KERNEL, ACTIVATION_SILU_CUDA_SRC,
     ACTIVATION_SILU_KERNEL, DECODE_ATTENTION_CUDA_SRC, DECODE_ATTENTION_KERNEL, F16_GEMV_CUDA_SRC,
     F16_GEMV_KERNEL, F32_GEMV_CUDA_SRC, F32_GEMV_KERNEL, GEGGLU_GELU_TANH_CUDA_SRC,
-    GEGGLU_GELU_TANH_KERNEL, GEGGLU_SILU_CUDA_SRC, GEGGLU_SILU_KERNEL, KV_APPEND_CUDA_SRC,
-    KV_APPEND_KERNEL, PREFILL_ATTENTION_CUDA_SRC, PREFILL_ATTENTION_KERNEL,
+    GEGGLU_GELU_TANH_KERNEL, GEGGLU_SILU_CUDA_SRC, GEGGLU_SILU_KERNEL, GREEDY_TOPK_FINAL_CUDA_SRC,
+    GREEDY_TOPK_FINAL_KERNEL, GREEDY_TOPK_PARTIAL_CUDA_SRC, GREEDY_TOPK_PARTIAL_KERNEL,
+    KV_APPEND_CUDA_SRC, KV_APPEND_KERNEL, PREFILL_ATTENTION_CUDA_SRC, PREFILL_ATTENTION_KERNEL,
     Q4K_DUAL_MATVEC_CUDA_SRC, Q4K_DUAL_MATVEC_KERNEL, Q4K_MATMUL_CUDA_SRC, Q4K_MATMUL_KERNEL,
     Q4K_MATVEC_CUDA_SRC, Q4K_MATVEC_KERNEL, Q4_MATVEC_CUDA_SRC, Q4_MATVEC_KERNEL,
     Q4_VECMAT_CUDA_SRC, Q4_VECMAT_KERNEL, Q6K_MATMUL_CUDA_SRC, Q6K_MATMUL_KERNEL,
@@ -50,6 +51,9 @@ pub(crate) struct CudaRuntime {
     rope: CudaFunction,
     decode_attention: CudaFunction,
     prefill_attention: CudaFunction,
+    /// LARQL-GPU-B4 greedy top-K reduction kernels.
+    greedy_topk_partial: CudaFunction,
+    greedy_topk_final: CudaFunction,
     /// Persistent device-resident weight cache (see `weight_cache.rs`).
     /// Uploads each immutable weight matrix once and reuses the device buffer
     /// across calls — the first slice of the per-projection htod round-trip
@@ -97,7 +101,7 @@ impl CudaRuntime {
         // a single module load exposes all entry points (each kernel is
         // `extern "C"` with a distinct name).
         let combined_src = format!(
-            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}\n{RESIDUAL_ADD_CUDA_SRC}\n{ROPE_CUDA_SRC}\n{DECODE_ATTENTION_CUDA_SRC}\n{PREFILL_ATTENTION_CUDA_SRC}"
+            "{Q4K_MATVEC_CUDA_SRC}\n{Q6K_MATVEC_CUDA_SRC}\n{Q4K_MATMUL_CUDA_SRC}\n{Q6K_MATMUL_CUDA_SRC}\n{Q4K_DUAL_MATVEC_CUDA_SRC}\n{F32_GEMV_CUDA_SRC}\n{F16_GEMV_CUDA_SRC}\n{Q4_MATVEC_CUDA_SRC}\n{Q4_VECMAT_CUDA_SRC}\n{KV_APPEND_CUDA_SRC}\n{RMS_NORM_CUDA_SRC}\n{RMS_NORM_HEADS_CUDA_SRC}\n{GEGGLU_SILU_CUDA_SRC}\n{GEGGLU_GELU_TANH_CUDA_SRC}\n{ACTIVATION_SILU_CUDA_SRC}\n{ACTIVATION_GELU_TANH_CUDA_SRC}\n{RESIDUAL_ADD_CUDA_SRC}\n{ROPE_CUDA_SRC}\n{DECODE_ATTENTION_CUDA_SRC}\n{PREFILL_ATTENTION_CUDA_SRC}\n{GREEDY_TOPK_PARTIAL_CUDA_SRC}\n{GREEDY_TOPK_FINAL_CUDA_SRC}"
         );
         // Target the device's real compute capability (e.g. `compute_89`)
         // instead of NVRTC's default virtual arch — better SASS once the
@@ -172,6 +176,14 @@ impl CudaRuntime {
         let prefill_attention = module
             .load_function(PREFILL_ATTENTION_KERNEL.identifier)
             .map_err(|err| RuntimeError::context("loading prefill_attention CUDA function", err))?;
+        let greedy_topk_partial = module
+            .load_function(GREEDY_TOPK_PARTIAL_KERNEL.identifier)
+            .map_err(|err| {
+                RuntimeError::context("loading greedy_topk_partial CUDA function", err)
+            })?;
+        let greedy_topk_final = module
+            .load_function(GREEDY_TOPK_FINAL_KERNEL.identifier)
+            .map_err(|err| RuntimeError::context("loading greedy_topk_final CUDA function", err))?;
         // LARQL-GPU-B3B: the canonical runtime stream is a dedicated NON-NULL
         // stream. The NULL/default stream (`default_stream()` returns
         // `cu_stream = null_mut`) cannot be captured
@@ -225,11 +237,13 @@ impl CudaRuntime {
             rope,
             decode_attention,
             prefill_attention,
+            greedy_topk_partial,
+            greedy_topk_final,
             weight_cache: WeightCache::default(),
             profile: super::RuntimeProfile::default(),
             capture_depth: std::sync::atomic::AtomicUsize::new(0),
             summary: format!(
-                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}, NVRTC target {arch}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention loaded, remaining ops use CPU fallback; single non-NULL decode stream (B3B), CudaEvent tracking disabled"
+                "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}, NVRTC target {arch}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention/greedy_topk_partial/greedy_topk_final loaded, remaining ops use CPU fallback; single non-NULL decode stream (B3B), CudaEvent tracking disabled"
             ),
         })
     }
@@ -1819,7 +1833,10 @@ impl CudaRuntime {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn note_sync(&self) {
+    /// LARQL-GPU-B4 calls this directly when it syncs once for the
+    /// fixed-size result readback (it reads two small buffers with one
+    /// sync, so it can't use `sync_dtoh_f32`).
+    pub(crate) fn note_sync(&self) {
         use std::sync::atomic::Ordering;
         if self.capture_depth.load(Ordering::Relaxed) != 0 {
             return;
@@ -2727,6 +2744,176 @@ impl CudaRuntime {
             .map_err(|err| RuntimeError::context("launching CUDA rms_norm_dev kernel", err))?;
         self.note_launch();
         Ok(out_dev)
+    }
+
+    /// LARQL-GPU-B4: RMSNorm into a pre-allocated stable output buffer (the
+    /// greedy-head workspace's `normed_hidden`). The graph-capture-friendly
+    /// twin of [`launch_rms_norm_dev`]: writes into `out_dev` instead of
+    /// allocating a fresh `CudaSlice`, so the workspace is reused across
+    /// tokens without per-token allocation. Shares the kernel-arg layout
+    /// with `_dev` so the two cannot drift.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_rms_norm_into_dev(
+        &self,
+        x_dev: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        weight: Option<&[f32]>,
+        rows: usize,
+        cols: usize,
+        eps: f64,
+        offset: f32,
+    ) -> Result<(), RuntimeError> {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        if x_dev.len() != rows * cols || out_dev.len() != rows * cols {
+            return Err(RuntimeError::usage(format!(
+                "rms_norm_into_dev expected x_dev/out_dev of length {} (rows={rows} cols={cols}), got {}/{}",
+                rows * cols,
+                x_dev.len(),
+                out_dev.len()
+            )));
+        }
+        if let Some(w) = weight {
+            if w.len() != cols {
+                return Err(RuntimeError::usage(format!(
+                    "rms_norm_into_dev expected weight of length {cols}, got {}",
+                    w.len()
+                )));
+            }
+        }
+        let placeholder = [0.0f32];
+        let (weight_slice, has_weight): (&[f32], i32) = match weight {
+            Some(w) => (w, 1),
+            None => (&placeholder[..], 0),
+        };
+        let weight_dev = self
+            .stream
+            .clone_htod(weight_slice)
+            .map_err(|err| RuntimeError::context("uploading rms_norm_into_dev weight", err))?;
+        let block_dim = 1024u32;
+        let rows_u = rows as u32;
+        let cols_u = cols as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows_u, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.rms_norm);
+        launch_args
+            .arg(x_dev)
+            .arg(&weight_dev)
+            .arg(out_dev)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&eps)
+            .arg(&offset)
+            .arg(&has_weight);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA rms_norm_into_dev kernel", err))?;
+        self.note_launch();
+        Ok(())
+    }
+
+    /// LARQL-GPU-B4: partial top-K reduction over the logical-vocabulary
+    /// score buffer. Grid: `num_blocks` blocks of `GREEDY_BLOCK_SIZE`
+    /// threads. Each block writes `k` `(score, id)` pairs into
+    /// `partial_scores/partial_ids` at offset `block_idx * k`.
+    pub(crate) fn launch_greedy_topk_partial(
+        &self,
+        scores_dev: &CudaSlice<f32>,
+        partial_scores_dev: &mut CudaSlice<f32>,
+        partial_ids_dev: &mut CudaSlice<u32>,
+        logical_rows: usize,
+        num_blocks: usize,
+        k: usize,
+    ) -> Result<(), RuntimeError> {
+        if logical_rows == 0 {
+            return Ok(());
+        }
+        let k = k.min(crate::ops::GREEDY_MAX_K);
+        let partial_len = num_blocks.checked_mul(k).ok_or_else(|| {
+            RuntimeError::usage("greedy_topk_partial partial_len overflow".to_string())
+        })?;
+        if scores_dev.len() < logical_rows
+            || partial_scores_dev.len() < partial_len
+            || partial_ids_dev.len() < partial_len
+        {
+            return Err(RuntimeError::usage(format!(
+                "greedy_topk_partial buffer too small: scores>={logical_rows} got {}, partials>={partial_len} got {}/{}",
+                scores_dev.len(),
+                partial_scores_dev.len(),
+                partial_ids_dev.len()
+            )));
+        }
+        let logical_u = logical_rows as u32;
+        let k_u = k as u32;
+        let threads = crate::ops::GREEDY_BLOCK_SIZE as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks as u32, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.greedy_topk_partial);
+        launch_args
+            .arg(scores_dev)
+            .arg(partial_scores_dev)
+            .arg(partial_ids_dev)
+            .arg(&logical_u)
+            .arg(&k_u);
+        unsafe { launch_args.launch(cfg) }.map_err(|err| {
+            RuntimeError::context("launching CUDA greedy_topk_partial kernel", err)
+        })?;
+        self.note_launch();
+        Ok(())
+    }
+
+    /// LARQL-GPU-B4: final top-K reduction over the per-block partial
+    /// candidates. Single block, `GREEDY_BLOCK_SIZE` threads. Writes the
+    /// final sorted (descending) top-`k` into `result_scores/result_ids`.
+    pub(crate) fn launch_greedy_topk_final(
+        &self,
+        partial_scores_dev: &mut CudaSlice<f32>,
+        partial_ids_dev: &CudaSlice<u32>,
+        result_scores_dev: &mut CudaSlice<f32>,
+        result_ids_dev: &mut CudaSlice<u32>,
+        num_partials: usize,
+        k: usize,
+    ) -> Result<(), RuntimeError> {
+        let k = k.min(crate::ops::GREEDY_MAX_K);
+        if partial_scores_dev.len() < num_partials
+            || partial_ids_dev.len() < num_partials
+            || result_scores_dev.len() < k
+            || result_ids_dev.len() < k
+        {
+            return Err(RuntimeError::usage(format!(
+                "greedy_topk_final buffer too small: partials>={num_partials} got {}/{}, result>={k} got {}/{}",
+                partial_scores_dev.len(),
+                partial_ids_dev.len(),
+                result_scores_dev.len(),
+                result_ids_dev.len()
+            )));
+        }
+        let num_partials_u = num_partials as u32;
+        let k_u = k as u32;
+        let threads = crate::ops::GREEDY_BLOCK_SIZE as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch_args = self.stream.launch_builder(&self.greedy_topk_final);
+        launch_args
+            .arg(partial_scores_dev)
+            .arg(partial_ids_dev)
+            .arg(result_scores_dev)
+            .arg(result_ids_dev)
+            .arg(&num_partials_u)
+            .arg(&k_u);
+        unsafe { launch_args.launch(cfg) }
+            .map_err(|err| RuntimeError::context("launching CUDA greedy_topk_final kernel", err))?;
+        self.note_launch();
+        Ok(())
     }
 
     /// Upload an RMSNorm weight vector once, returning a stable device handle

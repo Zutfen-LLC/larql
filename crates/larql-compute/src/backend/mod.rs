@@ -31,6 +31,7 @@
 
 pub mod capability;
 pub mod decode;
+pub mod greedy;
 pub mod helpers;
 pub mod matmul;
 pub mod quant_matvec;
@@ -39,6 +40,7 @@ pub use capability::Capability;
 pub use decode::{
     DecodeBackend, DecodeStateDump, ProfileCountersSnapshot, ProfileTimings, StateDumpMask,
 };
+pub use greedy::{DeviceGreedyPick, GreedyDecodeOutput, GreedyQ4kHeadSpec};
 pub use helpers::{dot_proj_gpu, matmul_gpu};
 pub use matmul::{MatMul, MatMulOp};
 pub use quant_matvec::QuantMatVec;
@@ -215,6 +217,7 @@ mod tests {
             Capability::KvHandleNative,
             Capability::PerLayerEmbeddings,
             Capability::HybridAttention,
+            Capability::DeviceGreedyLmHead,
         ] {
             assert!(!b.supports(cap), "default supports must reject {cap:?}");
         }
