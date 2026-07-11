@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "slice": "LARQL-INFERENCE-TRUST-001A-ST1",
+  "date": "2026-07-11",
+  "starting_main_sha": "4391b41279acc9db0301d69d52663e318a409f19",
+  "repository": "unsloth/gemma-4-E2B-it-qat-q4_0-unquantized",
+  "remote_revision_observed": "397aea7eca1853d6f3d099a56612a68ffc0229ae",
+  "observed_from_exact_source": null,
+  "derived_from_config": null,
+  "derived_from_larql_architecture": {
+    "decoder_layers": 35,
+    "shape_validation_uses_per_layer_head_dimension": true,
+    "shape_validation_uses_per_layer_query_and_kv_head_counts": true,
+    "ple_contract_supported": true,
+    "k_equals_v_contract_supported": true
+  },
+  "synthetic_only_evidence": {
+    "metadata_preflight_implemented": true,
+    "normalized_collision_detection_implemented": true,
+    "unknown_decoder_rejection_implemented": true,
+    "multimodal_and_mtp_exclusion_implemented": true
+  },
+  "not_observed": [
+    "source file checksums",
+    "Transformers source-health output",
+    "prompt token IDs",
+    "generated token IDs",
+    "tensor count and dtype histogram",
+    "exact-source tensor classifications",
+    "exact-source tied-head evidence",
+    "exact-source preflight result"
+  ],
+  "counts": {
+    "tensor_count": null,
+    "required_tensor_count": null,
+    "multimodal_excluded": null,
+    "mtp_excluded": null,
+    "unknown_decoder": null,
+    "missing_required": null,
+    "shape_mismatches": null,
+    "normalized_name_duplicates": null
+  },
+  "decision": "RED",
+  "blockers": [
+    "Acquire the exact pinned source checkout and record every required file SHA-256 and byte size.",
+    "Run the Transformers oracle and establish COHERENT source health with exact token evidence.",
+    "Run the real-model inventory and preflight to classify every decoder tensor and resolve all contract findings."
+  ]
+}

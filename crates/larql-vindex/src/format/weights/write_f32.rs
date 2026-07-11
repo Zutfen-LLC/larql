@@ -75,6 +75,26 @@ pub struct WeightEntry {
 /// for parallel per-layer transforms without unsafe code. `dyn WeightSource`
 /// automatically inherits `Sync` from this supertrait bound.
 pub trait WeightSource: Sync {
+    /// Explicit `tie_word_embeddings` evidence from source configuration.
+    fn tied_embeddings(&self) -> Option<bool> {
+        None
+    }
+
+    /// Metadata inventory. In-memory/legacy sources may return an empty list;
+    /// safetensors sources override this without decoding tensor payloads.
+    fn tensor_metadata(&self) -> Vec<super::preflight::TensorMetadata> {
+        Vec::new()
+    }
+
+    /// Original names represented by a normalized key.
+    fn source_names(&self, key: &str) -> Vec<String> {
+        self.tensor_metadata()
+            .into_iter()
+            .filter(|m| m.normalized_name == key)
+            .map(|m| m.source_name)
+            .collect()
+    }
+
     /// Get a 2D weight tensor by normalized key. Returns (data, rows, cols).
     fn get_tensor(&self, key: &str) -> Option<(Vec<f32>, usize, usize)>;
 
@@ -141,6 +161,7 @@ pub struct StreamingWeights<'a> {
     pub tensor_index: &'a HashMap<String, (usize, String)>,
     pub arch: &'a dyn larql_models::ModelArchitecture,
     pub num_layers: usize,
+    pub tied_embeddings: Option<bool>,
 }
 
 impl<'a> StreamingWeights<'a> {
@@ -165,6 +186,26 @@ impl<'a> StreamingWeights<'a> {
 }
 
 impl<'a> WeightSource for StreamingWeights<'a> {
+    fn tied_embeddings(&self) -> Option<bool> {
+        self.tied_embeddings
+    }
+
+    fn tensor_metadata(&self) -> Vec<super::preflight::TensorMetadata> {
+        let mut result = Vec::with_capacity(self.tensor_index.len());
+        for (normalized_name, (shard_idx, source_name)) in self.tensor_index {
+            if let Ok(st) = safetensors::SafeTensors::deserialize(self.shard_mmaps[*shard_idx]) {
+                if let Ok(view) = st.tensor(source_name) {
+                    result.push(super::preflight::TensorMetadata {
+                        normalized_name: normalized_name.clone(),
+                        source_name: source_name.clone(),
+                        shape: view.shape().to_vec(),
+                    });
+                }
+            }
+        }
+        result
+    }
+
     fn get_tensor(&self, key: &str) -> Option<(Vec<f32>, usize, usize)> {
         let (data, shape) = self.read_tensor_raw(key)?;
         if shape.len() != 2 {
@@ -307,6 +348,15 @@ pub fn write_model_weights_with_opts(
     opts: WriteWeightsOptions,
     profiler: Option<&ExtractProfiler>,
 ) -> Result<(), VindexError> {
+    if super::preflight::is_gemma4_e2b(source.arch()) {
+        let preflight = super::preflight::validate_weight_source(
+            source,
+            super::preflight::SafetensorsPreflightOptions::default(),
+        );
+        if !preflight.is_valid() {
+            return Err(VindexError::Parse(preflight.diagnostic()));
+        }
+    }
     callbacks.on_stage(STAGE_MODEL_WEIGHTS);
     let start = std::time::Instant::now();
     let rec = Recorder::from(profiler);

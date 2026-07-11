@@ -262,6 +262,15 @@ pub fn write_model_weights_kquant_with_opts(
     opts: KquantWriteOptions,
     profiler: Option<&ExtractProfiler>,
 ) -> Result<(), VindexError> {
+    if super::preflight::is_gemma4_e2b(source.arch()) {
+        let preflight = super::preflight::validate_weight_source(
+            source,
+            super::preflight::SafetensorsPreflightOptions::default(),
+        );
+        if !preflight.is_valid() {
+            return Err(VindexError::Parse(preflight.diagnostic()));
+        }
+    }
     callbacks.on_stage(STAGE_MODEL_WEIGHTS_KQUANT);
     let start = std::time::Instant::now();
     let rec = Recorder::from(profiler);

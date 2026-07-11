@@ -60,6 +60,7 @@ pub(super) struct StreamingContext<'a> {
     pub(super) is_moe: bool,
     pub(super) n_experts: usize,
     pub(super) expert_format: larql_models::ExpertFormat,
+    pub(super) tied_embeddings: Option<bool>,
 
     // Mmap state (owned, set in `new`) — either safetensors-backed or
     // GGUF-backed. Stages call `tensor_source.get_tensor_f32(key)`; the
@@ -113,6 +114,20 @@ impl<'a> StreamingContext<'a> {
         let is_moe = arch.is_moe();
         let n_experts = arch.num_experts();
         let expert_format = arch.expert_format();
+        let tied_embeddings = std::fs::read_to_string(model_dir.join("config.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|config_json| {
+                config_json
+                    .get("text_config")
+                    .and_then(|text| text.get("tie_word_embeddings"))
+                    .and_then(serde_json::Value::as_bool)
+                    .or_else(|| {
+                        config_json
+                            .get("tie_word_embeddings")
+                            .and_then(serde_json::Value::as_bool)
+                    })
+            });
         let prefixes: Vec<String> = arch
             .key_prefixes_to_strip()
             .iter()
@@ -168,7 +183,12 @@ impl<'a> StreamingContext<'a> {
                     .map_err(|e| VindexError::Parse(e.to_string()))?;
                 for name in st.names() {
                     let key = normalize_key(name, &prefix_refs);
-                    tensor_index.insert(key.clone(), (shard_idx, name.to_string()));
+                    if let Some((prior_shard, prior_name)) = tensor_index.get(&key) {
+                        return Err(VindexError::Parse(format!(
+                            "safetensors extraction preflight failed; normalized duplicate {key}: shard {prior_shard} {prior_name}, shard {shard_idx} {name}"
+                        )));
+                    }
+                    tensor_index.insert(key, (shard_idx, name.to_string()));
                 }
             }
             TensorSource::Safetensors {
@@ -231,6 +251,7 @@ impl<'a> StreamingContext<'a> {
             is_moe,
             n_experts,
             expert_format,
+            tied_embeddings,
             tensor_source,
             checkpoint,
             layer_infos: Vec::new(),
