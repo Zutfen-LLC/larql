@@ -348,12 +348,14 @@ pub fn write_model_weights_with_opts(
     opts: WriteWeightsOptions,
     profiler: Option<&ExtractProfiler>,
 ) -> Result<(), VindexError> {
-    let preflight = super::preflight::validate_weight_source(
-        source,
-        super::preflight::SafetensorsPreflightOptions::default(),
-    );
-    if !preflight.is_valid() {
-        return Err(VindexError::Parse(preflight.diagnostic()));
+    if source.arch().family() == "gemma4" {
+        let preflight = super::preflight::validate_weight_source(
+            source,
+            super::preflight::SafetensorsPreflightOptions::default(),
+        );
+        if !preflight.is_valid() {
+            return Err(VindexError::Parse(preflight.diagnostic()));
+        }
     }
     callbacks.on_stage(STAGE_MODEL_WEIGHTS);
     let start = std::time::Instant::now();

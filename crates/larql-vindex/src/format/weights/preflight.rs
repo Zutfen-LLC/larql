@@ -142,12 +142,14 @@ fn expected_tensors(
         }
         add(&mut e, arch.attn_o_key(layer), vec![h, q]);
         add(&mut e, arch.input_layernorm_key(layer), vec![h]);
-        add(&mut e, arch.post_attention_layernorm_key(layer), vec![h]);
-        if let Some(key) = arch.pre_feedforward_layernorm_key(layer) {
-            add(&mut e, key, vec![h]);
-        }
-        if let Some(key) = arch.post_feedforward_layernorm_key(layer) {
-            add(&mut e, key, vec![h]);
+        if arch.has_post_norms() {
+            add(&mut e, arch.post_attention_layernorm_key(layer), vec![h]);
+            if let Some(key) = arch.pre_feedforward_layernorm_key(layer) {
+                add(&mut e, key, vec![h]);
+            }
+            if let Some(key) = arch.post_feedforward_layernorm_key(layer) {
+                add(&mut e, key, vec![h]);
+            }
         }
         if let Some(key) = arch.attn_q_norm_key(layer) {
             add(&mut e, key, vec![hd]);
