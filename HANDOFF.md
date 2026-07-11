@@ -753,7 +753,9 @@ graph state, cache, counters) is committed and tested; the pipeline integration
   dtoh=78.1/tok, syncs=78.1/tok, hidden_readback=2.31ms/tok, p50=130.3ms/tok,
   7.64 tok/s`. Confirms resident-KV + resident-hidden 100% active on the
   default Q4_K_M. FFN chain = 7 kernels/layer × 36 = 252 host submissions/token
-  (the graph-replay target → 36 graph submissions = ~34% structural reduction).
+  (the graph-replay target — but the realized honest reduction is only 18.2%,
+  since the cap_stream design adds ~36 graph submissions + ~72 D2D back; see
+  B3A-10/11).
 
 - **B3A-1**: cudarc 0.19.8 graph API audited — full lifecycle (begin_capture →
   end_capture → CudaGraph::launch → Drop) available via the safe API. No
@@ -797,20 +799,29 @@ graph state, cache, counters) is committed and tested; the pipeline integration
   with EXACT counter assertions). Q4_K_M parity < 1e-3 under GRAPHS=1.
 - **B3A-9** (regression): DONE. 204/204 pass both GRAPHS=0 and GRAPHS=1 (serial).
 - **B3A-10** (benchmark): DONE. Same-day A/B on real Qwen2.5-3B Q4_K_M.
-- **B3A-11** (gate): DONE. 36.6% submission reduction (≥25% ✅); −0.18%
-  wall-clock (≥1% ❌). **Graph stays opt-in (default Disabled).**
+- **B3A-11** (gate): DONE. **Accounting-corrected:** 18.2% honest TOTAL
+  submission reduction (≥25% ❌); flat wall-clock (≥1% ❌); +91% syncs (sync
+  gate ❌). **Graph stays opt-in (default Disabled).** The earlier "36.6%" was
+  the NULL-stream `launches` counter alone.
 - **B3A-12** (docs): DONE. Baseline report + completion-plan + this entry.
 
-### B3A-10 measured result (honest)
+### B3A-10 measured result (honest accounting, review points 3 + 8)
 
 | metric | GRAPHS=0 | GRAPHS=1 | gate |
 |---|---|---|---|
-| median p50 ms/tok | 121.99 | 122.21 | −0.18% (❌ ≥1%) |
-| launches/tok | 599.2 | 379.8 | −36.6% (✅ ≥25%) |
+| median p50 ms/tok | 121.54 | 121.52 | ≈0% (❌ ≥1%) |
+| **TOTAL host submissions/tok** | **622.9** | **509.7** | **−18.2% (❌ ≥25%)** |
+| launches/tok (NULL-stream, old headline) | 622.9 | 396.6 | −36.4% (not a gate metric) |
+| graph submissions/tok | 0 | 37.7 | +37.7 |
+| graph d2d/tok | 0 | 75.4 | +75.4 |
+| syncs + cross-stream/tok | 83.3 | 83.3 + 76.0 | +91% (❌ sync gate) |
 
-The 36.6% submission reduction is real but the cross-stream sync overhead
-(2 synchronize/layer = 72/token) offsets the launch savings. B3B (event-based
-sync or attention graphization) is the path to the ≥1% wall-clock gate.
+Under honest accounting the submission reduction is 18.2% — below the 25% gate
+— and the cross-stream design nearly doubles sync count. An earlier version of
+this entry reported "36.6% submission gate PASS"; that was the `launches`
+>counter only and double-counted token-1's captured nodes as direct launches.
+B3B (capture on a non-NULL **runtime** stream to drop the 2 D2D/layer +
+cross-stream syncs, or attention graphization) is the path to a net win.
 
 ### Key design constraints (from B3A review + smoke-test findings)
 
@@ -819,5 +830,6 @@ sync or attention graphization) is the path to the ≥1% wall-clock gate.
 - **D2D copies at the layer boundary** (seed input + read output) are counted
   in `d2d_submissions` and honest against the ≥25% gate. The zero-D2D design
   (attention's residual-add writes directly into the arena) is a B3B refinement.
-- **Default graph mode = Disabled** (B3A-11 gate: wall-clock improvement < 1%);
+- **Default graph mode = Disabled** (under honest accounting B3A delivers
+  neither gate: 18.2% submission < 25%, flat wall-clock < 1%, +91% syncs);
   opt-in via `LARQL_CUDA_GRAPHS=1`.

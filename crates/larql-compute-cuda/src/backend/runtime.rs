@@ -60,6 +60,16 @@ pub(crate) struct CudaRuntime {
     /// only mutated when `LARQL_GPU_PROFILE=1` (the `note_*` helpers gate on
     /// `gpu_profile_enabled()`).
     pub(crate) profile: super::RuntimeProfile,
+    /// Stream-capture depth (B3A review point 8). When > 0 the runtime is
+    /// mid-`begin_capture`/`end_capture`, so `note_launch`/`note_htod`/
+    /// `note_dtoh`/`note_sync` are **suppressed** — captured kernel launches
+    /// become graph NODES (counted once at build via `note_graph_captured_nodes`
+    /// on `CudaBackend`), not physical direct submissions. Single-threaded
+    /// decode guarantees at most one capture is in flight, so a single depth
+    /// is sound. Incremented by [`Self::enter_capture`], decremented by
+    /// [`Self::exit_capture`]; the build path wraps the capture window in a
+    /// guard so every return path balances.
+    capture_depth: std::sync::atomic::AtomicUsize,
 }
 
 impl CudaRuntime {
@@ -190,6 +200,7 @@ impl CudaRuntime {
             prefill_attention,
             weight_cache: WeightCache::default(),
             profile: super::RuntimeProfile::default(),
+            capture_depth: std::sync::atomic::AtomicUsize::new(0),
             summary: format!(
                 "CUDA device {device_name} (ordinal {ordinal}, sm_{cc_major}{cc_minor}, NVRTC target {arch}); native q4k_matvec/q6k_matvec/q4k_matmul/q6k_matmul/q4k_dual_matvec/f32_gemv/f16_gemv/q4_matvec/q4_vecmat/kv_append/rms_norm/rms_norm_heads/geglu_silu/geglu_gelu_tanh/activation_silu/activation_gelu_tanh/residual_add/rope/decode_attention/prefill_attention loaded, remaining ops use CPU fallback"
             ),
@@ -1746,13 +1757,24 @@ impl CudaRuntime {
     //
     // All gate on `gpu_profile_enabled()` so normal decode is a no-op branch.
 
+    /// Record one direct kernel launch. **Suppressed during stream capture**
+    /// (B3A review point 8): a launch issued inside `begin_capture`/
+    /// `end_capture` becomes a graph node, not a physical execution, so it
+    /// must NOT inflate `direct_kernel_submissions` — the build path counts
+    /// it once via [`super::CudaBackend::note_graph_captured_nodes`].
     fn note_launch(&self) {
         use std::sync::atomic::Ordering;
+        if self.capture_depth.load(Ordering::Relaxed) != 0 {
+            return;
+        }
         self.profile.launches.fetch_add(1, Ordering::Relaxed);
     }
 
     fn note_htod(&self, bytes: usize) {
         use std::sync::atomic::Ordering;
+        if self.capture_depth.load(Ordering::Relaxed) != 0 {
+            return;
+        }
         self.profile.htod_copies.fetch_add(1, Ordering::Relaxed);
         self.profile
             .htod_bytes
@@ -1761,6 +1783,9 @@ impl CudaRuntime {
 
     fn note_dtoh(&self, bytes: usize) {
         use std::sync::atomic::Ordering;
+        if self.capture_depth.load(Ordering::Relaxed) != 0 {
+            return;
+        }
         self.profile.dtoh_copies.fetch_add(1, Ordering::Relaxed);
         self.profile
             .dtoh_bytes
@@ -1769,7 +1794,31 @@ impl CudaRuntime {
 
     fn note_sync(&self) {
         use std::sync::atomic::Ordering;
+        if self.capture_depth.load(Ordering::Relaxed) != 0 {
+            return;
+        }
         self.profile.syncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark the runtime as mid-stream-capture (B3A review point 8). While in
+    /// effect, `note_launch`/`note_htod`/`note_dtoh`/`note_sync` are no-ops.
+    /// Balanced by [`Self::exit_capture`]; the build path uses [`CaptureGuard`]
+    /// so every return path decrements.
+    pub(crate) fn enter_capture(&self) {
+        self.capture_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// End a capture window started by [`Self::enter_capture`]. Saturating so
+    /// an unbalanced call can't underflow.
+    pub(crate) fn exit_capture(&self) {
+        // fetch_sub with saturating semantics: loop to avoid underflow past 0.
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .capture_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     /// Consume and reset the runtime profile counters, returning the snapshot
@@ -3242,8 +3291,12 @@ mod b3a_smoke_tests {
         }
         // Default instantiate flags (0) — the FFN graph has no graph-managed
         // allocation nodes, so AUTO_FREE_ON_LAUNCH is unnecessary (point 5).
+        // This smoke test is the proof: if it passes with default flags on the
+        // RTX 3060, AUTO_FREE is not required. The cudarc flags enum has no
+        // explicit `0` variant but is `#[repr(u32)]`, so `0u32` is a sound
+        // "no flags" value.
         let graph = cap_stream
-            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .end_capture(crate::ffn_graph::graph_instantiate_flags())
             .expect("end_capture (smoke)")
             .expect("end_capture returned a non-null graph (smoke)");
 

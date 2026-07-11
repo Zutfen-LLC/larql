@@ -1,11 +1,32 @@
 # LARQL-GPU-B3A: CUDA Graph replay for the resident decode FFN — 2026-07-10
 
-> **Status: IMPLEMENTED + OPT-IN.** CUDA Graph replay for the resident decode
-> FFN is fully functional on RTX 3060 (`LARQL_CUDA_GRAPHS=1`). The structural
-> submission-reduction target (≥25%) is met (36.6% reduction). The wall-clock
-> improvement target (≥1%) is NOT met (-0.18%, within noise), so graph replay
-> stays **opt-in (default Disabled)** per the B3A-11 performance gate. RTX 3060
-> validation is the final project evidence; no RTX 3090 rerun is required.
+> **Status: IMPLEMENTED, OPT-IN, accounting-corrected.** CUDA Graph replay for
+> the resident decode FFN is functional on RTX 3060 (`LARQL_CUDA_GRAPHS=1`) and
+> remains **opt-in (default Disabled)**. A subsequent accounting audit
+> (implementing B3A review points 3 + 8) corrected the submission accounting:
+> under **honest total-submission accounting** (every graph submission + D2D +
+> cross-stream sync counted, captured nodes no longer double-counted as direct
+> launches), the structural reduction is **−18.2%**, which **does NOT meet the
+> ≥25% gate**. The earlier headline "−36.6%" was the NULL-stream `launches`
+> counter alone, which excluded the cap_stream graph launches and D2D copies
+> the path adds. Graph replay stays opt-in. RTX 3060 validation is the final
+> project evidence; no RTX 3090 rerun is required.
+>
+> **Accounting correction (points 3, 5, 8):**
+> - Captured FFN kernel nodes no longer inflate `direct_kernel_submissions`
+>   (the `*_into` launchers' `note_launch` is suppressed during stream capture).
+> - `graph_submissions`, `d2d_submissions`, `captured_kernel_nodes`,
+>   `logical_graph_kernel_executions`, `graph_failures`, `graph_fallbacks`,
+>   and `graph_cross_stream_syncs` are now emitted to the bench JSON + a
+>   `TOTAL host submissions` line; the ≥25% gate is evaluated against
+>   `TOTAL = launches + graph_submissions + d2d_submissions`.
+> - The graph path's cross-stream `synchronize()` calls (runtime↔cap_stream
+>   handoff) are now counted (`graph_cross_stream_syncs`) — they previously
+>   bypassed `note_sync`, hiding a **~91% sync increase**.
+> - `AUTO_FREE_ON_LAUNCH` is retained with documented justification: cudarc
+>   0.19.8's `end_capture` takes a typed `CUgraphInstantiate_flags` whose only
+>   constructible variants are non-zero, so a sound "no flags" value cannot be
+>   expressed through the safe API (point 5's escape clause).
 
 ## What changed
 
@@ -26,6 +47,19 @@ subsequent token.
 | B3A-3/6 | `9e35345e` | Arena (ping-pong + dedicated capture stream) + graph state + explicit Drop. |
 | B3A-7 | `69641643` | Per-backend graph mode + 7 capture-aware counters + reset teardown. |
 | B3A-5 | `011e9d57` | Build + replay pipeline integration (204 tests pass with GRAPHS=1). |
+
+### Follow-on: accounting correction (review points 3, 5, 8)
+
+A subsequent audit found the merged B3A-7 counters were **not honest**:
+captured FFN nodes inflated `direct_kernel_submissions` (the `*_into`
+launchers called `note_launch` during stream capture), the graph path's
+`graph_submissions` / `d2d_submissions` were never emitted to the bench JSON,
+and its cross-stream `synchronize()` calls bypassed `note_sync`. The correction
+(suppress `note_*` during capture via a depth guard; emit all graph counters +
+a `TOTAL host submissions` line; count cross-stream syncs; justify
+`AUTO_FREE_ON_LAUNCH` per cudarc 0.19.8's typed-flags API) changed the gate
+outcome from a false "36.6% PASS" to an honest **18.2% FAIL**. 204/204 CUDA
+tests still pass under both `GRAPHS=0` and `GRAPHS=1`; fmt + clippy clean.
 | B3A-8 | `dfc3fe45` | Graph correctness + lifecycle tests (build/replay/reset/disabled). |
 
 ## Two critical findings from B3A-SMOKE (shaped the design)
@@ -100,65 +134,81 @@ Uninstrumented release measurements (3 reps each).
 | tok/s | 8.20 | 8.20 | 0.00% |
 | n_steps | 127 | 127 | — |
 
-### Instrumented (submission decomposition, GRAPHS=1)
+### Instrumented (honest submission decomposition, 64-token window, GRAPHS=0 vs =1)
 
-| counter | GRAPHS=0 | GRAPHS=1 | delta |
+**Every D2D and graph submission is counted as a host CUDA submission**
+(B3A review point 3). The gate metric is `TOTAL = launches + graph_submissions
++ d2d_submissions`. The earlier `launches`-only headline (−36.4%) is retained
+for reference but is **not** a valid gate metric — it excludes the cap_stream
+graph launches and D2D copies the path adds.
+
+| counter | GRAPHS=0 | GRAPHS=1 | Δ |
 |---|---|---|---|
-| **launches/tok** | **599.2** | **379.8** | **−36.6%** ✅ |
-| htod copies/tok | 3.3 | 3.3 | 0 |
-| dtoh copies/tok | 78.1 | 78.1 | 0 |
-| syncs/tok | 78.1 | 78.1 | 0 |
-| hidden readback ms/tok | 2.31 | 0.01 | −2.30 |
-| gpu_fwd ms/tok | 102.7 | 96.1 | −6.4 |
+| **TOTAL host submissions/tok** | **622.9** | **509.7** | **−18.2%** ❌ gate ≥25% |
+| launches/tok (NULL-stream direct, capture-aware) | 622.9 | 396.6 | −36.4% (old headline) |
+| graph submissions/tok | 0 | 37.7 | +37.7 |
+| graph d2d/tok (seed + output) | 0 | 75.4 | +75.4 |
+| captured nodes/tok | 0 | 3.4 (build amortized) | — |
+| logical execs/tok (nodes × replays) | 0 | 226.3 | — |
+| syncs/tok (runtime stream) | 83.3 | 83.3 | 0 |
+| **cross-stream syncs/tok (graph handoff)** | **0** | **76.0** | **+91% total syncs** ❌ sync-regression gate |
+| graph fallbacks/tok | 0 | 0 | 0 |
+| graph failures/tok | 0 | 0 | 0 |
 
-The submission count drops 36.6% (599→380/token): the 252 individual FFN host
-launches (7/layer × 36) collapse to 36 graph-launch submissions, plus the 2
-D2D copies per layer (72 total) that seed/read the arena buffers. But the
-wall-clock is flat.
+**The submission count drops only 18.2% on honest accounting** (622.9 → 509.7):
+the 252 individual FFN host launches collapse to ~36 graph-launch submissions,
+but the separate `cap_stream` design adds ~36 graph submissions + ~72 D2D
+(seed + output copies) back. This is exactly the outcome B3A review point 3
+predicted: *"if both an input and output D2D copy are required… that reduces
+>total submissions by only about 23%"* — the measured 18.2% is below even that,
+and syncs nearly double.
 
-### Why no wall-clock improvement
+### Uninstrumented wall-clock (p50 ms/tok, 3 reps, 59-step window)
 
-The graph path adds **2 `synchronize()` calls per layer** (72/token) for the
-cross-stream handoff: the cap_stream must wait for the runtime stream's D2D
-seed before replay, and the runtime stream must wait for the cap_stream's
-graph output before reading it. These explicit syncs offset the launch-count
-savings — each `synchronize()` is a full device pipeline stall. The
-submission reduction is real (36.6%) but the sync overhead is comparable to
-the per-launch savings on the RTX 3060's relatively low launch latency.
+| metric | GRAPHS=0 (p50 r1/r2/r3) | GRAPHS=1 (p50 r1/r2/r3) | Δ |
+|---|---|---|---|
+| p50 ms/tok | 121.52 / 121.54 / 121.66 | 121.68 / 121.46 / 121.52 | ≈0% (flat) |
+| median p50 | 121.54 | 121.52 | −0.02% |
+| tok/s | 8.2 | 8.2 | 0 |
 
-The `hidden_readback` counter dropped to ~0 because the graph path's final
-D2D output copy happens on the cap_stream (not tracked by the runtime's NULL-
-stream profile counters). The `gpu_fwd` stage shows a 6.4 ms improvement,
-but this is offset by the sync overhead distributed across the decode step.
-
-## B3A-11 — performance decision gate
+## B3A-11 — performance decision gate (honest accounting)
 
 | Gate | Target | Result | Decision |
 |---|---|---|---|
-| Submission reduction | ≥25% | **36.6%** | ✅ PASS |
-| Wall-clock improvement | ≥1% | **−0.18%** | ❌ FAIL (noise) |
-| No regression | <0.5% | 0.18% | ✅ PASS |
-| Transfer/sync regression | none | none | ✅ PASS |
+| Submission reduction (TOTAL) | ≥25% | **18.2%** | ❌ FAIL |
+| Wall-clock improvement | ≥1% | ≈0% (flat) | ❌ FAIL |
+| No transfer regression | none | none | ✅ PASS |
+| **No sync regression** | none | **+91% (83→159)** | ❌ FAIL |
 | Resident-KV/hidden | 100% | 100% | ✅ PASS |
 
-**Decision: graph replay stays opt-in (default `Disabled`).** The structural
-submission-reduction target is met, but the wall-clock improvement is below
-the 1% gate. Per the B3A review: "When improvement is positive but below 1%,
-keep graph replay opt-in and document the result rather than overstating B3
-progress." The graph path is fully functional and correct via
-`LARQL_CUDA_GRAPHS=1` for users who want to test it.
+**Decision: graph replay stays opt-in (default `Disabled`).** Under honest
+total-submission accounting (point 3) the structural reduction is 18.2%, below
+the 25% gate; the wall-clock is flat; and the cross-stream design nearly
+doubles sync count. The graph path is fully functional and correct via
+`LARQL_CUDA_GRAPHS=1`, but it does not deliver a net win on the RTX 3060.
 
-### Path to wall-clock improvement (B3B)
+> **Correction of the prior claim.** An earlier version of this baseline
+> reported "submission reduction 36.6% — gate PASS". That number was the
+> NULL-stream `launches` counter only; it excluded the graph submissions and
+> D2D copies the path adds (then not emitted to the bench JSON) and
+> double-counted token-1's captured nodes as direct launches. The corrected
+> accounting (above) is the honest basis for the gate.
 
-The remaining launch overhead (380/tok) is dominated by the attention chain
-(dynamic total_len, KV cursor) and the cross-stream sync. Two follow-on paths:
+### Path to a net win (B3B)
 
-1. **B3B (attention graphization)**: graph the resident attention chain too,
-   reducing the remaining ~340 attention-related submissions. Harder — the
-   attention chain has dynamic `total_len` and KV-cursor state.
-2. **Event-based cross-stream sync**: replace the 72 explicit `synchronize()`
-   calls with `CudaEvent` record/wait pairs, which avoid the full pipeline
-   stall. This alone could recover the wall-clock.
+The 18.2% submission reduction is real but consumed by the cross-stream
+sync cost (the cap_stream↔runtime handoff). Two follow-on paths could recover
+it:
+
+1. **Single-stream capture** (eliminate the separate `cap_stream`): if the
+   FFN graph could be captured/replayed on the runtime stream, the seed/output
+   D2D copies and the cross-stream syncs would both vanish — moving honest
+   TOTAL toward the launches-only 36% figure and removing the sync regression.
+   This was blocked by B3A-SMOKE finding #1 (the NULL stream cannot be
+   captured); the fix is a non-NULL **runtime** stream, which is a larger
+   plumbing change.
+2. **B3B (attention graphization)**: the remaining ~360 submissions/token are
+   the attention chain, but it has dynamic `total_len` + KV-cursor state.
 
 ## How to use
 
@@ -176,7 +226,11 @@ LARQL_CUDA_GRAPHS=1 LARQL_GPU_DIAG=1 LARQL_GPU_PROFILE=1 larql bench <vindex> --
 ## Remaining B3 work
 
 - **B3B**: graph the dynamic attention chain (harder — dynamic total_len +
-  KV cursor state), OR replace the explicit `synchronize()` cross-stream sync
-  with event-based `CudaEvent` record/wait pairs (avoids the pipeline stall).
+  KV cursor state), OR — the higher-leverage fix — eliminate the separate
+  `cap_stream` (capture/replay on a non-NULL **runtime** stream) to remove the
+  2 D2D/layer and the cross-stream syncs that currently consume the
+  submission savings.
 - The graph path is correct and tested but opt-in until a follow-on slice
-  delivers the ≥1% wall-clock gate.
+  delivers BOTH the honest ≥25% submission gate AND the ≥1% wall-clock gate.
+  Under honest accounting B3A delivers neither (18.2% submission; flat
+  wall-clock; +91% syncs).

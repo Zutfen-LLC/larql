@@ -103,6 +103,35 @@ pub(crate) struct BenchJsonProfile {
     pub mirror_rows_per_tok: f64,
     /// Final hidden readback: ms per token.
     pub hidden_readback_ms_per_tok: f64,
+    // ── B3A capture-aware graph counters (review point 3) ──
+    /// Graph builds per token (one/layer/generation, so ~layers/gen_len).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub graph_builds_per_tok: f64,
+    /// `CudaGraph::launch()` submissions per token (incl. token 1).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub graph_submissions_per_tok: f64,
+    /// Captured kernel nodes per token (physical nodes in built graphs).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub captured_nodes_per_tok: f64,
+    /// `captured_nodes` × replays per token.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub logical_execs_per_tok: f64,
+    /// Graph-path D2D copies per token (seed + output cross-stream).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub d2d_per_tok: f64,
+    /// Cross-stream syncs the graph path issues per token.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub graph_cross_stream_syncs_per_tok: f64,
+    /// Graph build failures per token.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub graph_failures_per_tok: f64,
+    /// Graph replay fallbacks per token.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub graph_fallbacks_per_tok: f64,
+    /// TOTAL host CUDA submissions per token = launches + graph + d2d. This is
+    /// the honest metric for the ≥25% submission-reduction gate.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub total_host_submissions_per_tok: f64,
 }
 
 impl BenchJsonProfile {
@@ -122,6 +151,17 @@ impl BenchJsonProfile {
             mirror_ms_per_tok: s.mirror_append_ns as f64 / 1e6 / n,
             mirror_rows_per_tok: s.mirror_rows_copied as f64 / n,
             hidden_readback_ms_per_tok: s.hidden_readback_ns as f64 / 1e6 / n,
+            graph_builds_per_tok: s.graph_builds as f64 / n,
+            graph_submissions_per_tok: s.graph_submissions as f64 / n,
+            captured_nodes_per_tok: s.captured_kernel_nodes as f64 / n,
+            logical_execs_per_tok: s.logical_graph_kernel_executions as f64 / n,
+            d2d_per_tok: s.d2d_submissions as f64 / n,
+            graph_cross_stream_syncs_per_tok: s.graph_cross_stream_syncs as f64 / n,
+            graph_failures_per_tok: s.graph_failures as f64 / n,
+            graph_fallbacks_per_tok: s.graph_fallbacks as f64 / n,
+            total_host_submissions_per_tok: (s.launches + s.graph_submissions + s.d2d_submissions)
+                as f64
+                / n,
         }
     }
 }

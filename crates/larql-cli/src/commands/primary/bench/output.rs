@@ -180,6 +180,35 @@ pub(super) fn format_profile_breakdown(rows: &[BenchRow], warmup: usize) -> Vec<
             "    hidden rdback {:>5.3}ms/tok",
             p.hidden_readback_ns as f64 / 1e6 / n
         ),
+        // B3A capture-aware graph counters (review point 3): honest total
+        // host-submission accounting. `total` = direct launches + graph
+        // submissions + D2D copies the graph path adds. Reporting `launches`
+        // alone overstates the graph path's reduction.
+        format!(
+            "    graph       builds {:>6.1}/tok  submissions {:>6.1}/tok  replays {:>6.1}/tok",
+            p.graph_builds as f64 / n,
+            p.graph_submissions as f64 / n,
+            (p.graph_submissions.saturating_sub(p.graph_builds)) as f64 / n
+        ),
+        format!(
+            "    graph nodes captured {:>6.1}/tok  logical_execs {:>6.1}/tok",
+            p.captured_kernel_nodes as f64 / n,
+            p.logical_graph_kernel_executions as f64 / n
+        ),
+        format!(
+            "    graph d2d   {:>6.1}/tok  cross_stream_syncs {:>6.1}/tok  fallbacks {:>5.1}/tok  failures {:>5.1}/tok",
+            p.d2d_submissions as f64 / n,
+            p.graph_cross_stream_syncs as f64 / n,
+            p.graph_fallbacks as f64 / n,
+            p.graph_failures as f64 / n
+        ),
+        {
+            let total = p.launches + p.graph_submissions + p.d2d_submissions;
+            format!(
+                "    TOTAL host submissions {:>7.1}/tok  (= launches + graph + d2d)",
+                total as f64 / n
+            )
+        },
     ]
 }
 
