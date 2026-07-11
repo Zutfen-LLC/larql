@@ -4,6 +4,21 @@ use crate::config::types::QuantFormat;
 use crate::error::VindexError;
 use crate::extract::streaming::context::StreamingContext;
 
+fn unsupported_gguf_weights_error(
+    family: &str,
+    level: crate::ExtractLevel,
+    quant: QuantFormat,
+) -> VindexError {
+    VindexError::Parse(format!(
+        "GGUF architecture '{family}' cannot be extracted at level {level:?} with quant {quant:?}: \
+         the streaming model-weight writer accepts safetensors only. Required attention, FFN, \
+         norm, PLE, and lm-head tensors were not written. Implement per-tensor GGUF \
+         dequantization and audited destination routing in \
+         extract::streaming::stages::model_weights before retrying; browse-level GGUF remains \
+         available."
+    ))
+}
+
 impl<'a> StreamingContext<'a> {
     /// Stage 6 — model weights (if extract level requires them).
     ///
@@ -31,16 +46,10 @@ impl<'a> StreamingContext<'a> {
         ) {
             (Some(m), Some(i)) => (m, i),
             _ => {
-                return Err(VindexError::Parse(
-                    format!(
-                        "GGUF architecture '{}' cannot be extracted at level {:?} with quant {:?}: \
-                         the streaming model-weight writer accepts safetensors only. Required \
-                         attention, FFN, norm, PLE, and lm-head tensors were not written. \
-                         Implement per-tensor GGUF dequantization and audited destination routing \
-                         in extract::streaming::stages::model_weights before retrying; browse-level \
-                         GGUF remains available.",
-                        self.arch.family(), self.extract_level, self.quant
-                    )
+                return Err(unsupported_gguf_weights_error(
+                    self.arch.family(),
+                    self.extract_level,
+                    self.quant,
                 ));
             }
         };
@@ -80,5 +89,25 @@ impl<'a> StreamingContext<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_gguf_error_names_feature_path_and_remediation() {
+        let error = unsupported_gguf_weights_error(
+            "gemma4",
+            crate::ExtractLevel::Inference,
+            QuantFormat::Q4K,
+        );
+        let message = error.to_string();
+
+        assert!(message.contains("GGUF architecture 'gemma4'"));
+        assert!(message.contains("attention, FFN, norm, PLE, and lm-head"));
+        assert!(message.contains("extract::streaming::stages::model_weights"));
+        assert!(message.contains("per-tensor GGUF dequantization"));
     }
 }
