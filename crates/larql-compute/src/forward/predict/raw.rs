@@ -545,4 +545,66 @@ mod forward_from_layer_tests {
         assert_eq!(raw.h_pre_norm.shape(), &[3, weights.hidden_size]);
         assert_eq!(raw.logits.len(), weights.vocab_size);
     }
+
+    /// `traced_tail_from_hidden` computes the same tail stages (pre-final-norm,
+    /// final-norm, lm-head raw, final logits) from a post-layer residual that
+    /// `forward_raw_logits` produces inline. They must agree at the last token.
+    #[test]
+    fn traced_tail_from_hidden_matches_forward_raw_logits() {
+        let weights = make_test_weights();
+        let view = larql_models::WeightsView::dense(&weights);
+        let ids = [0u32, 1, 2];
+        let raw = forward_raw_logits(view, &ids, None);
+        let tail = traced_tail_from_hidden(view, &raw.h_pre_norm);
+        let last = ids.len() - 1;
+        let hidden = weights.hidden_size;
+        let vocab = weights.vocab_size;
+        assert_eq!(tail.pre_final_norm.len(), hidden);
+        assert_eq!(tail.final_norm.len(), hidden);
+        assert_eq!(tail.lm_head_raw.len(), vocab);
+        assert_eq!(tail.final_logits.len(), vocab);
+        for i in 0..hidden {
+            assert!(
+                (tail.pre_final_norm[i] - raw.h_pre_norm[[last, i]]).abs() < 1e-5,
+                "pre_final_norm[{i}]"
+            );
+            assert!(
+                (tail.final_norm[i] - raw.h_final[[last, i]]).abs() < 1e-5,
+                "final_norm[{i}]"
+            );
+        }
+        for i in 0..vocab {
+            assert!(
+                (tail.final_logits[i] - raw.logits[i]).abs() < 1e-5,
+                "final_logits[{i}]"
+            );
+        }
+    }
+
+    /// `traced_tail_with_lm_head` projects through an explicit lm-head. Passing
+    /// the model's own lm-head must match `traced_tail_from_hidden`; passing a
+    /// zeroed lm-head must produce zero logits.
+    #[test]
+    fn traced_tail_with_lm_head_uses_explicit_matrix() {
+        let weights = make_test_weights();
+        let view = larql_models::WeightsView::dense(&weights);
+        let ids = [0u32, 1, 2];
+        let raw = forward_raw_logits(view, &ids, None);
+        // Own lm-head → same result as traced_tail_from_hidden.
+        let tail_own = traced_tail_with_lm_head(view, &raw.h_pre_norm, &weights.lm_head);
+        for i in 0..weights.vocab_size {
+            assert!(
+                (tail_own.final_logits[i] - raw.logits[i]).abs() < 1e-5,
+                "own lm-head final_logits[{i}]"
+            );
+        }
+        // Zeroed lm-head → zero raw logits (before the transform; with
+        // softcap absent on the test fixture the final logits are also zero).
+        let zero_lm = ndarray::Array2::zeros((weights.vocab_size, weights.hidden_size));
+        let tail_zero = traced_tail_with_lm_head(view, &raw.h_pre_norm, &zero_lm);
+        assert!(
+            tail_zero.lm_head_raw.iter().all(|v| v.abs() < 1e-6),
+            "zeroed lm-head must produce zero raw logits"
+        );
+    }
 }
