@@ -15,6 +15,9 @@ exact same prompt token sequence the future execution path will consume.
 - Work-start SHA: `e88350da4b4929312d1fe1f06c49398ed2066769`
 - PR base SHA: `e88350da4b4929312d1fe1f06c49398ed2066769`
 - Head SHA: `d739800f6c99451e3349c07c3e9bd472d867c91a`
+- Final head SHA (ST3 evidence cleanup, ST4 §21): `7a2a3f44aa16d9b142b5f22aa0500766820c366e`
+- Merge commit: `15864226bd3ffb70a2cdc35ca3e52dafe76692c7`
+- CI: all final triggered workflows successful
 
 ## Source
 
@@ -116,7 +119,15 @@ gate).
 - `cargo build -p larql-cli --release`: passed
 - Exact-source parity test (`gemma4_tokenizer_prompt_parity`, `--ignored`):
   1 passed; 0 failed
-- CI: GitHub Actions pending PR creation
+- CI: all final triggered workflows successful
+
+## Source EOS policy clarification (ST4 §21)
+
+- source EOS policy = `[1, 50, 106]`
+- earlier ST1 oracle summary = `[1, 106]`
+
+(ST4 §21 housekeeping only — the tokenizer parity test was not rerun for
+this metadata cleanup.)
 
 ## Scope deviations
 

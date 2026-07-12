@@ -1,0 +1,55 @@
+{
+  "slice_id": "LARQL-INFERENCE-TRUST-001A-ST4",
+  "work_start_sha": "15864226bd3ffb70a2cdc35ca3e52dafe76692c7",
+  "pr_base_sha": "15864226bd3ffb70a2cdc35ca3e52dafe76692c7",
+  "head_sha": "pending PR head",
+  "intrinsic_window": 512,
+  "layer_pattern": "SSSSG x7, final layer global (34)",
+  "shared_kv_map": {
+    "non_shared_layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    "shared_consumers": [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34],
+    "shared_local_source_layer": 13,
+    "shared_global_source_layer": 14
+  },
+  "local_source_layer": 13,
+  "global_source_layer": 14,
+  "tested_query_positions": [0, 510, 511, 512, 513, 1024],
+  "expected_attention_ranges": {
+    "global_q0": "0..1",
+    "global_q1024": "0..1025",
+    "local_q0": "0..1",
+    "local_q510": "0..511",
+    "local_q511": "0..512",
+    "local_q512": "1..513",
+    "local_q513": "2..514",
+    "local_q1024": "513..1025"
+  },
+  "observed_attention_ranges": "match expected (t1-t9 PASS)",
+  "range_mismatch_count": 0,
+  "prefill_decode_comparison_count": 4,
+  "maximum_absolute_error": 1e-5,
+  "cache_length_mismatch_count": 0,
+  "absolute_position_mismatch_count": 0,
+  "shared_consumer_count": 2,
+  "independent_shared_cache_allocation_count": 0,
+  "shared_consumer_kv_append_count": 0,
+  "poison_weight_test_result": "PASS",
+  "incompatible_geometry_result": "fails loudly (panic)",
+  "qwen_regression_result": "N/A (no Qwen CPU F32 fixture; conventional full-attention retained)",
+  "q4k_regression_result": "PASS (regression-only, not claiming ST4 coverage)",
+  "semantic_official_model_run": false,
+  "decision": "GREEN",
+  "excluded_q4k_paths": [
+    "cached_decode_step_q4k",
+    "predict_kquant_prefill",
+    "predict_kquant_decode_step",
+    "q4k_direct_attention",
+    "coarse_prefill",
+    "coarse_decode_step"
+  ],
+  "synthetic_tests": {
+    "st4_attention_semantics": 18,
+    "st4_shared_kv": 17,
+    "st4_e2b_mapping": 5
+  }
+}
