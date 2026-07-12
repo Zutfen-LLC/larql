@@ -332,6 +332,190 @@ pub fn run_attention_block_decode_step_backend(
     Some((h_post_attn, (k_concat, v_concat)))
 }
 
+/// Decode-step attention for a **shared-KV consumer** layer (ST4 §10).
+///
+/// The consumer receives already-populated K/V from a source layer (Gemma 4
+/// E2B's last-20-layer sharing). This primitive:
+///
+/// - applies the consumer layer's input norm;
+/// - computes the consumer layer's Q (and Q-norm, Q-RoPE at `abs_position`);
+/// - uses the supplied source-layer K/V for attention — it does NOT compute
+///   consumer K or V and does NOT append to any consumer cache;
+/// - applies the consumer layer's intrinsic local/global attention range;
+/// - computes the O projection and post-attention residual using consumer
+///   weights;
+/// - returns only the post-attention hidden (`[1, hidden]`).
+///
+/// `shared_kv` must already include the current token's K/V row (the source
+/// layer is updated before its consumers run). Geometry (head dimension, KV
+/// head count, cache row count) must be compatible between source and
+/// consumer — validated by the caller via [`validate_shared_kv_geometry`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_attention_block_decode_step_shared_backend(
+    weights: larql_models::WeightsView,
+    h_new: &Array2<f32>,
+    layer: usize,
+    shared_kv: &SharedKV,
+    abs_position: usize,
+    backend: Option<&dyn crate::ComputeBackend>,
+) -> Option<Array2<f32>> {
+    use crate::dot_proj_gpu;
+    use crate::forward::add_bias;
+    use crate::residual::rms_norm_heads;
+
+    let arch = &*weights.arch;
+    let head_dim = arch.head_dim_for_layer(layer);
+    let num_q = arch.num_q_heads_for_layer(layer);
+    let num_kv = arch.num_kv_heads_for_layer(layer);
+    let reps = num_q / num_kv;
+    let scale = if arch.attention_multiplier() != 1.0 {
+        arch.attention_multiplier() as f64
+    } else {
+        arch.attention_scale_for_layer(layer)
+    };
+    let norm_offset = arch.norm_weight_offset();
+    let position = abs_position;
+
+    // Geometry guard: the shared K/V must match the consumer's expected shape.
+    validate_shared_kv_geometry(arch, layer, shared_kv)?;
+
+    let h_norm = crate::forward::apply_norm(
+        &weights,
+        h_new,
+        &arch.input_layernorm_key(layer),
+        norm_offset,
+    );
+
+    let w_q = weights.tensor(&arch.attn_q_key(layer))?;
+    let w_o = weights.tensor(&arch.attn_o_key(layer))?;
+    let mut q_full = dot_proj_gpu(&h_norm, w_q, backend);
+    if let Some(bias) = arch
+        .attn_q_bias_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
+        add_bias(&mut q_full, bias);
+    }
+
+    let qk_offset = weights.arch.qk_norm_weight_offset();
+    let qk_norm_off = if qk_offset != 0.0 {
+        qk_offset
+    } else {
+        norm_offset
+    };
+    let q_normed = match arch
+        .attn_q_norm_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
+        Some(norm_w) => rms_norm_heads(&q_full, norm_w, num_q, head_dim, qk_norm_off),
+        None => q_full,
+    };
+    let layer_rope_base = crate::forward_overrides::effective_rope_base_for_layer(arch, layer);
+    let rotary_frac = arch.rotary_fraction_for_layer(layer);
+    let pos_divisor =
+        crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
+    let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
+    let q_rope = crate::attention::rope::apply_rope_partial_at_full(
+        &q_normed,
+        num_q,
+        head_dim,
+        layer_rope_base,
+        rotary_frac,
+        position,
+        pos_divisor,
+        llama3,
+    );
+
+    // Apply the consumer's intrinsic local/global range to the shared K/V.
+    // The source cache is already windowed (clipped to the consumer's window
+    // for a sliding source, full for a global source), so the range typically
+    // covers the whole cache — but applying it explicitly is defensive and
+    // keeps the primitive correct even if the source was not pre-clipped.
+    let (k_src, v_src) = shared_kv;
+    let available = k_src.shape()[0];
+    let window = crate::attention::intrinsic_attention_window(arch, layer);
+    let range = crate::attention::causal_attention_range(position, available, window);
+    if range.is_empty() {
+        return None;
+    }
+    let softcap = arch.attn_logit_softcapping();
+    let attn_out = if range.start == 0 && range.end_exclusive == available {
+        gqa_attention_decode_step(&q_rope, k_src, v_src, num_q, head_dim, reps, scale, softcap)
+    } else {
+        let k_view = k_src.slice(ndarray::s![range.start..range.end_exclusive, ..]);
+        let v_view = v_src.slice(ndarray::s![range.start..range.end_exclusive, ..]);
+        gqa_attention_decode_step(
+            &q_rope, &k_view, &v_view, num_q, head_dim, reps, scale, softcap,
+        )
+    };
+
+    let mut attn_projected = dot_proj_gpu(&attn_out, w_o, backend);
+    if let Some(bias) = arch
+        .attn_o_bias_key(layer)
+        .and_then(|k| weights.vectors.get(&k))
+    {
+        add_bias(&mut attn_projected, bias);
+    }
+
+    let res_mult = arch.residual_multiplier();
+    let h_post_attn = if arch.has_post_norms() {
+        let normed = crate::forward::apply_norm(
+            &weights,
+            &attn_projected,
+            &arch.post_attention_layernorm_key(layer),
+            norm_offset,
+        );
+        if res_mult != 1.0 {
+            h_new + &(&normed * res_mult)
+        } else {
+            h_new + &normed
+        }
+    } else if res_mult != 1.0 {
+        h_new + &(&attn_projected * res_mult)
+    } else {
+        h_new + &attn_projected
+    };
+
+    Some(h_post_attn)
+}
+
+/// Validate that the shared K/V geometry is compatible with the consumer
+/// layer: head dimension, KV head count, and (for decode) at least one row.
+/// Returns `Some(())` when compatible, `None` otherwise so callers fail
+/// loudly on incompatible geometry (ST4 §10/§12).
+pub fn validate_shared_kv_geometry(
+    arch: &dyn larql_models::ModelArchitecture,
+    layer: usize,
+    shared_kv: &SharedKV,
+) -> Option<()> {
+    let head_dim = arch.head_dim_for_layer(layer);
+    let num_kv = arch.num_kv_heads_for_layer(layer);
+    let expected_kv_dim = num_kv * head_dim;
+    let (k, v) = shared_kv;
+    if k.shape()[0] == 0 || v.shape()[0] == 0 {
+        panic!(
+            "validate_shared_kv_geometry: empty shared K/V for consumer layer {layer} \
+             (source cache must include at least the current token)"
+        );
+    }
+    if k.shape()[0] != v.shape()[0] {
+        panic!(
+            "validate_shared_kv_geometry: shared K rows ({}) != V rows ({}) for layer {layer}",
+            k.shape()[0],
+            v.shape()[0]
+        );
+    }
+    if k.shape()[1] != expected_kv_dim || v.shape()[1] != expected_kv_dim {
+        panic!(
+            "validate_shared_kv_geometry: shared K/V kv_dim ({}/{}) != consumer kv_dim ({}) \
+             for layer {layer} (head_dim={head_dim}, num_kv={num_kv})",
+            k.shape()[1],
+            v.shape()[1],
+            expected_kv_dim
+        );
+    }
+    Some(())
+}
+
 /// `LARQL_Q4K_DIRECT_ATTN=1`: route decode-step attention projections through
 /// the Q4K-direct kernels (packed bytes from the index) instead of the
 /// f32-BLAS path over pre-dequantised `weights.tensors`. Single source of

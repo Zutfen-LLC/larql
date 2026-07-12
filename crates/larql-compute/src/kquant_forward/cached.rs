@@ -7,6 +7,19 @@
 //! per-step decode (single-row attention against the cache + 1-row
 //! FFN). Speedup scales linearly with decode length.
 //!
+//! # ST4 §18 — F32-only enforcement
+//!
+//! The intrinsic Gemma 4 local/global attention windows and shared-KV
+//! routing proven in ST4 apply to the **F32 CPU reference path only**.
+//! This Q4_K sibling prefill/decode path (`predict_kquant_prefill`,
+//! `predict_kquant_decode_step`, the Q4K-direct attention, and the
+//! coarse `coarse_prefill` / `coarse_decode_step` intents) passes
+//! `effective_window = None` (full causal attention) and does not route
+//! shared-KV. The intrinsic Gemma 4 local/global and shared-KV parity
+//! must be verified separately before these paths become
+//! semantic-oracle candidates. Do not modify Q4_K code merely to make
+//! its tests resemble the F32 path.
+//!
 //! Prefill projects Q/K/V/O and gate/up/down straight from the vindex's
 //! Q4_K/Q6_K bytes via the amortised q4k/q6k matmul — no per-layer f32
 //! dequant — when the projection dims are 256-aligned (see
@@ -155,6 +168,11 @@ pub fn predict_kquant_prefill_with_state(
         // Attention with K/V capture. When `use_q4k_attn`, Q/K/V/O project
         // straight from the Q4_K/Q6_K bytes (empty scratch — norms still come
         // from canonical weights); else the dequantised f32 view path.
+        //
+        // ST4 §18 EXCLUSION: the Q4_K sibling prefill path passes
+        // `effective_window = None` (full causal attention). The intrinsic
+        // Gemma 4 local/global and shared-KV parity must be verified
+        // separately before this path becomes a semantic-oracle candidate.
         let attn_index = if use_q4k_attn { Some(index) } else { None };
         let (h_post_attn, k_rope, v_final) = match run_attention_with_kv_backend(
             larql_models::WeightsView::with_scratch(weights, &scratch),
@@ -162,6 +180,7 @@ pub fn predict_kquant_prefill_with_state(
             layer,
             None,
             attn_index,
+            None,
         ) {
             Some(t) => t,
             None => {

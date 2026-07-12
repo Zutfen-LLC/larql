@@ -899,6 +899,119 @@ fn gemma4_double_wide_mlp_follows_shared_region() {
     assert_eq!(arch.intermediate_size_for_layer(34), 12288);
 }
 
+// ── ST4 §12: pinned E2B sharing map (35-layer) ─────────────────────────
+//
+// Exact 35-layer mapping: layers 0–14 compute own K/V; layers 15–34 are
+// shared consumers — sliding consumers reuse layer 13, global consumers
+// reuse layer 14. Layer pattern = SSSSG repeated seven times, final layer
+// global. Every shared layer points to a source of the same attention type.
+
+#[test]
+fn st4_e2b_exact_35_layer_source_map() {
+    let arch = gemma4_e2b_arch();
+    assert_eq!(arch.config().num_layers, 35);
+    assert_eq!(arch.sliding_window_size(), Some(512));
+
+    // Layers 0–14: non-shared (compute own K/V).
+    for l in 0..15 {
+        assert!(
+            arch.kv_shared_source_layer(l).is_none(),
+            "L{l} must compute its own K/V (non-shared)"
+        );
+    }
+    // Layers 15–34: shared consumers.
+    for l in 15..35 {
+        let src = arch
+            .kv_shared_source_layer(l)
+            .unwrap_or_else(|| panic!("L{l} must be a shared consumer"));
+        assert!(src < l, "shared source {src} must precede consumer {l}");
+        // Source attention type must match consumer type.
+        let consumer_is_sliding = arch.is_sliding_window_layer(l);
+        let source_is_sliding = arch.is_sliding_window_layer(src);
+        assert_eq!(
+            consumer_is_sliding, source_is_sliding,
+            "L{l} (sliding={consumer_is_sliding}) source L{src} (sliding={source_is_sliding}) type mismatch"
+        );
+    }
+}
+
+#[test]
+fn st4_e2b_shared_sliding_source_is_layer_13() {
+    let arch = gemma4_e2b_arch();
+    // Every shared sliding consumer points to layer 13 (last non-shared sliding).
+    for l in 15..35 {
+        if arch.is_sliding_window_layer(l) {
+            assert_eq!(
+                arch.kv_shared_source_layer(l),
+                Some(13),
+                "shared sliding L{l} must reuse source 13"
+            );
+        }
+    }
+    assert!(arch.is_sliding_window_layer(13), "L13 must be sliding");
+    assert!(
+        arch.kv_shared_source_layer(13).is_none(),
+        "L13 must be non-shared"
+    );
+}
+
+#[test]
+fn st4_e2b_shared_global_source_is_layer_14() {
+    let arch = gemma4_e2b_arch();
+    // Every shared global consumer points to layer 14 (last non-shared global).
+    for l in 15..35 {
+        if !arch.is_sliding_window_layer(l) {
+            assert_eq!(
+                arch.kv_shared_source_layer(l),
+                Some(14),
+                "shared global L{l} must reuse source 14"
+            );
+        }
+    }
+    assert!(!arch.is_sliding_window_layer(14), "L14 must be global");
+    assert!(
+        arch.kv_shared_source_layer(14).is_none(),
+        "L14 must be non-shared"
+    );
+}
+
+#[test]
+fn st4_e2b_layer_pattern_is_ssssg_final_global() {
+    let arch = gemma4_e2b_arch();
+    // SSSSG repeated seven times (layers 0–34), final layer 34 = global.
+    for l in 0..35 {
+        let is_global = (l + 1) % 5 == 0; // layers 4,9,14,...,34
+        assert_eq!(
+            !arch.is_sliding_window_layer(l),
+            is_global,
+            "L{l} global flag mismatch"
+        );
+    }
+    assert!(
+        !arch.is_sliding_window_layer(34),
+        "final layer must be global"
+    );
+}
+
+#[test]
+fn st4_e2b_intrinsic_window_for_layers() {
+    let arch = gemma4_e2b_arch();
+    // The ST4 `intrinsic_attention_window` helper (in larql-compute) returns
+    // `sliding_window_size()` for sliding layers and `None` for global layers,
+    // panicking when a sliding layer lacks a positive window. Verify the
+    // precondition it relies on: every sliding layer has a 512 window.
+    assert_eq!(arch.sliding_window_size(), Some(512));
+    for l in 0..35 {
+        if arch.is_sliding_window_layer(l) {
+            assert_eq!(
+                arch.sliding_window_size(),
+                Some(512),
+                "sliding L{l} must have a positive window"
+            );
+        }
+    }
+}
+
 #[test]
 fn gemma4_ple() {
     let arch = gemma4_e2b_arch();

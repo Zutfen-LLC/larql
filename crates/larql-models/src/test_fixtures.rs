@@ -160,6 +160,7 @@ pub fn make_gemma3_test_weights() -> ModelWeights {
             "vocab_size": VOCAB,
             "rope_theta": 10000.0,
             "residual_multiplier": 0.5,
+            "sliding_window": 1024,
         }),
         NUM_LAYERS,
     )
@@ -564,6 +565,131 @@ pub fn make_synthetic_e2b_like_weights() -> ModelWeights {
     }
 }
 
+/// Like [`make_synthetic_e2b_like_weights`] but with **deterministic random
+/// (non-zero) weights** so that source-vs-consumer K/V contributions are
+/// numerically distinguishable (required for ST4 §13 poison-weight proofs).
+///
+/// Same 4-layer E2B-like shape: sliding_window=4, num_kv_shared_layers=2
+/// (layers 2/3 are shared consumers of 0/1), PLE + QK-norm + V-norm.
+pub fn make_synthetic_e2b_like_weights_random() -> ModelWeights {
+    let arch = detect_from_json(&synthetic_e2b_like_arch_json());
+    let num_layers = 4;
+    let hidden = 8;
+    let intermediate = 16;
+    let head_dim = 4;
+    let global_head_dim = 8;
+    let num_q_heads = 2;
+    let num_kv_heads = 1;
+    let vocab_size = 32;
+    let ple_dim = 4;
+
+    let mut tensors: std::collections::HashMap<String, WeightArray> =
+        std::collections::HashMap::new();
+    let mut vectors: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+
+    let mut seed = 0xe2b5eed_u64;
+    let mut next_seed = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed
+    };
+
+    let embed = rand_mat_seeded(vocab_size, hidden, 0.05, next_seed());
+    let lm_head = rand_mat_seeded(vocab_size, hidden, 0.05, next_seed());
+    tensors.insert(arch.embed_key().to_string(), embed.clone());
+    vectors.insert(arch.final_norm_key().to_string(), vec![1.0; hidden]);
+
+    if let Some(k) = arch.per_layer_model_projection_key() {
+        tensors.insert(
+            k,
+            rand_mat_seeded(num_layers * ple_dim, hidden, 0.05, next_seed()),
+        );
+    }
+    if let Some(k) = arch.per_layer_embed_key() {
+        tensors.insert(
+            k,
+            rand_mat_seeded(vocab_size, num_layers * ple_dim, 0.05, next_seed()),
+        );
+    }
+    if let Some(k) = arch.per_layer_projection_norm_key() {
+        vectors.insert(k, vec![1.0; ple_dim]);
+    }
+
+    for layer in 0..num_layers {
+        let layer_head_dim = if arch.is_sliding_window_layer(layer) {
+            head_dim
+        } else {
+            global_head_dim
+        };
+        let q_dim = num_q_heads * layer_head_dim;
+        let kv_dim = num_kv_heads * layer_head_dim;
+        // Q/K/V/O get DISTINCT random weights per layer so source vs consumer
+        // K/V projections are numerically distinguishable (poison-testable).
+        tensors.insert(
+            arch.attn_q_key(layer),
+            rand_mat_seeded(q_dim, hidden, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_k_key(layer),
+            rand_mat_seeded(kv_dim, hidden, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_v_key(layer),
+            rand_mat_seeded(kv_dim, hidden, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_o_key(layer),
+            rand_mat_seeded(hidden, q_dim, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_gate_key(layer),
+            rand_mat_seeded(intermediate, hidden, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_up_key(layer),
+            rand_mat_seeded(intermediate, hidden, 0.1, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_down_key(layer),
+            rand_mat_seeded(hidden, intermediate, 0.1, next_seed()),
+        );
+        vectors.insert(arch.input_layernorm_key(layer), vec![1.0; hidden]);
+        vectors.insert(arch.post_attention_layernorm_key(layer), vec![1.0; hidden]);
+        if let Some(k) = arch.per_layer_input_gate_key(layer) {
+            tensors.insert(k, rand_mat_seeded(ple_dim, hidden, 0.05, next_seed()));
+        }
+        if let Some(k) = arch.per_layer_projection_key(layer) {
+            tensors.insert(k, rand_mat_seeded(hidden, ple_dim, 0.05, next_seed()));
+        }
+        if let Some(k) = arch.post_per_layer_input_norm_key(layer) {
+            vectors.insert(k, vec![1.0; hidden]);
+        }
+    }
+
+    ModelWeights {
+        tensors,
+        vectors,
+        raw_bytes: std::collections::HashMap::new(),
+        packed_mmaps: std::collections::HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_byte_ranges: std::collections::HashMap::new(),
+        embed,
+        lm_head,
+        position_embed: None,
+        arch,
+        num_layers,
+        hidden_size: hidden,
+        intermediate_size: intermediate,
+        vocab_size,
+        logical_vocab_size: None,
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        rope_base: 10_000.0,
+    }
+}
+
 // ── Q4_K-aware synthetic fixtures (Step 3b) ──
 
 // ── Q4_K-aware synthetic fixture ─────────────────────────────────────────
@@ -631,6 +757,7 @@ pub fn make_test_q4k_weights_inter_layers(intermediate: usize, num_layers: usize
         "vocab_size": Q4K_TEST_VOCAB,
         "hidden_activation": "gelu_pytorch_tanh",
         "rope_theta": 10000.0,
+        "sliding_window": 1024,
     });
     q4k_test_weights_from_json(arch_json, num_layers, intermediate)
 }
@@ -934,6 +1061,7 @@ pub fn make_test_gemma4_moe_weights() -> ModelWeights {
             "num_key_value_heads": num_kv,
             "head_dim": head_dim,
             "vocab_size": GEMMA4_MOE_HIDDEN,
+            "sliding_window": 512,
             "enable_moe_block": true,
             "num_experts": GEMMA4_MOE_NUM_EXPERTS,
             "top_k_experts": GEMMA4_MOE_TOP_K,

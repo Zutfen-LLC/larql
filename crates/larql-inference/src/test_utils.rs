@@ -753,6 +753,7 @@ pub fn make_test_gemma4_moe_weights() -> ModelWeights {
             "num_key_value_heads": num_kv,
             "head_dim": head_dim,
             "vocab_size": GEMMA4_MOE_HIDDEN,
+            "sliding_window": 512,
             "enable_moe_block": true,
             "num_experts": GEMMA4_MOE_NUM_EXPERTS,
             "top_k_experts": GEMMA4_MOE_TOP_K,
@@ -907,7 +908,8 @@ pub fn make_test_gemma4_moe_weights() -> ModelWeights {
 // so existing `crate::test_utils::*` callers (forward/ple.rs tests) and
 // downstream test crates keep working.
 pub use larql_models::test_fixtures::{
-    make_synthetic_e2b_like_weights, synthetic_e2b_like_arch_json,
+    make_synthetic_e2b_like_weights, make_synthetic_e2b_like_weights_random,
+    synthetic_e2b_like_arch_json,
 };
 /// Bundled fixture for Q4_K decode-path tests. Mirrors `TestFixtures`.
 pub struct Q4KTestFixtures {

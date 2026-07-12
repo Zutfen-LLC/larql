@@ -22,7 +22,11 @@
 use ndarray::Array2;
 
 use super::{EngineBackend, KvHandle};
-use crate::async_compute_backend::AsyncComputeBackend;
+use crate::async_compute_backend::{AsyncComputeBackend, AttentionHandle};
+use crate::attention::{
+    effective_window_for_layer, run_attention_block_decode_step_shared_backend,
+    run_attention_block_shared,
+};
 use crate::ffn::FfnBackend;
 use crate::forward::{embed_tokens_pub, run_ffn};
 
@@ -96,25 +100,62 @@ pub fn kv_prefill_from_hidden_via_dispatch(
         return None;
     }
     let num_layers = weights.num_layers;
+    let arch = &*weights.arch;
     let mut handles: Vec<KvHandle> = Vec::with_capacity(num_layers);
     let mut h = initial_hidden.clone();
 
+    // ST4 §11: route shared-KV. Source layers compute + store their own K/V
+    // (FULL — clipping is deferred to a final pass so consumer layers running
+    // later can still see early positions during their own prefill attention).
+    // Consumer layers reuse the source layer's full K/V and store no
+    // independent cache.
     for layer in 0..num_layers {
         let _t_attn = std::time::Instant::now();
-        let (h_post_attn, mut handle) = backend.attention_prefill(
-            weights,
-            &h,
-            layer,
-            window,
-            index.map(|v| v as &dyn larql_compute::KvIndex),
-        )?;
+        let h_post_attn = match arch.kv_shared_source_layer(layer) {
+            None => {
+                let (hpa, handle) = backend.attention_prefill(
+                    weights,
+                    &h,
+                    layer,
+                    window,
+                    index.map(|v| v as &dyn larql_compute::KvIndex),
+                )?;
+                handles.push(handle);
+                hpa
+            }
+            Some(src) => {
+                // Consumer: reuse the source layer's full K/V. `src < layer`
+                // so the source handle already exists.
+                let shared = backend
+                    .read_kv_to_host(&handles[src])
+                    .expect("shared-KV source handle must be populated before consumer");
+                // `run_attention_block_shared` derives the consumer's intrinsic
+                // window internally and applies the per-query range to the
+                // shared K/V (ST4 §7). No consumer handle is stored — allocate
+                // an empty placeholder so the per-layer indexing stays aligned.
+                let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
+                handles.push(backend.alloc_kv_buffer(layer, 0, kv_dim));
+                run_attention_block_shared(weights, &h, layer, false, Some(&shared))?.0
+            }
+        };
         crate::decode_stages::record_attn(_t_attn.elapsed().as_nanos());
-        if let Some(w) = window {
-            backend.clip_kv(&mut handle, w);
-        }
-        handles.push(handle);
-
         h = ffn_or_moe_layer(weights, &h_post_attn, layer, ffn);
+    }
+
+    // Final clip pass: clip local source caches to the window tail for future
+    // decode. Consumer placeholder handles are left empty. Global layers and
+    // non-shared conventional layers keep their full prefix (effective window
+    // None).
+    for layer in 0..num_layers {
+        if arch.kv_shared_source_layer(layer).is_some() {
+            continue;
+        }
+        let win = effective_window_for_layer(arch, layer, window);
+        if let Some(w) = win {
+            if let Some(h) = handles.get_mut(layer) {
+                backend.clip_kv(h, w);
+            }
+        }
     }
 
     Some((last_row_as_2d(&h), handles))
@@ -142,6 +183,7 @@ pub fn kv_decode_step_via_dispatch(
     index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<Array2<f32>> {
     let num_layers = weights.num_layers;
+    let arch = &*weights.arch;
     debug_assert_eq!(
         handles.len(),
         num_layers,
@@ -150,20 +192,57 @@ pub fn kv_decode_step_via_dispatch(
     let h_new = embed_tokens_pub(&weights, &[token_id]);
     let mut h_step = h_new;
 
-    for (layer, handle) in handles.iter_mut().enumerate().take(num_layers) {
+    for layer in 0..num_layers {
         let _t_attn = std::time::Instant::now();
-        let h_post_attn = backend.attention_step(
-            weights,
-            &h_step,
-            handle,
-            layer,
-            abs_position,
-            index.map(|v| v as &dyn larql_compute::KvIndex),
-        )?;
+        let h_post_attn = match arch.kv_shared_source_layer(layer) {
+            None => {
+                let handle = &mut handles[layer];
+                // Source (non-shared): clip BEFORE attention so the current
+                // query never attends to an out-of-window prior key (ST4 §9).
+                // `attention_step_windowed` retains at most `window - 1` prior
+                // rows, appends the current token, and attends over ≤ `window`
+                // rows. Global layers (effective window None) use the full
+                // `attention_step` with no clip.
+                let eff = effective_window_for_layer(arch, layer, window);
+                match eff {
+                    Some(w) => backend.attention_step_windowed(
+                        weights,
+                        &h_step,
+                        handle,
+                        layer,
+                        abs_position,
+                        w,
+                        index.map(|v| v as &dyn larql_compute::KvIndex),
+                    )?,
+                    None => backend.attention_step(
+                        weights,
+                        &h_step,
+                        handle,
+                        layer,
+                        abs_position,
+                        index.map(|v| v as &dyn larql_compute::KvIndex),
+                    )?,
+                }
+            }
+            Some(src) => {
+                // Shared consumer: the source layer (`src < layer`) has already
+                // been updated this step (clip-before + append), so its handle
+                // includes the current token's K/V. Run shared-KV Q/O attention
+                // over it; no consumer K/V is computed or appended. ST4 §10/§11.
+                let shared = backend
+                    .read_kv_to_host(&handles[src])
+                    .expect("shared-KV source handle must be updated before consumer decode");
+                run_attention_block_decode_step_shared_backend(
+                    weights,
+                    &h_step,
+                    layer,
+                    &shared,
+                    abs_position,
+                    None,
+                )?
+            }
+        };
         crate::decode_stages::record_attn(_t_attn.elapsed().as_nanos());
-        if let Some(w) = window {
-            backend.clip_kv(handle, w);
-        }
         h_step = ffn_or_moe_layer(weights, &h_post_attn, layer, ffn);
     }
 
@@ -223,26 +302,52 @@ pub fn kv_prefill_from_hidden_via_dispatch_async(
         return None;
     }
     let num_layers = weights.num_layers;
+    let arch = &*weights.arch;
     let mut handles: Vec<KvHandle> = Vec::with_capacity(num_layers);
     let mut h = initial_hidden.clone();
 
+    // ST4 §11: route shared-KV in the async prefill path too. Source layers
+    // compute + store full K/V (clip deferred to a final pass); consumer
+    // layers reuse the source's full K/V and store no independent cache.
     for layer in 0..num_layers {
-        let (h_post_attn_handle, mut handle) = backend.attention_prefill_async(
-            weights,
-            &h,
-            layer,
-            window,
-            index.map(|v| v as &dyn larql_compute::KvIndex),
-        );
-        if let Some(w) = window {
-            // Sync clip — backends with deferred dispatch must flush
-            // before clip per spec §11.3.
-            backend.clip_kv(&mut handle, w);
-        }
-        handles.push(handle);
+        let h_post_attn_handle = match arch.kv_shared_source_layer(layer) {
+            None => {
+                let (hpa_handle, handle) = backend.attention_prefill_async(
+                    weights,
+                    &h,
+                    layer,
+                    window,
+                    index.map(|v| v as &dyn larql_compute::KvIndex),
+                );
+                handles.push(handle);
+                hpa_handle
+            }
+            Some(src) => {
+                let shared = backend
+                    .read_kv_to_host(&handles[src])
+                    .expect("shared-KV source handle must be populated before consumer");
+                let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
+                handles.push(backend.alloc_kv_buffer(layer, 0, kv_dim));
+                let hpa = run_attention_block_shared(weights, &h, layer, false, Some(&shared))?.0;
+                AttentionHandle::ready(hpa)
+            }
+        };
 
         let h_post_attn = backend.read_hidden(h_post_attn_handle);
         h = ffn_or_moe_layer(weights, &h_post_attn, layer, ffn);
+    }
+
+    // Final clip pass: clip local source caches to the window tail.
+    for layer in 0..num_layers {
+        if arch.kv_shared_source_layer(layer).is_some() {
+            continue;
+        }
+        let win = effective_window_for_layer(arch, layer, window);
+        if let Some(w) = win {
+            if let Some(h) = handles.get_mut(layer) {
+                backend.clip_kv(h, w);
+            }
+        }
     }
 
     backend.flush().ok()?;
@@ -266,6 +371,7 @@ pub fn kv_decode_step_via_dispatch_async(
     index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<Array2<f32>> {
     let num_layers = weights.num_layers;
+    let arch = &*weights.arch;
     debug_assert_eq!(
         handles.len(),
         num_layers,
@@ -274,18 +380,46 @@ pub fn kv_decode_step_via_dispatch_async(
     let h_new = embed_tokens_pub(&weights, &[token_id]);
     let mut h_step = h_new;
 
-    for (layer, handle) in handles.iter_mut().enumerate().take(num_layers) {
-        let h_post_attn_handle = backend.attention_step_async(
-            weights,
-            &h_step,
-            handle,
-            layer,
-            abs_position,
-            index.map(|v| v as &dyn larql_compute::KvIndex),
-        );
-        if let Some(w) = window {
-            backend.clip_kv(handle, w);
-        }
+    for layer in 0..num_layers {
+        let h_post_attn_handle = match arch.kv_shared_source_layer(layer) {
+            None => {
+                let handle = &mut handles[layer];
+                // ST4 §9: clip BEFORE attention (retain `window - 1` prior
+                // rows) so the current query never sees an out-of-window key.
+                // Global layers (effective window None) attend over the full
+                // cache with no clip.
+                let eff = effective_window_for_layer(arch, layer, window);
+                if let Some(w) = eff {
+                    backend.clip_kv(handle, w.saturating_sub(1));
+                }
+                backend.attention_step_async(
+                    weights,
+                    &h_step,
+                    handle,
+                    layer,
+                    abs_position,
+                    index.map(|v| v as &dyn larql_compute::KvIndex),
+                )
+            }
+            Some(src) => {
+                // Shared consumer: source (`src < layer`) already updated this
+                // step. Run shared-KV Q/O attention on the host. ST4 §10/§11.
+                let shared = backend
+                    .read_kv_to_host(&handles[src])
+                    .expect("shared-KV source handle must be updated before consumer decode");
+                let h = run_attention_block_decode_step_shared_backend(
+                    weights,
+                    &h_step,
+                    layer,
+                    &shared,
+                    abs_position,
+                    None,
+                )?;
+                // The shared primitive returns the resolved hidden directly;
+                // wrap it so `read_hidden` below is a no-op pass-through.
+                AttentionHandle::ready(h)
+            }
+        };
         let h_post_attn = backend.read_hidden(h_post_attn_handle);
         h_step = ffn_or_moe_layer(weights, &h_post_attn, layer, ffn);
     }
