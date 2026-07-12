@@ -9,30 +9,7 @@
 name: larql-server
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/larql-server/**'
-      - 'crates/larql-router-protocol/**'
-      - 'crates/larql-vindex/**'
-      - 'crates/larql-inference/src/**'
-      - 'crates/larql-models/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Makefile'
-      - '.github/workflows/larql-server.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/larql-server/**'
-      - 'crates/larql-router-protocol/**'
-      - 'crates/larql-vindex/**'
-      - 'crates/larql-inference/src/**'
-      - 'crates/larql-models/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Makefile'
-      - '.github/workflows/larql-server.yml'
+  workflow_call: {}
   workflow_dispatch: {}
 
 env:

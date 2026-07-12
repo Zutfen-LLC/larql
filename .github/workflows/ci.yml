@@ -1,0 +1,109 @@
+# CI Orchestrator — tiered fail-fast pipeline
+#
+# Calls the per-crate workflows in dependency tiers so that a failure in a
+# leaf crate (tier 0) cancels all downstream jobs immediately instead of
+# letting 18 jobs run for 20 minutes.
+#
+# Tier structure follows the Cargo workspace dependency graph:
+#
+#   Tier 0 (leaf crates):    models, core, boundary
+#   Tier 1 (substrate):      compute, compute-cuda, compute-vulkan
+#   Tier 2 (engine):         inference, vindex
+#   Tier 3 (API layer):      kv, lql
+#   Tier 4 (applications):   server, cli, shannon-verify
+#
+# Within each tier, all jobs run in parallel. A failure in any tier skips
+# all subsequent tiers. Coverage jobs (where present) run in the same tier
+# as their crate's test job via needs.
+#
+# The per-crate workflows still retain their own push/PR triggers with path
+# filters, so a change touching only one crate still runs just that one
+# workflow without the full pipeline. This orchestrator fires on every PR
+# and on every push to main to provide the fail-fast gate.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Tier 0 — leaf crates (everything depends on these transitively)
+  # ──────────────────────────────────────────────────────────────
+  models:
+    name: "T0 · models"
+    uses: ./.github/workflows/larql-models.yml
+
+  core:
+    name: "T0 · core"
+    uses: ./.github/workflows/larql-core.yml
+
+  boundary:
+    name: "T0 · boundary"
+    uses: ./.github/workflows/larql-boundary.yml
+
+  # ──────────────────────────────────────────────────────────────
+  # Tier 1 — substrate (depends on tier 0)
+  # ──────────────────────────────────────────────────────────────
+  compute:
+    name: "T1 · compute"
+    needs: [models]
+    uses: ./.github/workflows/larql-compute.yml
+
+  compute-cuda:
+    name: "T1 · compute-cuda"
+    needs: [models]
+    uses: ./.github/workflows/larql-compute-cuda.yml
+
+  compute-vulkan:
+    name: "T1 · compute-vulkan"
+    needs: [models]
+    uses: ./.github/workflows/larql-compute-vulkan.yml
+
+  # ──────────────────────────────────────────────────────────────
+  # Tier 2 — engine (depends on tier 1)
+  # ──────────────────────────────────────────────────────────────
+  inference:
+    name: "T2 · inference"
+    needs: [compute]
+    uses: ./.github/workflows/larql-inference.yml
+
+  vindex:
+    name: "T2 · vindex"
+    needs: [compute]
+    uses: ./.github/workflows/larql-vindex.yml
+
+  # ──────────────────────────────────────────────────────────────
+  # Tier 3 — API layer (depends on tier 2)
+  # ──────────────────────────────────────────────────────────────
+  kv:
+    name: "T3 · kv"
+    needs: [inference, vindex]
+    uses: ./.github/workflows/larql-kv.yml
+
+  lql:
+    name: "T3 · lql"
+    needs: [inference, vindex]
+    uses: ./.github/workflows/larql-lql.yml
+
+  # ──────────────────────────────────────────────────────────────
+  # Tier 4 — applications (depends on tier 3)
+  # ──────────────────────────────────────────────────────────────
+  server:
+    name: "T4 · server"
+    needs: [inference, vindex]
+    uses: ./.github/workflows/larql-server.yml
+
+  cli:
+    name: "T4 · cli"
+    needs: [kv, lql]
+    uses: ./.github/workflows/larql-cli.yml
+
+  shannon-verify:
+    name: "T4 · shannon-verify"
+    needs: [cli]
+    uses: ./.github/workflows/shannon-verify.yml
