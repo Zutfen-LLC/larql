@@ -11,6 +11,7 @@ import platform
 import re
 import sys
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -43,7 +44,6 @@ PROMPTS = (
 )
 
 REQUIRED_FILES = (
-    "model.safetensors",
     "config.json",
     "tokenizer.json",
     "tokenizer_config.json",
@@ -51,10 +51,22 @@ REQUIRED_FILES = (
     "generation_config.json",
     "processor_config.json",
 )
+REPOSITORY_ID = "google/gemma-4-E2B-it"
+CANONICAL_URL = "https://huggingface.co/google/gemma-4-E2B-it/tree/main"
 
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_blob_id(path: Path) -> str:
+    digest = hashlib.sha1()
+    size = path.stat().st_size
+    digest.update(f"blob {size}\0".encode())
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
@@ -68,8 +80,54 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 def source_files(root: Path) -> Iterable[Path]:
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        if path.is_file() and ".git" not in path.relative_to(root).parts:
+        parts = path.relative_to(root).parts
+        if path.is_file() and ".git" not in parts and ".cache" not in parts:
             yield path
+
+
+def classify_tensor(name: str) -> str:
+    if name.startswith("model.vision_tower."):
+        return "VISION_EXCLUDED"
+    if name.startswith("model.audio_tower."):
+        return "AUDIO_EXCLUDED"
+    if name.startswith(("model.embed_vision.", "model.embed_audio.")):
+        return "MULTIMODAL_PROJECTOR_EXCLUDED"
+    if "mtp" in name.lower() or "draft" in name.lower():
+        return "MTP_EXCLUDED"
+    prefix = "model.language_model."
+    if not name.startswith(prefix):
+        return "UNKNOWN_NON_DECODER"
+    normalized = name.removeprefix(prefix)
+    if normalized == "embed_tokens.weight":
+        return "TOKEN_EMBEDDING_REQUIRED"
+    if normalized == "norm.weight":
+        return "FINAL_NORM_REQUIRED"
+    if normalized in {
+        "embed_tokens_per_layer.weight",
+        "per_layer_model_projection.weight",
+        "per_layer_projection_norm.weight",
+    } or any(
+        part in normalized
+        for part in (
+            ".per_layer_input_gate.",
+            ".per_layer_projection.",
+            ".post_per_layer_input_norm.",
+        )
+    ):
+        return "PLE_REQUIRED"
+    if ".self_attn." in normalized:
+        if normalized.endswith(("q_norm.weight", "k_norm.weight")):
+            return "QK_NORM_REQUIRED"
+        return "ATTENTION_REQUIRED"
+    if "layernorm.weight" in normalized:
+        return "LAYER_NORM_REQUIRED"
+    if ".mlp." in normalized:
+        return "FFN_REQUIRED"
+    if normalized.endswith(".layer_scalar"):
+        return "ATTENTION_REQUIRED"
+    if normalized == "lm_head.weight":
+        return "SEPARATE_LM_HEAD_REQUIRED"
+    return "UNKNOWN_TEXT_DECODER"
 
 
 def git_revision(root: Path) -> str | None:
@@ -113,11 +171,45 @@ def resolve_revision(root: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
+def verify_huggingface_manifest(root: Path, revision: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        raise ValueError("repository revision must be a full 40-character commit SHA")
+    manifest_path = root / ".cache" / "huggingface" / "trees" / f"{revision.lower()}.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"pinned Hugging Face snapshot manifest is missing for revision {revision}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format_version") != 1 or not isinstance(manifest.get("files"), dict):
+        raise ValueError("unsupported Hugging Face snapshot manifest")
+    expected = manifest["files"]
+    observed = {path.relative_to(root).as_posix(): path for path in source_files(root)}
+    if set(expected) != set(observed):
+        raise ValueError("local source file set does not match the pinned snapshot manifest")
+    for name, metadata in expected.items():
+        path = observed[name]
+        if path.stat().st_size != metadata.get("size"):
+            raise ValueError(f"snapshot size mismatch: {name}")
+        wanted_sha256 = metadata.get("lfs_sha256")
+        if wanted_sha256:
+            if sha256(path) != wanted_sha256:
+                raise ValueError(f"snapshot SHA-256 mismatch: {name}")
+        elif git_blob_id(path) != metadata.get("blob_id"):
+            raise ValueError(f"snapshot Git blob mismatch: {name}")
+    return manifest_path.stat().st_mtime_ns
+
+
 def validate_source(root: Path) -> list[Path]:
     if not root.is_dir():
         raise ValueError(f"LARQL_GEMMA4_ST_DIR is not a directory: {root}")
     missing = [name for name in REQUIRED_FILES if not (root / name).is_file()]
     tensors = sorted(root.glob("*.safetensors"))
+    index_path = root / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        named = sorted(set(index.get("weight_map", {}).values()))
+        missing.extend(name for name in named if not (root / name).is_file())
+        unexpected = sorted(path.name for path in tensors if path.name not in named)
+        if unexpected:
+            raise ValueError("unexpected safetensors shards: " + ", ".join(unexpected))
     if not tensors:
         missing.append("*.safetensors")
     if missing:
@@ -125,18 +217,26 @@ def validate_source(root: Path) -> list[Path]:
     return tensors
 
 
-def build_inventory(root: Path, revision: str | None, revision_source: str | None) -> dict[str, Any]:
+def build_inventory(
+    root: Path,
+    revision: str | None,
+    revision_source: str | None,
+    download_timestamp_ns: int,
+) -> dict[str, Any]:
     from safetensors import safe_open
 
     files = []
     safetensors = []
     dtype_counts: Counter[str] = Counter()
     tensor_count = 0
+    classification_counts: Counter[str] = Counter()
+    safetensors_bytes = 0
     for path in source_files(root):
         relative = path.relative_to(root).as_posix()
         size = path.stat().st_size
         files.append({"path": relative, "sha256": sha256(path), "size_bytes": size})
         if path.suffix == ".safetensors":
+            safetensors_bytes += size
             tensors = []
             with safe_open(path, framework="pt", device="cpu") as handle:
                 metadata = handle.metadata()
@@ -144,19 +244,37 @@ def build_inventory(root: Path, revision: str | None, revision_source: str | Non
                     tensor = handle.get_slice(name)
                     dtype = str(tensor.get_dtype())
                     shape = list(tensor.get_shape())
-                    tensors.append({"dtype": dtype, "name": name, "shape": shape})
+                    classification = classify_tensor(name)
+                    tensors.append({
+                        "classification": classification,
+                        "dtype": dtype,
+                        "name": name,
+                        "shape": shape,
+                        "source_shard": relative,
+                    })
+                    classification_counts[classification] += 1
                     dtype_counts[dtype] += 1
                     tensor_count += 1
             safetensors.append({"metadata": metadata, "path": relative, "tensors": tensors})
     return {
+        "canonical_url": CANONICAL_URL,
+        "classification_counts": dict(sorted(classification_counts.items())),
+        "download_timestamp_utc": datetime.fromtimestamp(
+            download_timestamp_ns / 1_000_000_000, timezone.utc
+        ).isoformat(),
         "dtype_histogram": dict(sorted(dtype_counts.items())),
         "files": files,
         "repository_revision": revision,
         "revision_source": revision_source,
-        "root": str(root),
+        "revision_verification": "huggingface_snapshot_manifest",
+        "repository_id": REPOSITORY_ID,
+        "root": "${LARQL_GEMMA4_ST_DIR}",
         "safetensors": safetensors,
-        "schema_version": 1,
+        "safetensors_bytes": safetensors_bytes,
+        "safetensors_shard_count": len(safetensors),
+        "schema_version": 2,
         "tensor_count": tensor_count,
+        "total_repository_bytes": sum(item["size_bytes"] for item in files),
     }
 
 
@@ -185,7 +303,7 @@ def load_official(root: Path, torch: Any, transformers: Any) -> tuple[Any, Any, 
     dtype_name = os.environ.get("LARQL_GEMMA4_ST_DTYPE", "auto")
     dtype = "auto" if dtype_name == "auto" else getattr(torch, dtype_name)
     device = os.environ.get("LARQL_GEMMA4_ST_DEVICE", "cpu")
-    model = model_class.from_pretrained(root, torch_dtype=dtype, **common)
+    model = model_class.from_pretrained(root, dtype=dtype, **common)
     model.to(device).eval()
     return processor, tokenizer, model, model_class.__name__
 
@@ -227,7 +345,15 @@ def run_oracle(root: Path, revision: str, inventory_path: Path) -> dict[str, Any
             thinking = {"requested": False, "supported": None, "value": False}
         else:
             rendered, thinking = render_prompt(processor, tokenizer, prompt["messages"])
-        input_ids = tokenizer(rendered, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+        add_special_tokens = prompt["messages"] is None
+        input_ids = tokenizer(
+            rendered,
+            return_tensors="pt",
+            add_special_tokens=add_special_tokens,
+        ).input_ids.to(device)
+        if prompt["messages"] is None and input_ids[0, 0].item() != tokenizer.bos_token_id:
+            bos = torch.tensor([[tokenizer.bos_token_id]], device=device)
+            input_ids = torch.cat((bos, input_ids), dim=1)
         ids = input_ids[0].tolist()
         generation_config = transformers.GenerationConfig.from_model_config(model.config)
         generation_config.do_sample = False
@@ -246,12 +372,24 @@ def run_oracle(root: Path, revision: str, inventory_path: Path) -> dict[str, Any
                 output_hidden_states=True,
             )
         generated = output.sequences[0, input_ids.shape[1] :].tolist()
+        decoded = tokenizer.decode(generated, skip_special_tokens=False)
         logits_finite, logits_count = finite_tree(torch, output.logits)
         hidden_finite, hidden_count = finite_tree(torch, output.hidden_states)
-        healthy = len(generated) == 16 and logits_count > 0 and hidden_count > 0 and logits_finite and hidden_finite
+        ids_in_range = all(0 <= token < len(tokenizer) for token in generated)
+        healthy = len(generated) == 16 and logits_count > 0 and hidden_count > 0 and logits_finite and hidden_finite and ids_in_range
         all_healthy &= healthy
+        lowered = decoded.lower()
+        coherent = {
+            "raw_completion": "paris" in lowered,
+            "chat": any(term in lowered for term in ("scatter", "rayleigh")),
+            "arithmetic": "391" in decoded,
+        }[prompt["id"]]
+        placeholders = any(token in decoded for token in ("<|image|>", "<|audio|>", "<|video|>"))
+        hidden_thinking = "<|channel>thought" in decoded or "<|think|>" in decoded
+        quality = "COHERENT" if coherent and not placeholders and not hidden_thinking else "DEGRADED"
         runs.append({
-            "decoded_new_tokens": tokenizer.decode(generated, skip_special_tokens=False),
+            "bos_placement": [index for index, token in enumerate(ids) if token == tokenizer.bos_token_id],
+            "decoded_new_tokens": decoded,
             "generated_pieces": tokenizer.convert_ids_to_tokens(generated),
             "generated_token_ids": generated,
             "hidden_states": {"finite": hidden_finite, "tensor_count": hidden_count},
@@ -259,12 +397,15 @@ def run_oracle(root: Path, revision: str, inventory_path: Path) -> dict[str, Any
             "input_token_ids": ids,
             "logits": {"finite": logits_finite, "tensor_count": logits_count},
             "new_token_count": len(generated),
+            "output_quality": quality,
             "prompt_id": prompt["id"],
             "source_messages": prompt["messages"],
             "raw_prompt": prompt["raw"],
             "rendered_prompt": rendered,
             "thinking_control": thinking,
+            "token_ids_within_vocabulary": ids_in_range,
         })
+    output_quality = "COHERENT" if all(run["output_quality"] == "COHERENT" for run in runs) else "DEGRADED"
     return {
         "environment": {
             "device": str(device),
@@ -275,6 +416,8 @@ def run_oracle(root: Path, revision: str, inventory_path: Path) -> dict[str, Any
             "safetensors": safetensors.__version__,
             "torch": torch.__version__,
             "transformers": transformers.__version__,
+            "tokenizers": __import__("tokenizers").__version__,
+            "huggingface_hub": __import__("huggingface_hub").__version__,
         },
         "generation": {
             "do_sample": False,
@@ -286,8 +429,9 @@ def run_oracle(root: Path, revision: str, inventory_path: Path) -> dict[str, Any
         "inventory_path": str(inventory_path),
         "repository_revision": revision,
         "runs": runs,
-        "schema_version": 1,
+        "schema_version": 2,
         "source_health": "HEALTHY" if all_healthy else "UNHEALTHY",
+        "output_quality": output_quality,
         "tokenizer": {
             "add_bos_token": getattr(tokenizer, "add_bos_token", None),
             "add_eos_token": getattr(tokenizer, "add_eos_token", None),
@@ -295,6 +439,7 @@ def run_oracle(root: Path, revision: str, inventory_path: Path) -> dict[str, Any
             "special_token_ids": special_ids,
             "special_tokens": special_tokens,
             "vocab_size": len(tokenizer),
+            "eos_ids": model.config.eos_token_id,
         },
     }
 
@@ -312,10 +457,11 @@ def main() -> int:
         root = Path(source).expanduser().resolve()
         validate_source(root)
         revision, revision_source = resolve_revision(root)
-        inventory = build_inventory(root, revision, revision_source)
-        write_json(args.inventory, inventory)
         if revision is None:
             raise ValueError(f"repository revision unavailable; set {REVISION_ENV}")
+        download_timestamp_ns = verify_huggingface_manifest(root, revision)
+        inventory = build_inventory(root, revision, revision_source, download_timestamp_ns)
+        write_json(args.inventory, inventory)
         report = run_oracle(root, revision, args.inventory)
         report["revision_source"] = revision_source
     except Exception as error:  # A machine-readable failure artifact is part of the contract.
@@ -324,7 +470,7 @@ def main() -> int:
         print(f"oracle failed: {error}", file=sys.stderr)
         return 1
     write_json(args.output, report)
-    return 0 if report["source_health"] == "HEALTHY" else 2
+    return 0 if report["source_health"] == "HEALTHY" and report["output_quality"] == "COHERENT" else 2
 
 
 if __name__ == "__main__":

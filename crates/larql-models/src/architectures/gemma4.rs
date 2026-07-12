@@ -99,6 +99,22 @@ impl ModelArchitecture for Gemma4Arch {
         &self.config
     }
 
+    fn intermediate_size_for_layer(&self, layer: usize) -> usize {
+        let first_wide = self
+            .config
+            .num_kv_shared_layers
+            .filter(|&count| count < self.config.num_layers)
+            .map_or(self.config.num_layers, |count| {
+                self.config.num_layers - count
+            });
+        if self.config.use_double_wide_mlp && layer >= first_wide && layer < self.config.num_layers
+        {
+            self.config.intermediate_size * 2
+        } else {
+            self.config.intermediate_size
+        }
+    }
+
     /// Gemma 4 weights use `model.language_model.` prefix (multimodal wrapper).
     fn key_prefixes_to_strip(&self) -> &[&str] {
         &[

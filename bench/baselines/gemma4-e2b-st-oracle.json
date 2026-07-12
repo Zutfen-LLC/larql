@@ -1,12 +1,413 @@
 {
-  "schema_version": 1,
-  "slice": "LARQL-INFERENCE-TRUST-001A-ST1",
-  "repository": "unsloth/gemma-4-E2B-it-qat-q4_0-unquantized",
-  "repository_revision": "397aea7eca1853d6f3d099a56612a68ffc0229ae",
-  "local_source_available": false,
-  "unavailable_reason": "LARQL_GEMMA4_ST_DIR was not set",
-  "environment": null,
-  "prompts": null,
-  "source_health": "FAILED",
-  "evidence_status": "not observed"
+  "environment": {
+    "device": "cuda:0",
+    "dtype": "torch.bfloat16",
+    "huggingface_hub": "1.23.0",
+    "model_class": "AutoModelForImageTextToText",
+    "platform": "Linux-7.1.3-2-cachyos-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.22.2",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.13.1"
+  },
+  "generation": {
+    "do_sample": false,
+    "max_new_tokens": 16,
+    "min_new_tokens": 16,
+    "num_beams": 1,
+    "speculative_decoding": false
+  },
+  "inventory_path": "bench/baselines/gemma4-e2b-st-source-inventory.json",
+  "output_quality": "COHERENT",
+  "repository_revision": "9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf",
+  "revision_source": "LARQL_GEMMA4_ST_REVISION",
+  "runs": [
+    {
+      "bos_placement": [
+        0
+      ],
+      "decoded_new_tokens": " Paris.\n\n**True**\n\n***\n\n**Explanation:** Paris is the capital",
+      "generated_pieces": [
+        "\u2581Paris",
+        ".",
+        "\n\n",
+        "**",
+        "True",
+        "**",
+        "\n\n",
+        "***",
+        "\n\n",
+        "**",
+        "Explanation",
+        ":**",
+        "\u2581Paris",
+        "\u2581is",
+        "\u2581the",
+        "\u2581capital"
+      ],
+      "generated_token_ids": [
+        9079,
+        236761,
+        108,
+        1018,
+        4339,
+        1018,
+        108,
+        13513,
+        108,
+        1018,
+        44008,
+        53121,
+        9079,
+        563,
+        506,
+        5279
+      ],
+      "hidden_states": {
+        "finite": true,
+        "tensor_count": 576
+      },
+      "input_pieces": [
+        "<bos>",
+        "The",
+        "\u2581capital",
+        "\u2581of",
+        "\u2581France",
+        "\u2581is"
+      ],
+      "input_token_ids": [
+        2,
+        818,
+        5279,
+        529,
+        7001,
+        563
+      ],
+      "logits": {
+        "finite": true,
+        "tensor_count": 16
+      },
+      "new_token_count": 16,
+      "output_quality": "COHERENT",
+      "prompt_id": "raw_completion",
+      "raw_prompt": "The capital of France is",
+      "rendered_prompt": "The capital of France is",
+      "source_messages": null,
+      "thinking_control": {
+        "requested": false,
+        "supported": null,
+        "value": false
+      },
+      "token_ids_within_vocabulary": true
+    },
+    {
+      "bos_placement": [
+        0
+      ],
+      "decoded_new_tokens": "The sky appears blue because of a phenomenon called Rayleigh scattering, where shorter wavelengths of",
+      "generated_pieces": [
+        "The",
+        "\u2581sky",
+        "\u2581appears",
+        "\u2581blue",
+        "\u2581because",
+        "\u2581of",
+        "\u2581a",
+        "\u2581phenomenon",
+        "\u2581called",
+        "\u2581Rayleigh",
+        "\u2581scattering",
+        ",",
+        "\u2581where",
+        "\u2581shorter",
+        "\u2581wavelengths",
+        "\u2581of"
+      ],
+      "generated_token_ids": [
+        818,
+        7217,
+        7412,
+        3730,
+        1547,
+        529,
+        496,
+        20284,
+        2760,
+        121707,
+        19389,
+        236764,
+        1298,
+        20532,
+        57583,
+        529
+      ],
+      "hidden_states": {
+        "finite": true,
+        "tensor_count": 576
+      },
+      "input_pieces": [
+        "<bos>",
+        "<|turn>",
+        "system",
+        "\n",
+        "You",
+        "\u2581are",
+        "\u2581a",
+        "\u2581helpful",
+        "\u2581assistant",
+        ".",
+        "<turn|>",
+        "\n",
+        "<|turn>",
+        "user",
+        "\n",
+        "In",
+        "\u2581one",
+        "\u2581sentence",
+        ",",
+        "\u2581explain",
+        "\u2581why",
+        "\u2581the",
+        "\u2581sky",
+        "\u2581appears",
+        "\u2581blue",
+        ".",
+        "<turn|>",
+        "\n",
+        "<|turn>",
+        "model",
+        "\n"
+      ],
+      "input_token_ids": [
+        2,
+        105,
+        9731,
+        107,
+        3048,
+        659,
+        496,
+        11045,
+        16326,
+        236761,
+        106,
+        107,
+        105,
+        2364,
+        107,
+        902,
+        886,
+        13315,
+        236764,
+        8082,
+        3217,
+        506,
+        7217,
+        7412,
+        3730,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107
+      ],
+      "logits": {
+        "finite": true,
+        "tensor_count": 16
+      },
+      "new_token_count": 16,
+      "output_quality": "COHERENT",
+      "prompt_id": "chat",
+      "raw_prompt": null,
+      "rendered_prompt": "<bos><|turn>system\nYou are a helpful assistant.<turn|>\n<|turn>user\nIn one sentence, explain why the sky appears blue.<turn|>\n<|turn>model\n",
+      "source_messages": [
+        {
+          "content": "You are a helpful assistant.",
+          "role": "system"
+        },
+        {
+          "content": "In one sentence, explain why the sky appears blue.",
+          "role": "user"
+        }
+      ],
+      "thinking_control": {
+        "requested": true,
+        "supported": true,
+        "value": false
+      },
+      "token_ids_within_vocabulary": true
+    },
+    {
+      "bos_placement": [
+        0
+      ],
+      "decoded_new_tokens": "391</blockquote>\n\u200b\n\u200b\n\u200b\n\u200b\n\u200b\n\u200b",
+      "generated_pieces": [
+        "3",
+        "9",
+        "1",
+        "</blockquote>",
+        "\n",
+        "\u200b",
+        "\n",
+        "\u200b",
+        "\n",
+        "\u200b",
+        "\n",
+        "\u200b",
+        "\n",
+        "\u200b",
+        "\n",
+        "\u200b"
+      ],
+      "generated_token_ids": [
+        236800,
+        236819,
+        236770,
+        197,
+        107,
+        237141,
+        107,
+        237141,
+        107,
+        237141,
+        107,
+        237141,
+        107,
+        237141,
+        107,
+        237141
+      ],
+      "hidden_states": {
+        "finite": true,
+        "tensor_count": 576
+      },
+      "input_pieces": [
+        "<bos>",
+        "<|turn>",
+        "system",
+        "\n",
+        "You",
+        "\u2581are",
+        "\u2581a",
+        "\u2581careful",
+        "\u2581assistant",
+        ".",
+        "<turn|>",
+        "\n",
+        "<|turn>",
+        "user",
+        "\n",
+        "What",
+        "\u2581is",
+        "\u2581",
+        "1",
+        "7",
+        "\u2581multiplied",
+        "\u2581by",
+        "\u2581",
+        "2",
+        "3",
+        "?",
+        "\u2581Give",
+        "\u2581only",
+        "\u2581the",
+        "\u2581answer",
+        ".",
+        "<turn|>",
+        "\n",
+        "<|turn>",
+        "model",
+        "\n"
+      ],
+      "input_token_ids": [
+        2,
+        105,
+        9731,
+        107,
+        3048,
+        659,
+        496,
+        15318,
+        16326,
+        236761,
+        106,
+        107,
+        105,
+        2364,
+        107,
+        3689,
+        563,
+        236743,
+        236770,
+        236832,
+        37764,
+        684,
+        236743,
+        236778,
+        236800,
+        236881,
+        23097,
+        1186,
+        506,
+        3890,
+        236761,
+        106,
+        107,
+        105,
+        4368,
+        107
+      ],
+      "logits": {
+        "finite": true,
+        "tensor_count": 16
+      },
+      "new_token_count": 16,
+      "output_quality": "COHERENT",
+      "prompt_id": "arithmetic",
+      "raw_prompt": null,
+      "rendered_prompt": "<bos><|turn>system\nYou are a careful assistant.<turn|>\n<|turn>user\nWhat is 17 multiplied by 23? Give only the answer.<turn|>\n<|turn>model\n",
+      "source_messages": [
+        {
+          "content": "You are a careful assistant.",
+          "role": "system"
+        },
+        {
+          "content": "What is 17 multiplied by 23? Give only the answer.",
+          "role": "user"
+        }
+      ],
+      "thinking_control": {
+        "requested": true,
+        "supported": true,
+        "value": false
+      },
+      "token_ids_within_vocabulary": true
+    }
+  ],
+  "schema_version": 2,
+  "source_health": "HEALTHY",
+  "tokenizer": {
+    "add_bos_token": false,
+    "add_eos_token": false,
+    "class": "GemmaTokenizer",
+    "eos_ids": [
+      1,
+      106
+    ],
+    "special_token_ids": {
+      "bos_token_id": 2,
+      "eos_token_id": 1,
+      "pad_token_id": 0,
+      "unk_token_id": 3
+    },
+    "special_tokens": {
+      "bos_token": "<bos>",
+      "eos_token": "<eos>",
+      "pad_token": "<pad>",
+      "unk_token": "<unk>"
+    },
+    "vocab_size": 262144
+  }
 }

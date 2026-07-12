@@ -274,6 +274,9 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         .as_u64()
         .map(|v| v as usize)
         .filter(|&v| v > 0);
+    let use_double_wide_mlp = text_config["use_double_wide_mlp"]
+        .as_bool()
+        .unwrap_or(false);
 
     // Per-layer embedding dimension (PLE)
     let per_layer_embed_dim = text_config["hidden_size_per_layer_input"]
@@ -320,6 +323,7 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         attention_k_eq_v,
         per_layer_embed_dim,
         num_kv_shared_layers,
+        use_double_wide_mlp,
         enable_moe_block,
         top_k_experts,
         moe_intermediate_size,

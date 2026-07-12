@@ -781,6 +781,7 @@ fn gemma4_e2b_arch() -> Box<dyn ModelArchitecture> {
             "sliding_window": 512,
             "hidden_size_per_layer_input": 256,
             "num_kv_shared_layers": 20,
+            "use_double_wide_mlp": true,
             "rope_parameters": {
                 "full_attention": {
                     "partial_rotary_factor": 0.25,
@@ -887,6 +888,15 @@ fn gemma4_kv_sharing() {
     // Global shared layers → last non-shared global (L14)
     assert_eq!(arch.kv_shared_source_layer(19), Some(14));
     assert_eq!(arch.kv_shared_source_layer(34), Some(14));
+}
+
+#[test]
+fn gemma4_double_wide_mlp_follows_shared_region() {
+    let arch = gemma4_e2b_arch();
+    assert!(arch.config().use_double_wide_mlp);
+    assert_eq!(arch.intermediate_size_for_layer(14), 6144);
+    assert_eq!(arch.intermediate_size_for_layer(15), 12288);
+    assert_eq!(arch.intermediate_size_for_layer(34), 12288);
 }
 
 #[test]

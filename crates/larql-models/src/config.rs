@@ -157,6 +157,8 @@ pub struct ModelConfig {
     /// Number of layers at the end of the model that share KV from earlier layers.
     /// E.g., 20 means the last 20 layers reuse KV cache from earlier source layers.
     pub num_kv_shared_layers: Option<usize>,
+    /// Whether layers in the KV-shared region use twice the base FFN width.
+    pub use_double_wide_mlp: bool,
     /// Whether the model's config.json contains a `vision_config` section.
     pub has_vision_config: bool,
 }
@@ -169,6 +171,11 @@ pub trait ModelArchitecture: Send + Sync {
 
     /// Parsed model configuration.
     fn config(&self) -> &ModelConfig;
+
+    /// Dense FFN width for one layer. Most architectures use one global width.
+    fn intermediate_size_for_layer(&self, _layer: usize) -> usize {
+        self.config().intermediate_size
+    }
 
     /// Validate parsed architecture dimensions and cross-field invariants.
     ///
