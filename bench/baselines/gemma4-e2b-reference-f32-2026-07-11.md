@@ -10,7 +10,7 @@ Slice: `LARQL-INFERENCE-TRUST-001A-ST2`
 
 - Work-start SHA: `d5922116a1ea8967a427164365baa75b370baffc`
 - PR base SHA: `d5922116a1ea8967a427164365baa75b370baffc`
-- Final head SHA: recorded in PR metadata after commit
+- Final head SHA: `62642e3da80a0a8a0f9ebd38cf26d8af7c53b13d`
 
 ## Source
 
@@ -67,6 +67,6 @@ cargo test -p larql-vindex --test gemma4_reference_vindex_roundtrip \
 - Required clippy checks for models, vindex, CLI, compute, and inference: passed with `-D warnings`
 - `cargo build -p larql-cli --release`: passed
 - Exact-source roundtrip: 1 passed, 0 failed
-- GitHub Actions: pending PR creation
+- GitHub Actions: all triggered GitHub Actions workflows passed
 
 `LARQL-INFERENCE-TRUST-001A-ST3` is unblocked for tokenizer, chat-template, BOS/EOS, and prompt-token parity work.
