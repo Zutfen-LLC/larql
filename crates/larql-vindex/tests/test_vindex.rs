@@ -4158,6 +4158,63 @@ fn streaming_extract_noquant_carries_ple_tensors() {
     let _ = std::fs::remove_dir_all(&output_dir);
 }
 
+#[test]
+fn streaming_reference_f32_writes_dense_exact_ple_tensors() {
+    let model_dir = std::env::temp_dir().join("larql_test_reference_f32_ple_model");
+    let output_dir = std::env::temp_dir().join("larql_test_reference_f32_ple_output");
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+    let (hidden, intermediate, num_layers, vocab, ple_dim) = (256, 256, 2, 256, 256);
+    write_gemma4_ple_fixture(&model_dir, num_layers, hidden, intermediate, vocab, ple_dim);
+    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(
+        br#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#,
+    )
+    .unwrap();
+    let opts = larql_vindex::WriteWeightsOptions {
+        ple_storage: larql_vindex::PleStoragePolicy::ReferenceF32,
+        ..Default::default()
+    };
+    larql_vindex::build_vindex_streaming(
+        &model_dir,
+        &tokenizer,
+        "test/reference-f32-ple",
+        &output_dir,
+        5,
+        0,
+        larql_vindex::ExtractLevel::Inference,
+        larql_vindex::StorageDtype::F32,
+        larql_vindex::QuantFormat::None,
+        opts,
+        larql_vindex::KquantWriteOptions::default(),
+        false,
+        &mut larql_vindex::SilentBuildCallbacks,
+    )
+    .unwrap();
+
+    let manifest: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(output_dir.join("weight_manifest.json")).unwrap())
+            .unwrap();
+    let ple_entries = manifest
+        .iter()
+        .filter(|entry| entry["file"] == "ple_weights.bin")
+        .collect::<Vec<_>>();
+    assert_eq!(ple_entries.len(), 2 + 2 * num_layers);
+    assert!(ple_entries.iter().all(|entry| entry["kind"] == "tensor"));
+    assert!(ple_entries.iter().all(|entry| {
+        let elements = entry["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dim| dim.as_u64().unwrap())
+            .product::<u64>();
+        entry["length"] == elements * 4
+    }));
+    larql_vindex::load_model_weights(&output_dir, &mut larql_vindex::SilentLoadCallbacks).unwrap();
+
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+}
+
 // ─── load_model_weights rejects PLE-arch vindexes with missing sidecars ──
 //
 // Pre-#49, dropping PLE tensors on the writer side was paired with a

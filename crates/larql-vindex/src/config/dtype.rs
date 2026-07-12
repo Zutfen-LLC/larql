@@ -43,11 +43,7 @@ pub fn write_floats(
 /// Encode f32 data as either f32 or f16 bytes.
 pub fn encode_floats(data: &[f32], dtype: StorageDtype) -> Vec<u8> {
     match dtype {
-        StorageDtype::F32 => {
-            let bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-            bytes.to_vec()
-        }
+        StorageDtype::F32 => data.iter().flat_map(|value| value.to_le_bytes()).collect(),
         StorageDtype::F16 => larql_models::quant::half::encode_f16(data),
     }
 }
@@ -55,11 +51,10 @@ pub fn encode_floats(data: &[f32], dtype: StorageDtype) -> Vec<u8> {
 /// Decode bytes back to f32, handling dtype.
 pub fn decode_floats(data: &[u8], dtype: StorageDtype) -> Vec<f32> {
     match dtype {
-        StorageDtype::F32 => {
-            let floats: &[f32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) };
-            floats.to_vec()
-        }
+        StorageDtype::F32 => data
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect(),
         StorageDtype::F16 => larql_models::quant::half::decode_f16(data),
     }
 }
@@ -83,6 +78,24 @@ mod tests {
         assert_eq!(encoded.len(), 12);
         let decoded = decode_floats(&encoded, StorageDtype::F32);
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn decode_f32_accepts_unaligned_slice() {
+        let mut bytes = vec![0xff];
+        bytes.extend(encode_floats(
+            &[1.0, -0.0, f32::INFINITY],
+            StorageDtype::F32,
+        ));
+        let decoded = decode_floats(&bytes[1..], StorageDtype::F32);
+        assert_eq!(
+            decoded.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            [
+                1.0f32.to_bits(),
+                (-0.0f32).to_bits(),
+                f32::INFINITY.to_bits(),
+            ]
+        );
     }
 
     #[test]

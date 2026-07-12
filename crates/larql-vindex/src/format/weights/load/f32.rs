@@ -122,12 +122,21 @@ pub fn load_model_weights_with_opts(
         // Gate vector conversion may have changed index.json dtype to f32
         // while weight files remain f16.
         let expected_floats: usize = entry.shape.iter().product();
-        let actual_dtype = if byte_count == expected_floats * 4 {
+        let expected_f32_bytes = expected_floats.checked_mul(4).ok_or_else(|| {
+            VindexError::Parse(format!("tensor {} byte length overflow", entry.key))
+        })?;
+        let expected_f16_bytes = expected_floats.checked_mul(2).ok_or_else(|| {
+            VindexError::Parse(format!("tensor {} byte length overflow", entry.key))
+        })?;
+        let actual_dtype = if byte_count == expected_f32_bytes {
             crate::config::dtype::StorageDtype::F32
-        } else if byte_count == expected_floats * 2 {
+        } else if byte_count == expected_f16_bytes {
             crate::config::dtype::StorageDtype::F16
         } else {
-            config.dtype // fallback to global
+            return Err(VindexError::Parse(format!(
+                "tensor {} has malformed byte length {} for shape {:?}; expected {} (f32) or {} (f16)",
+                entry.key, byte_count, entry.shape, expected_f32_bytes, expected_f16_bytes
+            )));
         };
         let floats = crate::config::dtype::decode_floats(raw_bytes, actual_dtype);
 
@@ -142,11 +151,8 @@ pub fn load_model_weights_with_opts(
                 }
             }
             kind::TENSOR_F16 => {
-                // Gemma 4 PLE sidecars are always written as f16 (see
-                // `weights::ple_sidecar`). The byte-count vs expected
-                // floats already picked F16 in `actual_dtype` above, so
-                // `floats` is already decoded — same handling as TENSOR
-                // from here, just routed via a distinct manifest kind.
+                // Production PLE sidecars use this explicit F16 kind.
+                // Reference F32 PLE uses the ordinary dense tensor kind.
                 if entry.shape.len() != 2 {
                     continue;
                 }

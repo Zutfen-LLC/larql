@@ -34,8 +34,8 @@ pub use load::{
 };
 pub use manifest::Q4kManifestEntry;
 pub use write_f32::{
-    write_model_weights, write_model_weights_with_opts, StreamingWeights, WeightSource,
-    WriteWeightsOptions,
+    write_model_weights, write_model_weights_with_opts, PleStoragePolicy, StreamingWeights,
+    WeightSource, WriteWeightsOptions,
 };
 pub use write_kquant::{
     write_model_weights_kquant, write_model_weights_kquant_with_opts, DownProjFormat,

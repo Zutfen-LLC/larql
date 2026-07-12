@@ -7,10 +7,9 @@
 //! accommodate those outliers, and the cell-level noise compounds
 //! over 35+ layers of additive contribution — the observable result
 //! was garbage tokens on Gemma 4 E2B / E4B. f16 halves the BF16
-//! footprint and preserves enough precision for accurate per-token
-//! retrieval, so PLE is stored as `kind::TENSOR_F16` in
-//! `ple_weights.bin` regardless of the rest of the vindex's quant
-//! mode.
+//! footprint and preserves enough precision for production retrieval.
+//! Lossless reference extraction overrides that default and stores PLE
+//! as little-endian F32.
 //!
 //! Both writers (`write_f32` and `write_q4k`) call into this helper
 //! so the on-disk layout — and the manifest entries the loader
@@ -25,7 +24,7 @@ use crate::error::VindexError;
 use crate::format::filenames::*;
 
 use super::profile::Recorder;
-use super::write_f32::{kind, WeightEntry, WeightSource};
+use super::write_f32::{kind, PleStoragePolicy, WeightEntry, WeightSource};
 
 /// Write `ple_weights.bin` and append `tensor_f16` manifest entries
 /// for every Gemma-4 PLE tensor. No-op when the architecture has no
@@ -40,6 +39,7 @@ pub(super) fn write_ple_weights(
     num_layers: usize,
     manifest_entries: &mut Vec<WeightEntry>,
     rec: &Recorder<'_>,
+    policy: PleStoragePolicy,
 ) -> Result<(), VindexError> {
     let arch = source.arch();
     if !arch.has_per_layer_embeddings() {
@@ -49,7 +49,12 @@ pub(super) fn write_ple_weights(
     let ple_path = dir.join(PLE_WEIGHTS_BIN);
     let mut ple_file = BufWriter::new(std::fs::File::create(&ple_path)?);
     let mut ple_offset: u64 = 0;
-    let ple_dtype = crate::config::dtype::StorageDtype::F16;
+    let (ple_dtype, manifest_kind) = match policy {
+        PleStoragePolicy::ProductionF16 => {
+            (crate::config::dtype::StorageDtype::F16, kind::TENSOR_F16)
+        }
+        PleStoragePolicy::ReferenceF32 => (crate::config::dtype::StorageDtype::F32, kind::TENSOR),
+    };
 
     let write_tensor = |file: &mut BufWriter<std::fs::File>,
                         manifest: &mut Vec<WeightEntry>,
@@ -64,7 +69,7 @@ pub(super) fn write_ple_weights(
             rec.write(rec.now(), "ple_sidecar", &key, None, bytes.len() as u64);
             manifest.push(WeightEntry {
                 key,
-                kind: kind::TENSOR_F16.into(),
+                kind: manifest_kind.into(),
                 shape: vec![rows, cols],
                 offset: *offset,
                 length: bytes.len() as u64,
