@@ -26,10 +26,13 @@ pub mod capture;
 pub mod compare;
 pub mod format;
 
-pub use capture::{capture_prompt, write_larql_trace};
+pub use capture::{
+    capture_prompt, capture_prompt_q4k, shared_kv_source_map, write_larql_q4k_trace,
+    write_larql_trace,
+};
 pub use compare::{
     compare_detailed_stage, compare_tensor, compare_traces, Decision, FirstDivergence, LogitTopK,
-    ParityResult, Policy, PolicyView, PromptComparison, StageMetrics,
+    ParityResult, Policy, PolicyView, PromptComparison, StageKind, StageMetrics,
 };
 pub use format::{
     coarse_stage_order, entry_at, entry_from, read_tensor, required_coarse_stages, StageId,

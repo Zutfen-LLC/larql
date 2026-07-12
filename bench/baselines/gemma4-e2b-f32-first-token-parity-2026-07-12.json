@@ -39,7 +39,9 @@
     "loader": "larql_vindex::load_model_weights (production F32 loader)"
   },
   "first_token_semantic_parity_test": "cargo test -p larql-inference --test gemma4_first_token_parity --release -- --ignored --nocapture (env-gated; soft-skips without the 18.65 GB artifact)",
-  "head_sha": "0eee46956438607acaf72ba5c9e6e53d206add84",
+  "head_sha": "53be0a5f2d551a93445ef165140456f4809622d8",
+  "merge_commit": "6e2bab40a8372c550b18b291587d53ace66b6ffd",
+  "ci": "final consolidated workflow successful",
   "oracle": {
     "environment": {
       "attention_implementation": "eager",

@@ -104,6 +104,46 @@ pub fn forward_raw_logits_traced(
     }
 }
 
+/// Compute the ST5/ST6 traced tail stages — pre-final-norm, final-norm,
+/// lm-head raw, final logits — from a post-layer residual `h` using the
+/// production final-norm + lm-head + logits transform.
+///
+/// This is the shared tail computation for both the F32 traced forward
+/// ([`forward_raw_logits_traced`]) and the Q4_K hooked forward
+/// (`predict_kquant_hidden_hooked` + this function), so the two capture
+/// paths use byte-identical tail math. `h` must have at least one row.
+pub fn traced_tail_from_hidden(weights: larql_models::WeightsView, h: &Array2<f32>) -> TracedTail {
+    traced_tail_with_lm_head(weights, h, &weights.lm_head)
+}
+
+/// Like [`traced_tail_from_hidden`] but projects through an explicit
+/// `lm_head` matrix instead of `weights.lm_head`. The final norm still uses
+/// `weights`' norm weights (F32 in both F32 and Q4_K vindexes, so identical).
+///
+/// Used by the ST6 §8 body-vs-lm-head error decomposition:
+///   - route B (Q4_K body + F32 lm-head) passes the F32 reference's lm-head,
+///   - route C (Q4_K body + production Q4_K lm-head) passes `weights.lm_head`.
+pub fn traced_tail_with_lm_head(
+    weights: larql_models::WeightsView,
+    h: &Array2<f32>,
+    lm_head: &ndarray::ArrayBase<impl ndarray::Data<Elem = f32>, ndarray::Ix2>,
+) -> TracedTail {
+    let total_len = h.nrows();
+    assert!(total_len > 0, "traced tail needs >= 1 row");
+    let last = total_len - 1;
+    let norm_offset = weights.arch.norm_weight_offset();
+    let h_final = apply_norm(&weights, h, weights.arch.final_norm_key(), norm_offset);
+    let last_2d = h_final.slice(ndarray::s![last..total_len, ..]);
+    let logits_raw = dot_proj(&last_2d, lm_head);
+    let logits = apply_logits_transform(weights.canonical(), logits_raw.row(0).as_slice().unwrap());
+    TracedTail {
+        pre_final_norm: h.row(last).to_vec(),
+        final_norm: h_final.row(last).to_vec(),
+        lm_head_raw: logits_raw.row(0).to_vec(),
+        final_logits: logits.to_vec(),
+    }
+}
+
 /// Apply the model's final logits transform: divide by `logits_scaling`
 /// then apply the optional `final_logit_softcapping` tanh.
 fn apply_logits_transform(weights: &ModelWeights, raw_row: &[f32]) -> ndarray::Array1<f32> {
