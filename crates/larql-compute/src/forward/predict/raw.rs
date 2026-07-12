@@ -328,6 +328,7 @@ fn forward_layer_range(
 #[cfg(test)]
 mod forward_from_layer_tests {
     use super::*;
+    use crate::forward::RecordHook;
     use larql_models::test_fixtures::make_test_weights;
 
     #[test]
@@ -347,6 +348,56 @@ mod forward_from_layer_tests {
             raw.h_pre_norm.shape(),
             &[3, weights.hidden_size],
             "h_pre_norm shape"
+        );
+    }
+
+    #[test]
+    fn forward_raw_logits_traced_captures_boundaries_and_tail() {
+        // The ST5 traced forward must run the same math as forward_raw_logits
+        // and expose every coarse boundary via the hook + TracedTail.
+        let weights = make_test_weights();
+        let n = weights.num_layers;
+        let view = larql_models::WeightsView::dense(&weights);
+        let ids = [0u32, 1, 2];
+
+        // Traced path.
+        let mut hook = RecordHook::for_layers(0..n);
+        let tail = forward_raw_logits_traced(view, &ids, &mut hook);
+
+        // Reference path (same math, no capture).
+        let raw = forward_raw_logits(view, &ids, None);
+
+        // Per-layer boundary capture: every layer recorded pre/post stages.
+        for layer in 0..n {
+            assert!(hook.pre_layer.contains_key(&layer), "pre_layer {layer}");
+            assert!(hook.post_attention.contains_key(&layer), "post_attention {layer}");
+            assert!(hook.post_ffn.contains_key(&layer), "post_ffn {layer}");
+            assert!(hook.post_ple.contains_key(&layer), "post_ple {layer}");
+            assert!(hook.post_layer.contains_key(&layer), "post_layer {layer}");
+        }
+
+        // Tail stages: last-token vectors of the expected width.
+        let hidden = weights.hidden_size;
+        assert_eq!(tail.pre_final_norm.len(), hidden);
+        assert_eq!(tail.final_norm.len(), hidden);
+        assert_eq!(tail.lm_head_raw.len(), weights.vocab_size);
+        assert_eq!(tail.final_logits.len(), weights.vocab_size);
+
+        // pre_final_norm == last row of the reference pre-norm residual.
+        let last = ids.len() - 1;
+        for (i, v) in tail.pre_final_norm.iter().enumerate() {
+            assert!(
+                (v - raw.h_pre_norm[[last, i]]).abs() < 1e-4,
+                "pre_final_norm[{i}] mismatch"
+            );
+        }
+        // final logits match the reference logits (same transform).
+        for (i, v) in tail.final_logits.iter().enumerate() {
+            assert!((v - raw.logits[i]).abs() < 1e-4, "final_logits[{i}] mismatch");
+        }
+        assert!(
+            tail.final_logits.iter().all(|v| v.is_finite()),
+            "final logits must be finite"
         );
     }
 
