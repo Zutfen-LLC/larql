@@ -9,8 +9,11 @@
 use larql_compute::attention::{
     causal_attention_range, gqa_attention_decode_step, gqa_attention_windowed,
     gqa_attention_with_all_weights_windowed, gqa_attention_with_weights_windowed,
-    gqa_reduced_qk_all_weights_windowed, AttentionRange,
+    gqa_reduced_qk_all_weights_windowed, run_attention_block_decode_step_shared_backend,
+    validate_shared_kv_geometry, AttentionRange,
 };
+use larql_models::test_fixtures::{make_synthetic_e2b_like_weights_random, make_test_weights};
+use larql_models::WeightsView;
 use ndarray::Array2;
 
 fn small(rows: usize, cols: usize, scale: f32) -> Array2<f32> {
@@ -368,4 +371,213 @@ fn t36_gqa_prefill_last_query_matches_windowed_slice() {
             "prefill last query vs windowed-slice decode: {a} vs {b}"
         );
     }
+}
+
+// ── Shared-KV decode primitive (ST4 §10) ───────────────────────────────
+//
+// The 4-layer synthetic E2B fixture: layer_types [sliding, full, sliding,
+// full], num_kv_shared_layers=2 → layers 2/3 are shared consumers of
+// layers 0/1. These exercise `run_attention_block_decode_step_shared_backend`
+// and `validate_shared_kv_geometry` at the substrate crate.
+
+fn e2b_random_weights() -> larql_models::ModelWeights {
+    make_synthetic_e2b_like_weights_random()
+}
+
+fn embed1(weights: &larql_models::ModelWeights) -> Array2<f32> {
+    Array2::from_shape_fn((1, weights.hidden_size), |(_, c)| (c as f32) * 0.01 + 0.05)
+}
+
+#[test]
+fn shared_decode_primitive_returns_post_attn_hidden() {
+    let weights = e2b_random_weights();
+    let arch = &*weights.arch;
+    let consumer = 2usize; // shared sliding consumer, source 0
+    let kv_dim = arch.num_kv_heads_for_layer(consumer) * arch.head_dim_for_layer(consumer);
+    let k = Array2::from_shape_fn((3, kv_dim), |(r, c)| {
+        (r as f32 + 1.0) * 0.1 + c as f32 * 0.01
+    });
+    let v = Array2::from_shape_fn((3, kv_dim), |(r, c)| {
+        (r as f32 + 2.0) * 0.1 + c as f32 * 0.01
+    });
+    let h = embed1(&weights);
+    let out = run_attention_block_decode_step_shared_backend(
+        WeightsView::dense(&weights),
+        &h,
+        consumer,
+        &(k, v),
+        3,
+        None,
+    )
+    .expect("shared decode");
+    assert_eq!(out.shape(), &[1, weights.hidden_size]);
+    assert!(out.iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn shared_decode_primitive_ignores_consumer_kv_weights() {
+    let mut weights = e2b_random_weights();
+    let arch = &*weights.arch;
+    let consumer = 2usize;
+    let kv_dim = arch.num_kv_heads_for_layer(consumer) * arch.head_dim_for_layer(consumer);
+    let k = Array2::from_elem((3, kv_dim), 0.3);
+    let v = Array2::from_elem((3, kv_dim), 0.3);
+    let h = embed1(&weights);
+    let out_clean = run_attention_block_decode_step_shared_backend(
+        WeightsView::dense(&weights),
+        &h,
+        consumer,
+        &(k.clone(), v.clone()),
+        3,
+        None,
+    )
+    .expect("decode clean");
+    for key in [arch.attn_k_key(consumer), arch.attn_v_key(consumer)] {
+        if let Some(orig) = weights.tensors.get(&key) {
+            let (r, c) = (orig.shape()[0], orig.shape()[1]);
+            weights.tensors.insert(
+                key,
+                larql_models::WeightArray::from(Array2::from_elem((r, c), 9e5)),
+            );
+        }
+    }
+    let out_poison = run_attention_block_decode_step_shared_backend(
+        WeightsView::dense(&weights),
+        &h,
+        consumer,
+        &(k, v),
+        3,
+        None,
+    )
+    .expect("decode poisoned");
+    let max_diff = out_clean
+        .iter()
+        .zip(out_poison.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1e-4,
+        "consumer K/V poison must not change output"
+    );
+}
+
+#[test]
+fn shared_decode_primitive_source_v_mutation_changes_output() {
+    let weights = e2b_random_weights();
+    let arch = &*weights.arch;
+    let consumer = 2usize;
+    let kv_dim = arch.num_kv_heads_for_layer(consumer) * arch.head_dim_for_layer(consumer);
+    let h = embed1(&weights);
+    let k = Array2::from_elem((3, kv_dim), 0.3);
+    let v = Array2::from_elem((3, kv_dim), 0.3);
+    let out_a = run_attention_block_decode_step_shared_backend(
+        WeightsView::dense(&weights),
+        &h,
+        consumer,
+        &(k.clone(), v.clone()),
+        3,
+        None,
+    )
+    .expect("decode a");
+    let mut v2 = v.clone();
+    v2.slice_mut(ndarray::s![..2, ..]).fill(0.0);
+    let out_b = run_attention_block_decode_step_shared_backend(
+        WeightsView::dense(&weights),
+        &h,
+        consumer,
+        &(k, v2),
+        3,
+        None,
+    )
+    .expect("decode b");
+    let max_diff = out_a
+        .iter()
+        .zip(out_b.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    // The consumer is a post-norm (Gemma 4) layer, so the V-driven direction
+    // change is dampened by the post-attention RMSNorm + residual; the
+    // mutation still produces a measurable, reproducible change.
+    assert!(
+        max_diff > 1e-3,
+        "source V mutation must change output (max_diff={max_diff})"
+    );
+}
+
+#[test]
+fn shared_decode_primitive_global_consumer_accepts_long_cache() {
+    let weights = e2b_random_weights();
+    let arch = &*weights.arch;
+    let consumer = 3usize; // shared global consumer
+    assert!(!arch.is_sliding_window_layer(consumer));
+    let kv_dim = arch.num_kv_heads_for_layer(consumer) * arch.head_dim_for_layer(consumer);
+    let k = Array2::from_elem((20, kv_dim), 0.2);
+    let v = Array2::from_elem((20, kv_dim), 0.2);
+    let h = embed1(&weights);
+    let out = run_attention_block_decode_step_shared_backend(
+        WeightsView::dense(&weights),
+        &h,
+        consumer,
+        &(k, v),
+        19,
+        None,
+    )
+    .expect("global shared decode");
+    assert!(out.iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn validate_shared_geometry_accepts_compatible() {
+    let weights = e2b_random_weights();
+    let arch = &*weights.arch;
+    let layer = 0usize;
+    let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
+    let k = Array2::zeros((5, kv_dim));
+    let v = Array2::zeros((5, kv_dim));
+    assert!(validate_shared_kv_geometry(arch, layer, &(k, v)).is_some());
+}
+
+#[test]
+fn validate_shared_geometry_rejects_wrong_kv_dim() {
+    let weights = e2b_random_weights();
+    let arch = &*weights.arch;
+    let bad_k = Array2::zeros((3, 1));
+    let bad_v = Array2::zeros((3, 1));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_shared_kv_geometry(arch, 0, &(bad_k, bad_v))
+    }));
+    assert!(r.is_err(), "mismatched kv_dim must panic");
+}
+
+#[test]
+fn validate_shared_geometry_rejects_empty() {
+    let weights = e2b_random_weights();
+    let arch = &*weights.arch;
+    let kv_dim = arch.num_kv_heads_for_layer(0) * arch.head_dim_for_layer(0);
+    let empty_k = Array2::zeros((0, kv_dim));
+    let empty_v = Array2::zeros((0, kv_dim));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_shared_kv_geometry(arch, 0, &(empty_k, empty_v))
+    }));
+    assert!(r.is_err(), "empty shared K/V must panic");
+}
+
+#[test]
+fn conventional_arch_full_attention_via_shared_primitive() {
+    let weights = make_test_weights();
+    let arch = &*weights.arch;
+    let kv_dim = arch.num_kv_heads_for_layer(0) * arch.head_dim_for_layer(0);
+    let k = Array2::from_elem((2, kv_dim), 0.1);
+    let v = Array2::from_elem((2, kv_dim), 0.1);
+    let h = Array2::from_elem((1, weights.hidden_size), 0.1);
+    let out = run_attention_block_decode_step_shared_backend(
+        WeightsView::dense(&weights),
+        &h,
+        0,
+        &(k, v),
+        1,
+        None,
+    )
+    .expect("shared decode on conventional arch");
+    assert!(out.iter().all(|x| x.is_finite()));
 }

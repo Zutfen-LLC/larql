@@ -146,7 +146,11 @@ fn t23_absolute_position_survives_clipping() {
     // position pointer is 6 (the true absolute position of the next token),
     // NOT the clipped cache length (2).
     for layer in 0..weights.num_layers {
-        assert_eq!(cache.cached_len(layer), 2, "clipped cache ≠ position pointer");
+        assert_eq!(
+            cache.cached_len(layer),
+            2,
+            "clipped cache ≠ position pointer"
+        );
     }
     for step in 0..4 {
         kv_decode_step_run(&weights, &ffn, &mut cache, 0u32, None, &mut NoopHook).expect("decode");
