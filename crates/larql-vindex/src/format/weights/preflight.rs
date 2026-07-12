@@ -139,11 +139,11 @@ fn expected_tensors(
         let q = hd * arch.num_q_heads_for_layer(layer);
         let kv = hd * arch.num_kv_heads_for_layer(layer);
         add(&mut e, arch.attn_q_key(layer), vec![q, h]);
-        if arch.kv_shared_source_layer(layer).is_none() {
-            add(&mut e, arch.attn_k_key(layer), vec![kv, h]);
-            if !arch.v_shares_k(layer) {
-                add(&mut e, arch.attn_v_key(layer), vec![kv, h]);
-            }
+        // Runtime KV reuse does not imply that the official source omits the
+        // redundant projection tensors in its shared region.
+        add(&mut e, arch.attn_k_key(layer), vec![kv, h]);
+        if !arch.v_shares_k(layer) {
+            add(&mut e, arch.attn_v_key(layer), vec![kv, h]);
         }
         add(&mut e, arch.attn_o_key(layer), vec![h, q]);
         add(&mut e, arch.input_layernorm_key(layer), vec![h]);
@@ -162,21 +162,10 @@ fn expected_tensors(
         if let Some(key) = arch.attn_k_norm_key(layer) {
             add(&mut e, key, vec![hd]);
         }
-        add(
-            &mut e,
-            arch.ffn_gate_key(layer),
-            vec![cfg.intermediate_size, h],
-        );
-        add(
-            &mut e,
-            arch.ffn_up_key(layer),
-            vec![cfg.intermediate_size, h],
-        );
-        add(
-            &mut e,
-            arch.ffn_down_key(layer),
-            vec![h, cfg.intermediate_size],
-        );
+        let intermediate = arch.intermediate_size_for_layer(layer);
+        add(&mut e, arch.ffn_gate_key(layer), vec![intermediate, h]);
+        add(&mut e, arch.ffn_up_key(layer), vec![intermediate, h]);
+        add(&mut e, arch.ffn_down_key(layer), vec![h, intermediate]);
         if let Some(key) = arch.layer_scalar_key(layer) {
             add(&mut e, key, vec![1]);
         }
@@ -403,6 +392,7 @@ mod tests {
                 "vocab_size": VOCAB,
                 "hidden_size_per_layer_input": PLE_DIM,
                 "num_kv_shared_layers": 20,
+                "use_double_wide_mlp": true,
                 "layer_types": [
                     "sliding_attention", "sliding_attention", "sliding_attention",
                     "sliding_attention", "full_attention",
@@ -484,14 +474,14 @@ mod tests {
     }
 
     #[test]
-    fn scenario_05_kv_shared_layers_omit_reused_kv_tensors() {
+    fn scenario_05_kv_shared_layers_retain_source_kv_tensors() {
         let arch = arch();
         let expected = expected_tensors(&*arch, VOCAB);
         let reused = (0..35)
             .find(|&layer| arch.kv_shared_source_layer(layer).is_some())
             .unwrap();
-        assert!(!expected.contains_key(&arch.attn_k_key(reused)));
-        assert!(!expected.contains_key(&arch.attn_v_key(reused)));
+        assert!(expected.contains_key(&arch.attn_k_key(reused)));
+        assert!(expected.contains_key(&arch.attn_v_key(reused)));
     }
 
     #[test]
@@ -505,6 +495,22 @@ mod tests {
         assert_eq!(
             expected.contains_key(&arch.attn_v_key(layer)),
             !arch.v_shares_k(layer)
+        );
+    }
+
+    #[test]
+    fn scenario_06b_double_wide_mlp_starts_at_shared_region() {
+        let arch = arch();
+        let expected = expected_tensors(&*arch, VOCAB);
+        assert_eq!(expected[&arch.ffn_gate_key(14)], vec![INTERMEDIATE, HIDDEN]);
+        assert_eq!(expected[&arch.ffn_down_key(14)], vec![HIDDEN, INTERMEDIATE]);
+        assert_eq!(
+            expected[&arch.ffn_gate_key(15)],
+            vec![INTERMEDIATE * 2, HIDDEN]
+        );
+        assert_eq!(
+            expected[&arch.ffn_down_key(34)],
+            vec![HIDDEN, INTERMEDIATE * 2]
         );
     }
 

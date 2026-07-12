@@ -1,49 +1,82 @@
 {
-  "schema_version": 1,
-  "slice": "LARQL-INFERENCE-TRUST-001A-ST1",
-  "date": "2026-07-11",
-  "starting_main_sha": "4391b41279acc9db0301d69d52663e318a409f19",
-  "repository": "unsloth/gemma-4-E2B-it-qat-q4_0-unquantized",
-  "remote_revision_observed": "397aea7eca1853d6f3d099a56612a68ffc0229ae",
-  "observed_from_exact_source": null,
-  "derived_from_config": null,
-  "derived_from_larql_architecture": {
-    "decoder_layers": 35,
-    "shape_validation_uses_per_layer_head_dimension": true,
-    "shape_validation_uses_per_layer_query_and_kv_head_counts": true,
-    "ple_contract_supported": true,
-    "k_equals_v_contract_supported": true
+  "architecture_verification": {
+    "decoder_layers": {"config": 35, "larql": 35, "match": true, "tensor_corroboration": "layers.0 through layers.34"},
+    "final_layer_type": {"config": "full_attention", "larql": "full_attention", "match": true, "tensor_corroboration": "layers.34 global attention shapes"},
+    "final_logit_softcap": {"config": 30.0, "larql": 30.0, "match": true, "tensor_corroboration": null},
+    "global_head_dimension": {"config": 512, "larql": 512, "match": true, "tensor_corroboration": "global q_proj [4096,1536], k/v_proj [512,1536], q/k_norm [512]"},
+    "global_kv_heads": {"config": null, "larql": 1, "match": true, "tensor_corroboration": "global k/v_proj [512,1536]"},
+    "global_rope_base": {"config": 1000000.0, "larql": 1000000.0, "match": true, "tensor_corroboration": null},
+    "hidden_size": {"config": 1536, "larql": 1536, "match": true, "tensor_corroboration": "embed_tokens.weight [262144,1536]"},
+    "intermediate_size": {"config": 6144, "larql": 6144, "match": true, "tensor_corroboration": "layers.0-14 gate/up [6144,1536], down [1536,6144]; layers.15-34 double-wide [12288,1536]/[1536,12288]"},
+    "layer_sequence": {"config": "SSSSG SSSSG SSSSG SSSSG SSSSG SSSSG SSSSG", "larql": "SSSSG SSSSG SSSSG SSSSG SSSSG SSSSG SSSSG", "match": true, "tensor_corroboration": "local/global attention shape alternation"},
+    "local_head_dimension": {"config": 256, "larql": 256, "match": true, "tensor_corroboration": "local q_proj [2048,1536], k/v_proj [256,1536], q/k_norm [256]"},
+    "local_kv_heads": {"config": 1, "larql": 1, "match": true, "tensor_corroboration": "local k/v_proj [256,1536]"},
+    "local_rope_base": {"config": 10000.0, "larql": 10000.0, "match": true, "tensor_corroboration": null},
+    "partial_rotary_factor": {"config": 0.25, "larql": 0.25, "match": true, "tensor_corroboration": null},
+    "ple_dimension": {"config": 256, "larql": 256, "match": true, "tensor_corroboration": "embed_tokens_per_layer [262144,8960], projection [8960,1536], norm [256]"},
+    "query_heads": {"config": 8, "larql": 8, "match": true, "tensor_corroboration": "local/global q_proj output rows 2048/4096"},
+    "rms_norm_epsilon": {"config": 0.000001, "larql": 0.000001, "match": true, "tensor_corroboration": null},
+    "shared_kv": {"config": 20, "larql": "layers 15-34 reuse layer 13 sliding or layer 14 global KV states", "match": true, "tensor_corroboration": "official source retains redundant physical K/V projections for all 35 layers"},
+    "sliding_window": {"config": 512, "larql": 512, "match": true, "tensor_corroboration": null},
+    "tied_embeddings": {"config": true, "larql": true, "match": true, "tensor_corroboration": "lm_head.weight absent; embed_tokens.weight [262144,1536] matches output projection geometry"},
+    "vocabulary_size": {"config": 262144, "larql": 262144, "match": true, "tensor_corroboration": "tokenizer length and 262144 embedding rows"}
   },
-  "synthetic_only_evidence": {
-    "metadata_preflight_implemented": true,
-    "normalized_collision_detection_implemented": true,
-    "unknown_decoder_rejection_implemented": true,
-    "multimodal_and_mtp_exclusion_implemented": true
-  },
-  "not_observed": [
-    "source file checksums",
-    "Transformers source-health output",
-    "prompt token IDs",
-    "generated token IDs",
-    "tensor count and dtype histogram",
-    "exact-source tensor classifications",
-    "exact-source tied-head evidence",
-    "exact-source preflight result"
-  ],
   "counts": {
-    "tensor_count": null,
-    "required_tensor_count": null,
-    "multimodal_excluded": null,
-    "mtp_excluded": null,
-    "unknown_decoder": null,
-    "missing_required": null,
-    "shape_mismatches": null,
-    "normalized_name_duplicates": null
+    "audio_excluded": 751,
+    "missing_required": 0,
+    "mtp_excluded": 0,
+    "multimodal_excluded": 1411,
+    "normalized_name_duplicates": 0,
+    "required_tensor_count": 600,
+    "shape_mismatches": 0,
+    "tensor_count": 2011,
+    "unknown_decoder": 0,
+    "vision_excluded": 658
   },
-  "decision": "RED",
-  "blockers": [
-    "Acquire the exact pinned source checkout and record every required file SHA-256 and byte size.",
-    "Run the Transformers oracle and establish COHERENT source health with exact token evidence.",
-    "Run the real-model inventory and preflight to classify every decoder tensor and resolve all contract findings."
-  ]
+  "date": "2026-07-11",
+  "decision": "GREEN",
+  "derived_by_larql": {
+    "double_wide_mlp_boundary": 15,
+    "exact_source_preflight": "PASS",
+    "global_kv_source_layer": 14,
+    "ple_contract": "PASS",
+    "sliding_kv_source_layer": 13,
+    "tied_head_contract": "PASS"
+  },
+  "not_observed": [],
+  "observed_from_official_source": {
+    "canonical_url": "https://huggingface.co/google/gemma-4-E2B-it/tree/main",
+    "dtype_histogram": {"BF16": 2011},
+    "lm_head_weight_present": false,
+    "repository": "google/gemma-4-E2B-it",
+    "revision": "9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf",
+    "revision_verification": "all source sizes and LFS SHA-256/Git blob IDs match the pinned Hugging Face snapshot manifest",
+    "safetensors_bytes": 10246621918,
+    "safetensors_shards": 1,
+    "tie_word_embeddings": true,
+    "token_embedding_name": "model.language_model.embed_tokens.weight",
+    "token_embedding_shape": [262144, 1536],
+    "total_repository_bytes": 10278846563
+  },
+  "observed_from_transformers_execution": {
+    "device": "cuda:0",
+    "dtype": "torch.bfloat16",
+    "model_class": "AutoModelForImageTextToText",
+    "oracle_artifact": "gemma4-e2b-st-oracle.json",
+    "output_quality": "COHERENT",
+    "source_health": "HEALTHY"
+  },
+  "schema_version": 2,
+  "slice": "LARQL-INFERENCE-TRUST-001A-ST1B",
+  "starting_main_sha": "d969c18fe93fd3269e5bf18e648c8bbde5a3a6e7",
+  "st2_unblocked": true,
+  "supersedes": {
+    "reason": "The official exact source was downloaded and all previously unavailable observations were completed.",
+    "slice": "LARQL-INFERENCE-TRUST-001A-ST1"
+  },
+  "synthetic_regression_evidence": {
+    "double_wide_ffn_boundary": "PASS",
+    "physical_kv_tensors_in_shared_region": "PASS",
+    "semantic_tensor_classification": "PASS"
+  }
 }

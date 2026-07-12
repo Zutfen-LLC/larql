@@ -13,9 +13,16 @@ fn gemma4_safetensors_preflight_records_provenance_and_summary() {
     };
     let revision = std::env::var("LARQL_GEMMA4_ST_REVISION")
         .expect("LARQL_GEMMA4_ST_REVISION is required for a pinned source audit");
-    assert!(!revision.trim().is_empty());
+    assert_eq!(revision.len(), 40, "revision must be a full commit SHA");
+    assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(
+        model_dir
+            .join(".cache/huggingface/trees")
+            .join(format!("{revision}.json"))
+            .is_file(),
+        "missing pinned Hugging Face snapshot manifest"
+    );
     for required in [
-        "model.safetensors",
         "config.json",
         "tokenizer.json",
         "tokenizer_config.json",
@@ -33,6 +40,9 @@ fn gemma4_safetensors_preflight_records_provenance_and_summary() {
         .collect::<Vec<_>>();
     shards.sort();
     assert!(!shards.is_empty(), "no safetensors shards");
+    let single = model_dir.join("model.safetensors").is_file();
+    let sharded = model_dir.join("model.safetensors.index.json").is_file();
+    assert!(single || sharded, "missing safetensors file or shard index");
     let hashes = shards
         .iter()
         .map(|path| {
@@ -56,8 +66,21 @@ fn gemma4_safetensors_preflight_records_provenance_and_summary() {
     let report =
         audit_safetensors_preflight(&model_dir, SafetensorsPreflightOptions::default()).unwrap();
     assert!(report.is_valid(), "{}", report.diagnostic());
-    let summary = serde_json::json!({ "revision": revision, "sha256": hashes, "report": report });
+    let summary = serde_json::json!({
+        "classification_counts": &report.classification_counts,
+        "duplicate_normalized_name_count": report.duplicates.len(),
+        "missing_required_count": report.missing.len(),
+        "report": &report,
+        "required_tensor_count": report.required.len(),
+        "revision": revision,
+        "safetensors_shard_count": shards.len(),
+        "sha256": hashes,
+        "shape_mismatch_count": report.shape_mismatches.len(),
+        "tied_head_evidence": &report.tied_evidence,
+        "unknown_decoder_tensor_count": report.unknown.len(),
+    });
     assert!(summary["report"]["required"]
         .as_array()
         .is_some_and(|v| !v.is_empty()));
+    println!("{}", serde_json::to_string_pretty(&summary).unwrap());
 }
