@@ -167,7 +167,8 @@ pub fn create_with_dims(dir: &Path, dims: &ModelDims) {
             "head_dim": dims.head_dim,
             "num_attention_heads": dims.num_q_heads,
             "num_key_value_heads": dims.num_kv_heads,
-            "rope_theta": 10000.0
+            "rope_theta": 10000.0,
+            "sliding_window": 1024
         }
     });
     std::fs::write(

@@ -96,8 +96,9 @@ pub fn rs_prefill(
 
     for layer in 0..num_layers {
         stored.push(h.clone());
-        let (h_post_attn, _k, _v) = run_attention_with_kv_backend(weights, &h, layer, be, None)
-            .expect("attention failed during MarkovRS prefill");
+        let (h_post_attn, _k, _v) =
+            run_attention_with_kv_backend(weights, &h, layer, be, None, None)
+                .expect("attention failed during MarkovRS prefill");
         let bffn = BackendFfn {
             weights: weights.canonical(),
             backend,

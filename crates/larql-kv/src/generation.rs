@@ -29,7 +29,9 @@
 //! `larql-inference/docs/specs/kv-engine-unification.md` §8.7).
 
 use larql_inference::attention::{
-    run_attention_block_decode_step_backend, run_attention_with_kv_backend,
+    effective_window_for_layer, run_attention_block_decode_step_backend,
+    run_attention_block_decode_step_shared_backend, run_attention_block_shared,
+    run_attention_with_kv_backend,
 };
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::hooks::{LayerHook, NoopHook};
@@ -448,6 +450,13 @@ where
 ///
 /// The caller applies `final_norm + lm_head` to the returned hidden
 /// state to get logits.
+///
+/// ST4 §8/§11: per-layer intrinsic (architecture-driven) attention windows
+/// are applied to the prefill attention, and shared-KV consumer layers
+/// reuse K/V from their source layer instead of computing independent K/V.
+/// Local source caches are clipped to the window tail in a final pass
+/// (after every prompt query has been computed), so early/middle queries
+/// keep their own local ranges.
 #[allow(clippy::too_many_arguments)]
 pub fn kv_prefill_run(
     weights: larql_inference::WeightsView,
@@ -461,6 +470,7 @@ pub fn kv_prefill_run(
         return None;
     }
     let num_layers = weights.num_layers;
+    let arch = &*weights.arch;
     let mut cache = match window {
         Some(w) => KvCache::with_window(num_layers, w),
         None => KvCache::with_layers(num_layers),
@@ -474,10 +484,30 @@ pub fn kv_prefill_run(
     for layer in 0..num_layers {
         hook.on_pre_layer(layer, &h);
 
-        let (mut h_post_attn, k_rope, v) =
-            run_attention_with_kv_backend(weights, &h, layer, backend, None)?;
-        cache.layers[layer] = Some((k_rope, v));
-        cache.clip_layer(layer);
+        let win = effective_window_for_layer(arch, layer, window);
+        let mut h_post_attn = match arch.kv_shared_source_layer(layer) {
+            None => {
+                // Source (non-shared): compute own K/V with windowed attention.
+                // Store the FULL K/V here — clipping to the window tail happens
+                // in a final pass so consumer layers (which run later) can
+                // still see early positions during their own prefill attention.
+                let (hpa, k_rope, v) =
+                    run_attention_with_kv_backend(weights, &h, layer, backend, None, win)?;
+                cache.layers[layer] = Some((k_rope, v));
+                hpa
+            }
+            Some(src) => {
+                // Shared consumer: reuse the source layer's full K/V. Compute
+                // the consumer's own Q (from consumer weights) and attend with
+                // the consumer's intrinsic window. No consumer K/V is computed
+                // and no consumer cache entry is stored.
+                let shared = cache.layers[src].clone()?;
+                // `run_attention_block_shared` derives the consumer's intrinsic
+                // window internally (ST4 §7) and applies the per-query range to
+                // the shared K/V.
+                run_attention_block_shared(weights, &h, layer, false, Some(&shared))?.0
+            }
+        };
 
         hook.on_post_attention(layer, &mut h_post_attn);
 
@@ -488,6 +518,28 @@ pub fn kv_prefill_run(
 
         hook.on_post_layer(layer, &mut h_out);
         h = h_out;
+    }
+
+    // Final clip pass: clip local source caches to the window tail for future
+    // decode. Global layers and consumers are left untouched (consumers hold
+    // no cache; global sources retain the full prefix).
+    for layer in 0..num_layers {
+        if arch.kv_shared_source_layer(layer).is_some() {
+            continue;
+        }
+        let win = effective_window_for_layer(arch, layer, window);
+        if let Some(w) = win {
+            if let Some(Some((k, v))) = cache.layers.get_mut(layer) {
+                let rows = k.shape()[0];
+                if rows > w {
+                    let start = rows - w;
+                    let k_tail = k.slice(ndarray::s![start..rows, ..]).to_owned();
+                    let v_tail = v.slice(ndarray::s![start..rows, ..]).to_owned();
+                    *k = k_tail;
+                    *v = v_tail;
+                }
+            }
+        }
     }
     cache.next_position = prompt_ids.len();
 
@@ -503,6 +555,14 @@ pub fn kv_prefill_run(
 /// Returns `None` if any layer's attention fails. This is the
 /// production decode step extracted so `KvEngine::decode_step` impls
 /// can call it directly.
+///
+/// ST4 §9/§11: local source layers clip BEFORE attention (retain at most
+/// `window-1` prior rows, then append the current token → `window` rows),
+/// so the current query never attends to an out-of-window prior key.
+/// Shared-KV consumer layers reuse the (already-updated) source cache via
+/// [`run_attention_block_decode_step_shared_backend`] and store no
+/// independent cache. Absolute RoPE positions are preserved across
+/// clipping (`abs_position` is the caller-supplied true position).
 #[allow(clippy::too_many_arguments)]
 pub fn kv_decode_step_run(
     weights: &ModelWeights,
@@ -513,6 +573,7 @@ pub fn kv_decode_step_run(
     hook: &mut dyn LayerHook,
 ) -> Option<Array2<f32>> {
     let num_layers = weights.num_layers;
+    let arch = &*weights.arch;
     let h_new = embed_tokens_pub(weights, &[token_id]);
     let abs_position = cache.next_position;
     // PLE inputs are per-token. Recompute for this single-token decode
@@ -524,17 +585,52 @@ pub fn kv_decode_step_run(
     for layer in 0..num_layers {
         hook.on_pre_layer(layer, &h_step);
 
-        let kv_entry = cache.layers[layer].as_ref();
-        let (mut h_post_attn, new_kv) = run_attention_block_decode_step_backend(
-            larql_inference::WeightsView::dense(weights),
-            &h_step,
-            layer,
-            kv_entry,
-            abs_position,
-            backend,
-        )?;
-        cache.layers[layer] = Some(new_kv);
-        cache.clip_layer(layer);
+        let win = effective_window_for_layer(arch, layer, cache.max_window);
+        let mut h_post_attn = match arch.kv_shared_source_layer(layer) {
+            None => {
+                // Source (non-shared): clip prior cache to `window - 1` rows
+                // BEFORE the step so the current query attends to at most
+                // `window - 1` prior entries + itself.
+                if let Some(w) = win {
+                    if let Some(Some((k, v))) = cache.layers.get_mut(layer) {
+                        let rows = k.shape()[0];
+                        let retain = w.saturating_sub(1);
+                        if rows > retain {
+                            let start = rows - retain;
+                            let k_tail = k.slice(ndarray::s![start..rows, ..]).to_owned();
+                            let v_tail = v.slice(ndarray::s![start..rows, ..]).to_owned();
+                            *k = k_tail;
+                            *v = v_tail;
+                        }
+                    }
+                }
+                let kv_entry = cache.layers[layer].as_ref();
+                let (hpa, new_kv) = run_attention_block_decode_step_backend(
+                    larql_inference::WeightsView::dense(weights),
+                    &h_step,
+                    layer,
+                    kv_entry,
+                    abs_position,
+                    backend,
+                )?;
+                cache.layers[layer] = Some(new_kv);
+                hpa
+            }
+            Some(src) => {
+                // Shared consumer: the source layer (`src < layer`) has
+                // already been updated this step, so its cache includes the
+                // current token's K/V. Run shared-KV Q/O attention over it.
+                let shared = cache.layers[src].as_ref()?;
+                run_attention_block_decode_step_shared_backend(
+                    larql_inference::WeightsView::dense(weights),
+                    &h_step,
+                    layer,
+                    shared,
+                    abs_position,
+                    backend,
+                )?
+            }
+        };
 
         hook.on_post_attention(layer, &mut h_post_attn);
 
@@ -732,6 +828,7 @@ where
             larql_inference::WeightsView::dense(weights),
             &h,
             layer,
+            None,
             None,
             None,
         ) {

@@ -33,11 +33,16 @@ pub use block::{
 pub use decode::{
     gqa_attention_decode_step, run_attention_block_decode_step,
     run_attention_block_decode_step_auto, run_attention_block_decode_step_auto_inplace,
-    run_attention_block_decode_step_backend,
+    run_attention_block_decode_step_backend, run_attention_block_decode_step_shared_backend,
+    validate_shared_kv_geometry,
 };
 pub use gpu::{
     q4_attention_proj, run_attention_block_gpu, run_attention_with_kv,
     run_attention_with_kv_backend,
 };
 pub use gqa::{gqa_attention, gqa_attention_with_all_weights, gqa_attention_with_weights};
+pub use larql_compute::attention::window::{
+    causal_attention_range, effective_window, effective_window_for_layer,
+    intrinsic_attention_window, AttentionRange,
+};
 pub use rope::{apply_rope, apply_rope_partial, apply_rope_partial_at};

@@ -25,6 +25,7 @@ pub fn prefill_with_kv(
             layer,
             Some(backend),
             None,
+            None,
         )
         .unwrap();
 

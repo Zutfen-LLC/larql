@@ -4,8 +4,10 @@
 //! Supports KV sharing (reuse K/V from a source layer).
 
 use super::gqa::{
-    gqa_attention_with_all_weights, gqa_attention_with_weights, gqa_reduced_qk_all_weights,
+    gqa_attention_with_all_weights_windowed, gqa_attention_with_weights_windowed,
+    gqa_reduced_qk_all_weights_windowed,
 };
+use super::window::intrinsic_attention_window;
 use super::{AttentionAllWeights, AttentionWeights, SharedKV};
 use ndarray::{s, Array2};
 
@@ -463,20 +465,23 @@ fn run_attention_block_core(
     dump_f32("k_out_after_rope", &k_rope);
     dump_f32("v_out", &v_final);
 
-    // GQA attention
+    // GQA attention — derive the architecture-driven intrinsic window so
+    // diagnostics, interventions, and production inference all observe the
+    // same per-layer local/global attention semantics (ST4 §7).
     let softcap = arch.attn_logit_softcapping();
+    let window = intrinsic_attention_window(arch, layer);
     let reduced_qk_weights = reduced_qk_rank.map(|rank| {
-        gqa_reduced_qk_all_weights(
-            &q_rope, &k_rope, num_q, head_dim, reps, scale, seq_len, softcap, rank,
+        gqa_reduced_qk_all_weights_windowed(
+            &q_rope, &k_rope, num_q, head_dim, reps, scale, seq_len, softcap, rank, window,
         )
     });
     let (mut attn_out, attn_weights, full_all_attn_weights) = if capture_all_attention {
-        let (out, all_weights) = gqa_attention_with_all_weights(
-            &q_rope, &k_rope, &v_final, num_q, head_dim, reps, scale, seq_len, softcap,
+        let (out, all_weights) = gqa_attention_with_all_weights_windowed(
+            &q_rope, &k_rope, &v_final, num_q, head_dim, reps, scale, seq_len, softcap, window,
         );
         (out, None, Some(all_weights))
     } else {
-        let (out, weights) = gqa_attention_with_weights(
+        let (out, weights) = gqa_attention_with_weights_windowed(
             &q_rope,
             &k_rope,
             &v_final,
@@ -487,6 +492,7 @@ fn run_attention_block_core(
             seq_len,
             capture_attention,
             softcap,
+            window,
         );
         (out, weights, None)
     };

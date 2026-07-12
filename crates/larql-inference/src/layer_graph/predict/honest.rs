@@ -166,6 +166,7 @@ pub fn predict_honest(
                                 abs_layer,
                                 Some(backend),
                                 None,
+                                None,
                             )
                             .unwrap();
 

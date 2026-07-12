@@ -3,8 +3,9 @@
 //! Falls back to CPU BLAS when backend is None.
 //! Also includes Q4 quantized attention projection and KV-capture attention.
 
-use super::gqa::gqa_attention_with_weights;
+use super::gqa::gqa_attention_with_weights_windowed;
 use super::rope::{apply_rope_partial, apply_rope_partial_at_full};
+use super::window::{effective_window_for_layer, intrinsic_attention_window};
 use super::AttentionWeights;
 use ndarray::Array2;
 
@@ -101,7 +102,7 @@ pub fn run_attention_block_gpu(
     let k_rope = apply_rope_partial(&k_normed, num_kv, head_dim, layer_rope_base, rotary_frac);
 
     let softcap = arch.attn_logit_softcapping();
-    let (attn_out, attn_weights) = gqa_attention_with_weights(
+    let (attn_out, attn_weights) = gqa_attention_with_weights_windowed(
         &q_rope,
         &k_rope,
         &v_full,
@@ -112,6 +113,7 @@ pub fn run_attention_block_gpu(
         seq_len,
         capture_attention,
         softcap,
+        intrinsic_attention_window(arch, layer),
     );
 
     let mut attn_projected = dot_proj_gpu(&attn_out, w_o, backend);
@@ -151,16 +153,31 @@ pub fn run_attention_with_kv(
     h: &Array2<f32>,
     layer: usize,
 ) -> Option<(Array2<f32>, Array2<f32>, Array2<f32>)> {
+    let win = effective_window_for_layer(&*weights.arch, layer, None);
     run_attention_with_kv_backend(
         larql_models::WeightsView::dense(weights),
         h,
         layer,
         None,
         None,
+        win,
     )
 }
 
 /// Run attention with optional compute backend for accelerated projections.
+///
+/// `effective_window` is the already-combined per-layer attention window:
+/// callers should compute it via [`effective_window_for_layer`] (which
+/// combines the architecture's intrinsic window with an optional caller
+/// window using the stricter-of-the-two rule). `None` = full causal
+/// attention (global layers, conventional architectures, or Q4_K sibling
+/// paths that are explicitly excluded from ST4's intrinsic-window coverage —
+/// see ST4 §18).
+///
+/// The returned K/V (`k_r`, `v`) cover the FULL prompt — clipping the cache
+/// tail to the window for future decode is the caller's responsibility
+/// (it must happen AFTER all prompt queries have been computed, because
+/// early/middle queries still need their own local ranges).
 pub fn run_attention_with_kv_backend(
     weights: larql_models::WeightsView,
     h: &Array2<f32>,
@@ -170,6 +187,8 @@ pub fn run_attention_with_kv_backend(
     // (q4k-direct prefill — skips the f32 dequant). When `None`, read the
     // dequantised projection weights from `weights` (the f32 view path).
     index: Option<&dyn crate::KvIndex>,
+    // Already-combined effective window for this layer (`None` = full causal).
+    effective_window: Option<usize>,
 ) -> Option<(Array2<f32>, Array2<f32>, Array2<f32>)> {
     use crate::forward::{add_bias, apply_norm};
     use crate::residual::{rms_norm_heads, rms_norm_heads_no_weight};
@@ -288,7 +307,7 @@ pub fn run_attention_with_kv_backend(
     let q_r = apply_rope_partial_at_full(&q, nq, hd, rb, rf, 0, pos_divisor, llama3);
     let k_r = apply_rope_partial_at_full(&k, nkv, hd, rb, rf, 0, pos_divisor, llama3);
 
-    let (attn_out, _) = gqa_attention_with_weights(
+    let (attn_out, _) = gqa_attention_with_weights_windowed(
         &q_r,
         &k_r,
         &v,
@@ -299,6 +318,7 @@ pub fn run_attention_with_kv_backend(
         seq_len,
         false,
         arch.attn_logit_softcapping(),
+        effective_window,
     );
     let mut o = if let Some(attn) = attn_q4k {
         crate::ffn::weight::quant_proj(
@@ -535,6 +555,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
@@ -565,6 +586,7 @@ mod tests {
                 &input,
                 layer,
                 Some(&crate::CpuBackend),
+                None,
                 None,
             )
             .expect("engine attention");
@@ -597,6 +619,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(h_out.shape(), &[2, weights.hidden_size]);
@@ -616,6 +639,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .unwrap();
         let (h_cpu, _, _) = run_attention_with_kv_backend(
@@ -623,6 +647,7 @@ mod tests {
             &input,
             0,
             Some(&crate::CpuBackend),
+            None,
             None,
         )
         .unwrap();
@@ -662,6 +687,7 @@ mod tests {
             0,
             None,
             None,
+            None,
         )
         .unwrap();
         let (h_cpu, k_cpu, v_cpu) = run_attention_with_kv_backend(
@@ -669,6 +695,7 @@ mod tests {
             &input,
             0,
             Some(&crate::CpuBackend),
+            None,
             None,
         )
         .unwrap();

@@ -3,6 +3,7 @@
 //! Memory-efficient: O(seq) per position, never materializes full [seq, seq] matrix.
 //! Uses BLAS gemv for both Q·K scores and softmax·V accumulation.
 
+use super::window::causal_attention_range;
 use super::{AttentionAllWeights, AttentionWeights};
 use ndarray::Array2;
 
@@ -24,6 +25,30 @@ pub fn gqa_attention(
     out
 }
 
+/// Windowed GQA with causal masking (no weight capture).
+///
+/// `window` is the per-layer sliding-window bound (`None` = full causal
+/// attention). For a windowed query at position `qi`, scores and the
+/// softmax-weighted V sum run over `[max(0, qi+1-window), qi+1)` only —
+/// the kernel never computes scores over the full prefix and masks after.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_windowed(
+    q: &Array2<f32>,
+    k: &Array2<f32>,
+    v: &Array2<f32>,
+    num_q: usize,
+    head_dim: usize,
+    reps: usize,
+    scale: f64,
+    seq_len: usize,
+    window: Option<usize>,
+) -> Array2<f32> {
+    let (out, _) = gqa_attention_with_weights_windowed(
+        q, k, v, num_q, head_dim, reps, scale, seq_len, false, None, window,
+    );
+    out
+}
+
 /// GQA that optionally captures per-head attention weights for the last token.
 /// `softcap`: if Some(cap), apply tanh(scores/cap)*cap before softmax.
 #[allow(clippy::too_many_arguments)]
@@ -40,7 +65,28 @@ pub fn gqa_attention_with_weights(
     softcap: Option<f32>,
 ) -> (Array2<f32>, Option<AttentionWeights>) {
     let (out, last, _) = gqa_attention_capture(
-        q, k, v, num_q, head_dim, reps, scale, seq_len, capture, false, softcap,
+        q, k, v, num_q, head_dim, reps, scale, seq_len, capture, false, softcap, None,
+    );
+    (out, last)
+}
+
+/// Windowed variant of [`gqa_attention_with_weights`].
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_with_weights_windowed(
+    q: &Array2<f32>,
+    k: &Array2<f32>,
+    v: &Array2<f32>,
+    num_q: usize,
+    head_dim: usize,
+    reps: usize,
+    scale: f64,
+    seq_len: usize,
+    capture: bool,
+    softcap: Option<f32>,
+    window: Option<usize>,
+) -> (Array2<f32>, Option<AttentionWeights>) {
+    let (out, last, _) = gqa_attention_capture(
+        q, k, v, num_q, head_dim, reps, scale, seq_len, capture, false, softcap, window,
     );
     (out, last)
 }
@@ -62,7 +108,30 @@ pub fn gqa_attention_with_all_weights(
     softcap: Option<f32>,
 ) -> (Array2<f32>, AttentionAllWeights) {
     let (out, _, all) = gqa_attention_capture(
-        q, k, v, num_q, head_dim, reps, scale, seq_len, false, true, softcap,
+        q, k, v, num_q, head_dim, reps, scale, seq_len, false, true, softcap, None,
+    );
+    (
+        out,
+        all.expect("all-position attention capture requested but missing"),
+    )
+}
+
+/// Windowed variant of [`gqa_attention_with_all_weights`].
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_with_all_weights_windowed(
+    q: &Array2<f32>,
+    k: &Array2<f32>,
+    v: &Array2<f32>,
+    num_q: usize,
+    head_dim: usize,
+    reps: usize,
+    scale: f64,
+    seq_len: usize,
+    softcap: Option<f32>,
+    window: Option<usize>,
+) -> (Array2<f32>, AttentionAllWeights) {
+    let (out, _, all) = gqa_attention_capture(
+        q, k, v, num_q, head_dim, reps, scale, seq_len, false, true, softcap, window,
     );
     (
         out,
@@ -73,6 +142,11 @@ pub fn gqa_attention_with_all_weights(
 /// Capture every query-position attention distribution using only the first
 /// `qk_rank` dimensions of each Q/K head. This is a diagnostic surface for
 /// reduced-QK address probes; it does not compute a V-weighted output.
+///
+/// `window` is `None` (full causal) by default; pass `Some(W)` to apply the
+/// same per-layer sliding range as the production attention path. Captured
+/// distributions are padded to the full sequence length with zeros outside
+/// `[start, end)`.
 #[allow(clippy::too_many_arguments)]
 pub fn gqa_reduced_qk_all_weights(
     q: &Array2<f32>,
@@ -84,6 +158,25 @@ pub fn gqa_reduced_qk_all_weights(
     seq_len: usize,
     softcap: Option<f32>,
     qk_rank: usize,
+) -> AttentionAllWeights {
+    gqa_reduced_qk_all_weights_windowed(
+        q, k, num_q, head_dim, reps, scale, seq_len, softcap, qk_rank, None,
+    )
+}
+
+/// Windowed variant of [`gqa_reduced_qk_all_weights`].
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_reduced_qk_all_weights_windowed(
+    q: &Array2<f32>,
+    k: &Array2<f32>,
+    num_q: usize,
+    head_dim: usize,
+    reps: usize,
+    scale: f64,
+    seq_len: usize,
+    softcap: Option<f32>,
+    qk_rank: usize,
+    window: Option<usize>,
 ) -> AttentionAllWeights {
     let rank = qk_rank.clamp(1, head_dim);
     let mut captured_all_heads: Vec<Vec<Vec<f32>>> = Vec::with_capacity(num_q);
@@ -97,9 +190,17 @@ pub fn gqa_reduced_qk_all_weights(
         let kv_off = kv_h * head_dim;
 
         for qi in 0..seq_len {
-            let causal_len = qi + 1;
+            let range = causal_attention_range(qi, seq_len, window);
+            let causal_len = range.end_exclusive - range.start;
+            if causal_len == 0 {
+                captured_positions.push(vec![0.0f32; seq_len]);
+                continue;
+            }
             let q_row = q.slice(ndarray::s![qi, q_off..q_off + rank]);
-            let k_block = k.slice(ndarray::s![0..causal_len, kv_off..kv_off + rank]);
+            let k_block = k.slice(ndarray::s![
+                range.start..range.end_exclusive,
+                kv_off..kv_off + rank
+            ]);
             let raw_scores = k_block.dot(&q_row);
 
             for i in 0..causal_len {
@@ -125,8 +226,10 @@ pub fn gqa_reduced_qk_all_weights(
                 *score *= inv_sum;
             }
 
+            // Pad to full seq length: zeros before `start`, normalized weights
+            // over `[start, end)`, zeros for causal-future positions.
             let mut captured = vec![0.0f32; seq_len];
-            captured[..causal_len].copy_from_slice(&scores_buf[..causal_len]);
+            captured[range.start..range.end_exclusive].copy_from_slice(&scores_buf[..causal_len]);
             captured_positions.push(captured);
         }
         captured_all_heads.push(captured_positions);
@@ -150,6 +253,7 @@ fn gqa_attention_capture(
     capture_last: bool,
     capture_all: bool,
     softcap: Option<f32>,
+    window: Option<usize>,
 ) -> (
     Array2<f32>,
     Option<AttentionWeights>,
@@ -182,10 +286,23 @@ fn gqa_attention_capture(
         let kv_off = kv_h * head_dim;
 
         for qi in 0..seq_len {
-            let causal_len = qi + 1;
+            let range = causal_attention_range(qi, seq_len, window);
+            let causal_len = range.end_exclusive - range.start;
+            if causal_len == 0 {
+                if capture_last && qi == last_pos {
+                    captured_heads.push(vec![0.0f32; seq_len]);
+                }
+                if capture_all {
+                    captured_positions.push(vec![0.0f32; seq_len]);
+                }
+                continue;
+            }
 
             let q_row = q.slice(ndarray::s![qi, q_off..q_off + head_dim]);
-            let k_block = k.slice(ndarray::s![0..causal_len, kv_off..kv_off + head_dim]);
+            let k_block = k.slice(ndarray::s![
+                range.start..range.end_exclusive,
+                kv_off..kv_off + head_dim
+            ]);
             let raw_scores = k_block.dot(&q_row);
 
             for i in 0..causal_len {
@@ -213,16 +330,21 @@ fn gqa_attention_capture(
 
             if capture_last && qi == last_pos {
                 let mut captured = vec![0.0f32; seq_len];
-                captured[..causal_len].copy_from_slice(&scores_buf[..causal_len]);
+                captured[range.start..range.end_exclusive]
+                    .copy_from_slice(&scores_buf[..causal_len]);
                 captured_heads.push(captured);
             }
             if capture_all {
                 let mut captured = vec![0.0f32; seq_len];
-                captured[..causal_len].copy_from_slice(&scores_buf[..causal_len]);
+                captured[range.start..range.end_exclusive]
+                    .copy_from_slice(&scores_buf[..causal_len]);
                 captured_positions.push(captured);
             }
 
-            let v_block = v.slice(ndarray::s![0..causal_len, kv_off..kv_off + head_dim]);
+            let v_block = v.slice(ndarray::s![
+                range.start..range.end_exclusive,
+                kv_off..kv_off + head_dim
+            ]);
             let scores_view = ndarray::ArrayView1::from(&scores_buf[..causal_len]);
             let weighted_v = v_block.t().dot(&scores_view);
 

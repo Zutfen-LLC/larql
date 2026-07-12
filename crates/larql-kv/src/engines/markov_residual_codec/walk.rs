@@ -45,7 +45,7 @@ pub fn rs_prefill_codec_walk(
     let mut hot_kv_captured: Vec<SharedKV> = Vec::with_capacity(num_layers);
     for layer in 0..num_layers {
         stored.push(h.clone());
-        let (h_post_attn, k, v) = run_attention_with_kv_backend(weights, &h, layer, be, None)
+        let (h_post_attn, k, v) = run_attention_with_kv_backend(weights, &h, layer, be, None, None)
             .expect("attention failed during MarkovResidualCodec Q4K prefill");
         hot_kv_captured.push((k, v));
         let (h_out, _) = run_ffn(&weights, &h_post_attn, layer, &walk_ffn, false);

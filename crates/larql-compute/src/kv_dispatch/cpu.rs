@@ -398,17 +398,56 @@ impl KvDispatch for CpuBackend {
         Some(h_post_attn)
     }
 
+    fn attention_step_windowed(
+        &self,
+        weights: larql_models::WeightsView,
+        query: &Array2<f32>,
+        kv: &mut KvHandle,
+        layer: usize,
+        abs_position: usize,
+        window: usize,
+        index: Option<&dyn crate::KvIndex>,
+    ) -> Option<Array2<f32>> {
+        // ST4 §9: clip BEFORE attention so the current query never attends
+        // to an out-of-window prior key. Retain at most `window - 1` prior
+        // rows; the step below appends the current token's K/V (→ at most
+        // `window` rows) and attends over exactly those rows. For window=1
+        // no prior rows are retained and the token attends only to itself.
+        //
+        // `abs_position` is the caller-supplied TRUE position (RoPE is
+        // applied at that position inside `attention_step`); it is never
+        // derived from the clipped cache length.
+        let retain = window.saturating_sub(1);
+        self.clip_kv(kv, retain);
+        let h = self.attention_step(weights, query, kv, layer, abs_position, index)?;
+        // The cache is already at ≤ `window` rows (retain prior + 1 new), so
+        // no post-step clip is needed — unlike the trait default which clips
+        // AFTER attention (letting the query see an evictable key).
+        Some(h)
+    }
+
     fn attention_prefill(
         &self,
         weights: larql_models::WeightsView,
         tokens_embedded: &Array2<f32>,
         layer: usize,
-        _window: Option<usize>,
+        caller_window: Option<usize>,
         _index: Option<&dyn crate::KvIndex>,
     ) -> Option<(Array2<f32>, KvHandle)> {
         // See `attention_step` doc for the `_index` convention.
+        //
+        // Combine the layer's intrinsic (architecture-driven) window with the
+        // caller-supplied bounded window (stricter wins). The per-query window
+        // is applied to the attention COMPUTATION (sliding semantics); the
+        // returned K/V covers the FULL prompt. Clipping the cache tail to the
+        // window for future decode is the caller's responsibility (it must
+        // happen AFTER all prompt queries have been computed, because early /
+        // middle queries — including shared-KV consumer layers — still need
+        // their own local ranges). ST4 §8.
+        let arch = &*weights.arch;
+        let win = crate::attention::effective_window_for_layer(arch, layer, caller_window);
         let (h_post_attn, k_rope, v) =
-            run_attention_with_kv_backend(weights, tokens_embedded, layer, Some(self), None)?;
+            run_attention_with_kv_backend(weights, tokens_embedded, layer, Some(self), None, win)?;
         let kv_dim = k_rope.shape()[1];
         let mut handle = CpuKvHandle::new(layer, kv_dim);
         handle.replace_state((k_rope, v));

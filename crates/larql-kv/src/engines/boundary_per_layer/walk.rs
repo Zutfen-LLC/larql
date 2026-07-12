@@ -41,7 +41,8 @@ pub(super) fn run_prefill(
     for layer in 0..num_layers {
         stored.push(h.clone());
         let (h_post_attn, _k, _v) =
-            run_attention_with_kv_backend(weights, &h, layer, be, None).expect("attention failed");
+            run_attention_with_kv_backend(weights, &h, layer, be, None, None)
+                .expect("attention failed");
         let h_out = crate::engines::layer_ffn_or_moe(
             weights.canonical(),
             &h_post_attn,

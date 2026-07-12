@@ -11,6 +11,7 @@ pub mod decode;
 pub mod gpu;
 pub mod gqa;
 pub mod rope;
+pub mod window;
 
 use ndarray::Array2;
 
@@ -38,8 +39,10 @@ pub struct AttentionAllWeights {
 pub type SharedKV = (Array2<f32>, Array2<f32>);
 
 pub use gqa::{
-    gqa_attention, gqa_attention_with_all_weights, gqa_attention_with_weights,
-    gqa_reduced_qk_all_weights,
+    gqa_attention, gqa_attention_windowed, gqa_attention_with_all_weights,
+    gqa_attention_with_all_weights_windowed, gqa_attention_with_weights,
+    gqa_attention_with_weights_windowed, gqa_reduced_qk_all_weights,
+    gqa_reduced_qk_all_weights_windowed,
 };
 pub use rope::{
     apply_llama3_inv_freq, apply_rope, apply_rope_partial, apply_rope_partial_at,
@@ -64,8 +67,13 @@ pub use decode::{
     run_attention_block_decode_step_auto, run_attention_block_decode_step_auto_inplace,
     run_attention_block_decode_step_backend, run_attention_block_decode_step_q4k_direct,
     run_attention_block_decode_step_q4k_direct_inplace,
+    run_attention_block_decode_step_shared_backend, validate_shared_kv_geometry,
 };
 pub use gpu::{
     q4_attention_proj, run_attention_block_gpu, run_attention_with_kv,
     run_attention_with_kv_backend,
+};
+pub use window::{
+    causal_attention_range, effective_window, effective_window_for_layer,
+    intrinsic_attention_window, AttentionRange,
 };
