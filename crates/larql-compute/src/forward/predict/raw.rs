@@ -3,7 +3,8 @@
 use std::ops::Range;
 
 use super::super::embed::embed_tokens_pub;
-use super::super::layer::run_layer_with_ffn;
+use super::super::hooks::LayerHook;
+use super::super::layer::{run_layer_with_capture_hooked, run_layer_with_ffn};
 use super::super::ple::precompute_per_layer_inputs;
 use super::super::{apply_norm, dot_proj};
 use crate::attention::SharedKV;
@@ -18,6 +19,89 @@ pub struct RawForward {
     pub h_pre_norm: Array2<f32>,
     pub h_final: Array2<f32>,
     pub logits: ndarray::Array1<f32>,
+}
+
+/// Tail stages of a traced forward pass (last token position). Returned by
+/// [`forward_raw_logits_traced`] so the ST5 comparator can compare the
+/// final-norm and logits boundaries alongside the per-layer stages a
+/// [`LayerHook`] captured during the same forward.
+#[derive(Debug, Clone)]
+pub struct TracedTail {
+    /// Last-token hidden state before the final norm (`h_pre_norm[-1]`).
+    pub pre_final_norm: Vec<f32>,
+    /// Last-token hidden state after the final norm (`h_final[-1]`).
+    pub final_norm: Vec<f32>,
+    /// Last-token raw lm-head output before logits scaling/softcap.
+    pub lm_head_raw: Vec<f32>,
+    /// Last-token final logits after the model's logits transform.
+    pub final_logits: Vec<f32>,
+}
+
+/// Canonical F32 forward pass that fires a [`LayerHook`] at every semantic
+/// boundary (pre-layer, post-attention, post-FFN, post-PLE, post-layer) and
+/// returns the tail stages (pre-final-norm, final-norm, lm-head raw, final
+/// logits) at the last token.
+///
+/// This is the **same math** as [`forward_raw_logits`] — it embeds with the
+/// production `embed_tokens_pub`, runs each layer through
+/// `run_layer_with_capture_hooked` (the hooked sibling of
+/// `run_layer_with_ffn`, identical attention + FFN + PLE + `layer_scalar`),
+/// then applies the production final-norm + lm-head + logits transform. It
+/// is a thin capture harness over the canonical primitives, NOT a second
+/// implementation of the forward pass.
+///
+/// The caller owns `hook` (typically a `RecordHook::for_layers(0..n)`) and
+/// reads the per-layer stages out of it after the call; this function only
+/// returns the non-layer tail stages.
+pub fn forward_raw_logits_traced(
+    weights: larql_models::WeightsView,
+    token_ids: &[u32],
+    hook: &mut dyn LayerHook,
+) -> TracedTail {
+    assert!(!token_ids.is_empty(), "traced forward needs >= 1 token");
+    let total_len = token_ids.len();
+    let norm_offset = weights.arch.norm_weight_offset();
+
+    let mut h = embed_tokens_pub(&weights, token_ids);
+    let ple_inputs = precompute_per_layer_inputs(&weights, &h, token_ids);
+    let ffn = crate::ffn::ViewFfn { view: weights };
+    let mut kv_cache: std::collections::HashMap<usize, SharedKV> = std::collections::HashMap::new();
+
+    for layer in 0..weights.num_layers {
+        let shared_kv = weights
+            .arch
+            .kv_shared_source_layer(layer)
+            .and_then(|src| kv_cache.get(&src));
+        if let Some((h_new, _act, _attn, kv_out)) = run_layer_with_capture_hooked(
+            weights,
+            &h,
+            layer,
+            &ffn,
+            /*capture_activation=*/ false,
+            /*capture_attention=*/ false,
+            ple_inputs.get(layer),
+            shared_kv,
+            hook,
+        ) {
+            h = h_new;
+            if let Some(kv) = kv_out {
+                kv_cache.insert(layer, kv);
+            }
+        }
+    }
+
+    let h_final = apply_norm(&weights, &h, weights.arch.final_norm_key(), norm_offset);
+    let last = total_len - 1;
+    let last_2d = h_final.slice(ndarray::s![last..total_len, ..]);
+    let logits_raw = dot_proj(&last_2d, &weights.lm_head);
+    let logits = apply_logits_transform(&weights, logits_raw.row(0).as_slice().unwrap());
+
+    TracedTail {
+        pre_final_norm: h.row(last).to_vec(),
+        final_norm: h_final.row(last).to_vec(),
+        lm_head_raw: logits_raw.row(0).to_vec(),
+        final_logits: logits.to_vec(),
+    }
 }
 
 /// Apply the model's final logits transform: divide by `logits_scaling`
@@ -244,6 +328,7 @@ fn forward_layer_range(
 #[cfg(test)]
 mod forward_from_layer_tests {
     use super::*;
+    use crate::forward::RecordHook;
     use larql_models::test_fixtures::make_test_weights;
 
     #[test]
@@ -263,6 +348,62 @@ mod forward_from_layer_tests {
             raw.h_pre_norm.shape(),
             &[3, weights.hidden_size],
             "h_pre_norm shape"
+        );
+    }
+
+    #[test]
+    fn forward_raw_logits_traced_captures_boundaries_and_tail() {
+        // The ST5 traced forward must run the same math as forward_raw_logits
+        // and expose every coarse boundary via the hook + TracedTail.
+        let weights = make_test_weights();
+        let n = weights.num_layers;
+        let view = larql_models::WeightsView::dense(&weights);
+        let ids = [0u32, 1, 2];
+
+        // Traced path.
+        let mut hook = RecordHook::for_layers(0..n);
+        let tail = forward_raw_logits_traced(view, &ids, &mut hook);
+
+        // Reference path (same math, no capture).
+        let raw = forward_raw_logits(view, &ids, None);
+
+        // Per-layer boundary capture: every layer recorded pre/post stages.
+        for layer in 0..n {
+            assert!(hook.pre_layer.contains_key(&layer), "pre_layer {layer}");
+            assert!(
+                hook.post_attention.contains_key(&layer),
+                "post_attention {layer}"
+            );
+            assert!(hook.post_ffn.contains_key(&layer), "post_ffn {layer}");
+            assert!(hook.post_ple.contains_key(&layer), "post_ple {layer}");
+            assert!(hook.post_layer.contains_key(&layer), "post_layer {layer}");
+        }
+
+        // Tail stages: last-token vectors of the expected width.
+        let hidden = weights.hidden_size;
+        assert_eq!(tail.pre_final_norm.len(), hidden);
+        assert_eq!(tail.final_norm.len(), hidden);
+        assert_eq!(tail.lm_head_raw.len(), weights.vocab_size);
+        assert_eq!(tail.final_logits.len(), weights.vocab_size);
+
+        // pre_final_norm == last row of the reference pre-norm residual.
+        let last = ids.len() - 1;
+        for (i, v) in tail.pre_final_norm.iter().enumerate() {
+            assert!(
+                (v - raw.h_pre_norm[[last, i]]).abs() < 1e-4,
+                "pre_final_norm[{i}] mismatch"
+            );
+        }
+        // final logits match the reference logits (same transform).
+        for (i, v) in tail.final_logits.iter().enumerate() {
+            assert!(
+                (v - raw.logits[i]).abs() < 1e-4,
+                "final_logits[{i}] mismatch"
+            );
+        }
+        assert!(
+            tail.final_logits.iter().all(|v| v.is_finite()),
+            "final logits must be finite"
         );
     }
 

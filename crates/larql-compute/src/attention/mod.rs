@@ -46,7 +46,8 @@ pub use gqa::{
 };
 pub use rope::{
     apply_llama3_inv_freq, apply_rope, apply_rope_partial, apply_rope_partial_at,
-    apply_rope_partial_at_full, apply_rope_partial_at_scaled, build_rope_inv_freq,
+    apply_rope_partial_at_full, apply_rope_partial_at_full_with_mode, apply_rope_partial_at_scaled,
+    build_rope_inv_freq, build_rope_inv_freq_with_mode, RopeFreqMode,
 };
 
 // ── Spine re-exports: preserve `crate::attention::*` paths for callers

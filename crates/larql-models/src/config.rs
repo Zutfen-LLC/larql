@@ -419,6 +419,15 @@ pub trait ModelArchitecture: Send + Sync {
         1.0
     }
 
+    /// How to construct the RoPE `inv_freq` table for a layer. Gemma 4
+    /// *global* layers override this to [`RopeFreqMode::Proportional`] (HF
+    /// `rope_type = "proportional"`): the exponent is divided by the full
+    /// `head_dim` rather than the rotated `rotary_dim`. Every other model
+    /// (and Gemma 4 sliding layers) uses [`RopeFreqMode::Standard`].
+    fn rope_freq_mode_for_layer(&self, _layer: usize) -> RopeFreqMode {
+        RopeFreqMode::Standard
+    }
+
     /// Whether value shares key projections at this layer (V = K).
     /// When true, the forward pass uses K in place of V.
     /// Default: false.
@@ -885,6 +894,25 @@ pub trait ModelArchitecture: Send + Sync {
     fn multimodal(&self) -> Option<&dyn crate::multimodal::MultiModalProtocol> {
         None
     }
+}
+
+/// RoPE inverse-frequency construction mode for a layer.
+///
+/// - [`RopeFreqMode::Standard`] — the classic RoPE formula
+///   `inv_freq[i] = 1 / base^(2i/rotary_dim)` where `rotary_dim` is the
+///   rotated portion of the head (`fraction * head_dim`). This is what
+///   Llama, Mistral, Gemma 1/2/3, and Gemma 4 *sliding* layers use.
+/// - [`RopeFreqMode::Proportional`] — Gemma 4 *global* (full-attention)
+///   layers (`rope_type = "proportional"`): `inv_freq[i] = 1 / base^(2i/head_dim)`
+///   where the exponent is divided by the **full** `head_dim`, not the
+///   rotated portion. See HF's `_compute_proportional_rope_parameters`. The
+///   remaining (`head_dim/2 - rope_angles`) pairs are zero (no rotation),
+///   but those are identical to the standard partial-RoPE pass-through, so
+///   the only effect of this mode is the exponent denominator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeFreqMode {
+    Standard,
+    Proportional,
 }
 
 /// `llama3` rope scaling parameters. Lives in larql-models so both the

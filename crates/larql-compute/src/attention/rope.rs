@@ -9,6 +9,7 @@ use ndarray::Array2;
 /// can be parsed from `config.json` without cross-crate dependency
 /// inversion. The math (`apply_llama3_inv_freq` below) is substrate.
 pub use larql_models::Llama3RopeScaling;
+pub use larql_models::RopeFreqMode;
 
 /// Compute wavelength-adjusted `inv_freq[i]` for each rotary half-pair
 /// from the standard `1 / base^(2i/d)` baseline. Mirrors HF's
@@ -130,16 +131,64 @@ pub fn build_rope_inv_freq(
     fraction: f64,
     llama3_scaling: Option<Llama3RopeScaling>,
 ) -> (usize, usize, Vec<f64>) {
+    build_rope_inv_freq_with_mode(
+        rope_base,
+        head_dim,
+        fraction,
+        llama3_scaling,
+        RopeFreqMode::Standard,
+    )
+}
+
+/// Mode-aware builder. [`RopeFreqMode::Proportional`] (Gemma 4 global
+/// layers, HF `rope_type = "proportional"`) constructs `inv_freq` over the
+/// **full** `head_dim/2` pairs — the first `rope_angles = rotary_dim/2`
+/// pairs carry `1 / rope_base^(2i/head_dim)` (exponents divided by the full
+/// head_dim), the remaining pairs are zero (no rotation). The caller's
+/// half-split loop then pairs `(x[i], x[i+head_dim/2])` over the entire head,
+/// matching HF's `apply_rotary_pos_emb` + `rotate_half` exactly. Everything
+/// else is identical to [`build_rope_inv_freq`] (Standard mode).
+pub fn build_rope_inv_freq_with_mode(
+    rope_base: f64,
+    head_dim: usize,
+    fraction: f64,
+    llama3_scaling: Option<Llama3RopeScaling>,
+    mode: RopeFreqMode,
+) -> (usize, usize, Vec<f64>) {
     let rotary_dim = ((head_dim as f64 * fraction) as usize).max(2);
-    let half_rotary = rotary_dim / 2;
-    let base_inv_freq: Vec<f64> = (0..half_rotary)
-        .map(|i| 1.0 / rope_base.powf(2.0 * i as f64 / rotary_dim as f64))
-        .collect();
-    let inv_freq = match llama3_scaling {
-        Some(scaling) => apply_llama3_inv_freq(&scaling, &base_inv_freq),
-        None => base_inv_freq,
-    };
-    (rotary_dim, half_rotary, inv_freq)
+    match mode {
+        RopeFreqMode::Standard => {
+            let half_rotary = rotary_dim / 2;
+            let base_inv_freq: Vec<f64> = (0..half_rotary)
+                .map(|i| 1.0 / rope_base.powf(2.0 * i as f64 / rotary_dim as f64))
+                .collect();
+            let inv_freq = match llama3_scaling {
+                Some(scaling) => apply_llama3_inv_freq(&scaling, &base_inv_freq),
+                None => base_inv_freq,
+            };
+            (rotary_dim, half_rotary, inv_freq)
+        }
+        RopeFreqMode::Proportional => {
+            let rope_angles = rotary_dim / 2;
+            let half_rotary = head_dim / 2;
+            let base_inv_freq: Vec<f64> = (0..half_rotary)
+                .map(|i| {
+                    if i < rope_angles {
+                        1.0 / rope_base.powf(2.0 * i as f64 / head_dim as f64)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let inv_freq = match llama3_scaling {
+                Some(scaling) => apply_llama3_inv_freq(&scaling, &base_inv_freq),
+                None => base_inv_freq,
+            };
+            // rotary_dim = number of actually-rotated dims; half_rotary =
+            // head_dim/2 (the application pair count for the full half-split).
+            (rotary_dim, half_rotary, inv_freq)
+        }
+    }
 }
 
 /// Most general RoPE entry point. Adds optional `llama3_scaling`: when
@@ -158,11 +207,39 @@ pub fn apply_rope_partial_at_full(
     position_divisor: f64,
     llama3_scaling: Option<Llama3RopeScaling>,
 ) -> Array2<f32> {
+    apply_rope_partial_at_full_with_mode(
+        x,
+        num_heads,
+        head_dim,
+        rope_base,
+        fraction,
+        position_offset,
+        position_divisor,
+        llama3_scaling,
+        RopeFreqMode::Standard,
+    )
+}
+
+/// Mode-aware sibling of [`apply_rope_partial_at_full`]. Pass
+/// [`RopeFreqMode::Proportional`] for Gemma 4 global layers so the inverse
+/// frequencies match HF's `_compute_proportional_rope_parameters`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_rope_partial_at_full_with_mode(
+    x: &Array2<f32>,
+    num_heads: usize,
+    head_dim: usize,
+    rope_base: f64,
+    fraction: f64,
+    position_offset: usize,
+    position_divisor: f64,
+    llama3_scaling: Option<Llama3RopeScaling>,
+    mode: RopeFreqMode,
+) -> Array2<f32> {
     let seq_len = x.shape()[0];
     let mut out = x.clone();
 
     let (_rotary_dim, half_rotary, inv_freq) =
-        build_rope_inv_freq(rope_base, head_dim, fraction, llama3_scaling);
+        build_rope_inv_freq_with_mode(rope_base, head_dim, fraction, llama3_scaling, mode);
     let divisor = if position_divisor > 0.0 {
         position_divisor
     } else {
@@ -518,5 +595,117 @@ mod tests {
         let (_, _, scaled) = build_rope_inv_freq(10_000.0, 32, 1.0, Some(llama3_default()));
         let direct = apply_llama3_inv_freq(&llama3_default(), &base);
         assert_eq!(scaled, direct);
+    }
+
+    // ── Proportional RoPE (Gemma 4 global layers) ──────────────────────────
+
+    /// Proportional inv_freq uses exponents divided by the FULL head_dim, and
+    /// is zero-padded to `head_dim/2` entries. Pin the exact construction
+    /// against HF's `_compute_proportional_rope_parameters` for the Gemma 4
+    /// E2B global-layer geometry (head_dim=512, fraction=0.25, base=1e6).
+    #[test]
+    fn proportional_inv_freq_matches_hf_gemma4_global() {
+        // head_dim=512, fraction=0.25 → rotary_dim=128, rope_angles=64.
+        let (rotary_dim, half, inv_freq) =
+            build_rope_inv_freq_with_mode(1_000_000.0, 512, 0.25, None, RopeFreqMode::Proportional);
+        assert_eq!(rotary_dim, 128, "rotated dim count");
+        assert_eq!(half, 256, "application pair count = head_dim/2");
+        assert_eq!(inv_freq.len(), 256);
+        // First 64 entries: 1 / base^(2i/head_dim).
+        for (i, freq) in inv_freq.iter().enumerate().take(64) {
+            let expected = 1.0 / 1_000_000.0_f64.powf(2.0 * i as f64 / 512.0);
+            assert!(
+                (freq - expected).abs() < 1e-15,
+                "proportional freq[{i}] = {freq} expected {expected}"
+            );
+        }
+        // Remaining entries: zero (no rotation).
+        for (i, freq) in inv_freq.iter().enumerate().skip(64) {
+            assert!(*freq == 0.0, "padding freq[{i}] must be zero");
+        }
+    }
+
+    /// Proportional RoPE pairs `(x[i], x[i+head_dim/2])` over the full head —
+    /// the zero-padded entries leave the non-rotated dims untouched. Verify
+    /// the dimensions that HF rotates vs leaves alone differ from standard
+    /// partial RoPE, which would rotate the wrong dims.
+    #[test]
+    fn proportional_rope_pairs_full_head_dim_not_rotary_dim() {
+        // Single head, head_dim=8, fraction=0.5 → rotary_dim=4, rope_angles=2.
+        // Proportional: rotate pairs (0,4) and (1,5) [first 2 of 4 pairs];
+        // dims 2,3,6,7 untouched.
+        let mut x = ndarray::Array2::zeros((1, 8));
+        for j in 0..8 {
+            x[[0, j]] = j as f32 + 1.0;
+        }
+        let out = apply_rope_partial_at_full_with_mode(
+            &x,
+            1,
+            8,
+            10_000.0,
+            0.5,
+            0,
+            1.0,
+            None,
+            RopeFreqMode::Proportional,
+        );
+        // At position 0: cos=1, sin=0 → identity everywhere.
+        for j in 0..8 {
+            assert!(
+                (out[[0, j]] - x[[0, j]]).abs() < 1e-6,
+                "pos 0 should be identity at dim {j}"
+            );
+        }
+        // At position 1: pair (0,4) rotates; dims 2,3,6,7 unchanged.
+        let mut x1 = ndarray::Array2::zeros((1, 8));
+        for j in 0..8 {
+            x1[[0, j]] = j as f32 + 1.0;
+        }
+        let o1 = apply_rope_partial_at_full_with_mode(
+            &x1,
+            1,
+            8,
+            10_000.0,
+            0.5,
+            1,
+            1.0,
+            None,
+            RopeFreqMode::Proportional,
+        );
+        // Standard partial would rotate dims 2,3; proportional must NOT.
+        // dims 2,3 are in the zero-pad region → unchanged.
+        assert!(
+            (o1[[0, 2]] - x1[[0, 2]]).abs() < 1e-6,
+            "dim 2 must be untouched by proportional"
+        );
+        assert!(
+            (o1[[0, 3]] - x1[[0, 3]]).abs() < 1e-6,
+            "dim 3 must be untouched by proportional"
+        );
+        // dim 4 (the second-half partner of dim 0) IS rotated.
+        assert!(
+            (o1[[0, 4]] - x1[[0, 4]]).abs() > 1e-6,
+            "dim 4 must be rotated (paired with dim 0 over the full head)"
+        );
+    }
+
+    /// Standard mode is unchanged: exponents divided by rotary_dim, no
+    /// zero-padding, half-split within rotary_dim.
+    #[test]
+    fn standard_mode_unchanged_by_proportional_addition() {
+        let (rd, half, inv) =
+            build_rope_inv_freq_with_mode(10_000.0, 32, 0.5, None, RopeFreqMode::Standard);
+        let (rd0, half0, inv0) = build_rope_inv_freq(10_000.0, 32, 0.5, None);
+        assert_eq!(rd, rd0);
+        assert_eq!(half, half0);
+        assert_eq!(inv, inv0);
+        // Standard: rotary_dim=16, half=8, inv over rotary_dim.
+        assert_eq!(rd, 16);
+        assert_eq!(half, 8);
+        assert_eq!(inv.len(), 8);
+        for (i, freq) in inv.iter().enumerate() {
+            let expected = 1.0 / 10_000.0_f64.powf(2.0 * i as f64 / 16.0);
+            assert!((freq - expected).abs() < 1e-15);
+        }
     }
 }

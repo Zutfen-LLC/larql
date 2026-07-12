@@ -216,11 +216,13 @@ pub fn run_layer_with_capture(
 }
 
 /// Hook-aware sibling of [`run_layer_with_capture`]. Fires the [`LayerHook`]
-/// callbacks at four points inside the layer: pre-layer, post-attention
-/// (mut), attention-weights / FFN-activation if captured, post-layer (mut).
+/// callbacks inside the layer: pre-layer, post-attention (mut),
+/// attention-weights / FFN-activation if captured, post-FFN (read-only),
+/// post-PLE (read-only), post-layer (mut).
 ///
 /// The two `&mut` callbacks (post-attention and post-layer) are what enable
-/// activation patching, ablation, and steering.
+/// activation patching, ablation, and steering. The read-only `on_post_ffn`
+/// / `on_post_ple` taps expose the ST5 semantic boundaries.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub fn run_layer_with_capture_hooked(
@@ -262,11 +264,13 @@ pub fn run_layer_with_capture_hooked(
     hook.on_post_attention(layer, &mut h_post_attn);
 
     let (h_post_ffn, activation) = run_ffn(&weights, &h_post_attn, layer, ffn, capture_activation);
+    hook.on_post_ffn(layer, &h_post_ffn);
     if let Some(ref act) = activation {
         hook.on_ffn_activation(layer, act);
     }
 
     let mut h_out = apply_per_layer_embedding(&weights, &h_post_ffn, layer, ple_input);
+    hook.on_post_ple(layer, &h_out);
     apply_layer_scalar(&weights, &mut h_out, layer);
     hook.on_post_layer(layer, &mut h_out);
 

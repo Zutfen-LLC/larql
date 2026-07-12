@@ -4,7 +4,7 @@
 //! Also includes Q4 quantized attention projection and KV-capture attention.
 
 use super::gqa::gqa_attention_with_weights_windowed;
-use super::rope::{apply_rope_partial, apply_rope_partial_at_full};
+use super::rope::apply_rope_partial_at_full_with_mode;
 use super::window::{effective_window_for_layer, intrinsic_attention_window};
 use super::AttentionWeights;
 use ndarray::Array2;
@@ -98,8 +98,29 @@ pub fn run_attention_block_gpu(
 
     let layer_rope_base = arch.rope_base_for_layer(layer);
     let rotary_frac = arch.rotary_fraction_for_layer(layer);
-    let q_rope = apply_rope_partial(&q_normed, num_q, head_dim, layer_rope_base, rotary_frac);
-    let k_rope = apply_rope_partial(&k_normed, num_kv, head_dim, layer_rope_base, rotary_frac);
+    let rope_mode = arch.rope_freq_mode_for_layer(layer);
+    let q_rope = apply_rope_partial_at_full_with_mode(
+        &q_normed,
+        num_q,
+        head_dim,
+        layer_rope_base,
+        rotary_frac,
+        0,
+        1.0,
+        None,
+        rope_mode,
+    );
+    let k_rope = apply_rope_partial_at_full_with_mode(
+        &k_normed,
+        num_kv,
+        head_dim,
+        layer_rope_base,
+        rotary_frac,
+        0,
+        1.0,
+        None,
+        rope_mode,
+    );
 
     let softcap = arch.attn_logit_softcapping();
     let (attn_out, attn_weights) = gqa_attention_with_weights_windowed(
@@ -301,11 +322,23 @@ pub fn run_attention_with_kv_backend(
     // through the KvEngine prefill path while the decode-step path was correct.
     let rb = crate::forward_overrides::effective_rope_base_for_layer(arch, layer);
     let rf = arch.rotary_fraction_for_layer(layer);
+    let rope_mode = arch.rope_freq_mode_for_layer(layer);
     let pos_divisor =
         crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
     let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
-    let q_r = apply_rope_partial_at_full(&q, nq, hd, rb, rf, 0, pos_divisor, llama3);
-    let k_r = apply_rope_partial_at_full(&k, nkv, hd, rb, rf, 0, pos_divisor, llama3);
+    let q_r =
+        apply_rope_partial_at_full_with_mode(&q, nq, hd, rb, rf, 0, pos_divisor, llama3, rope_mode);
+    let k_r = apply_rope_partial_at_full_with_mode(
+        &k,
+        nkv,
+        hd,
+        rb,
+        rf,
+        0,
+        pos_divisor,
+        llama3,
+        rope_mode,
+    );
 
     let (attn_out, _) = gqa_attention_with_weights_windowed(
         &q_r,
