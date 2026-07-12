@@ -14,12 +14,21 @@
 //!   residual, before FFN.
 //! - [`LayerHook::on_attention_weights`] — read per-head attention.
 //! - [`LayerHook::on_ffn_activation`] — read FFN gate activation.
+//! - [`LayerHook::on_post_ffn`] — read the residual after the FFN block,
+//!   before per-layer-embedding (ST5 semantic-boundary capture only).
+//! - [`LayerHook::on_post_ple`] — read the residual after per-layer
+//!   embedding, before `layer_scalar` (ST5 semantic-boundary capture only).
 //! - [`LayerHook::on_post_layer`] — **read or write** the residual exiting
 //!   the layer.
 //!
 //! The two `&mut` callbacks are what unlock the entire intervention surface.
 //! Ablation, steering, patching, and subspace surgery are all just
 //! [`LayerHook`] impls over those points.
+//!
+//! `on_post_ffn` and `on_post_ple` are read-only boundary taps added for the
+//! ST5 first-token parity comparator. They default to no-ops, so every
+//! existing impl pays nothing; the only caller that fires them is
+//! [`super::layer::run_layer_with_capture_hooked`].
 //!
 //! Plumbing: `run_layer_with_capture` and `trace_forward_full_hooked` accept
 //! a `&mut dyn LayerHook`. The existing zero-hook signatures stay as thin
@@ -55,6 +64,17 @@ pub trait LayerHook {
     /// Shape is `(seq_len, ffn_dim)`.
     fn on_ffn_activation(&mut self, layer: usize, gate: &Array2<f32>) {}
 
+    /// Fires after the FFN block (norm + MLP + post-norm + residual add),
+    /// before per-layer embedding. Read-only. Gives the ST5 comparator the
+    /// post-FFN semantic boundary. Default is a no-op so existing hooks pay
+    /// nothing; only `run_layer_with_capture_hooked` fires it.
+    fn on_post_ffn(&mut self, layer: usize, h: &Array2<f32>) {}
+
+    /// Fires after per-layer embedding, before `layer_scalar`. Read-only.
+    /// Gives the ST5 comparator the post-PLE semantic boundary. Default is a
+    /// no-op; only `run_layer_with_capture_hooked` fires it.
+    fn on_post_ple(&mut self, layer: usize, h: &Array2<f32>) {}
+
     /// Fires after the full layer (attention + FFN + PLE + scalar). The
     /// hook may mutate `h` — that is the insertion point for residual-stream
     /// ablation, steering, and any "edit before the next layer sees it"
@@ -79,6 +99,12 @@ pub struct RecordHook {
     pub pre_layer: HashMap<usize, Array2<f32>>,
     /// `(seq_len, hidden)` residual after attention at each captured layer.
     pub post_attention: HashMap<usize, Array2<f32>>,
+    /// `(seq_len, hidden)` residual after the FFN block, before PLE.
+    /// Populated for captured layers when ST5 boundary capture is enabled.
+    pub post_ffn: HashMap<usize, Array2<f32>>,
+    /// `(seq_len, hidden)` residual after PLE, before `layer_scalar`.
+    /// Populated for captured layers when ST5 boundary capture is enabled.
+    pub post_ple: HashMap<usize, Array2<f32>>,
     /// `(seq_len, hidden)` residual after the full layer.
     pub post_layer: HashMap<usize, Array2<f32>>,
     /// `(seq_len, ffn_dim)` FFN gate activation. Only populated when the
@@ -96,6 +122,8 @@ impl RecordHook {
             layers: layers.into_iter().collect(),
             pre_layer: HashMap::new(),
             post_attention: HashMap::new(),
+            post_ffn: HashMap::new(),
+            post_ple: HashMap::new(),
             post_layer: HashMap::new(),
             ffn_activation: HashMap::new(),
             attention_weights: HashMap::new(),
@@ -122,6 +150,16 @@ impl LayerHook for RecordHook {
     fn on_ffn_activation(&mut self, layer: usize, gate: &Array2<f32>) {
         if self.layers.contains(&layer) {
             self.ffn_activation.insert(layer, gate.clone());
+        }
+    }
+    fn on_post_ffn(&mut self, layer: usize, h: &Array2<f32>) {
+        if self.layers.contains(&layer) {
+            self.post_ffn.insert(layer, h.clone());
+        }
+    }
+    fn on_post_ple(&mut self, layer: usize, h: &Array2<f32>) {
+        if self.layers.contains(&layer) {
+            self.post_ple.insert(layer, h.clone());
         }
     }
     fn on_post_layer(&mut self, layer: usize, h: &mut Array2<f32>) {

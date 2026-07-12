@@ -215,10 +215,11 @@ pub fn run_attention_block_decode_step_backend(
     };
     let layer_rope_base = crate::forward_overrides::effective_rope_base_for_layer(arch, layer);
     let rotary_frac = arch.rotary_fraction_for_layer(layer);
+    let rope_mode = arch.rope_freq_mode_for_layer(layer);
     let pos_divisor =
         crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
     let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
-    let q_rope = crate::attention::rope::apply_rope_partial_at_full(
+    let q_rope = crate::attention::rope::apply_rope_partial_at_full_with_mode(
         &q_normed,
         num_q,
         head_dim,
@@ -227,6 +228,7 @@ pub fn run_attention_block_decode_step_backend(
         position,
         pos_divisor,
         llama3,
+        rope_mode,
     );
 
     // New token's K, V — RoPE'd at `position`, then appended to cache.
@@ -262,7 +264,7 @@ pub fn run_attention_block_decode_step_backend(
         Some(norm_w) => rms_norm_heads(&k_full_new, norm_w, num_kv, head_dim, qk_norm_off),
         None => k_full_new,
     };
-    let k_new_rope = crate::attention::rope::apply_rope_partial_at_full(
+    let k_new_rope = crate::attention::rope::apply_rope_partial_at_full_with_mode(
         &k_normed,
         num_kv,
         head_dim,
@@ -271,6 +273,7 @@ pub fn run_attention_block_decode_step_backend(
         position,
         pos_divisor,
         llama3,
+        rope_mode,
     );
 
     // Concatenate cache + new along seq axis.
@@ -411,10 +414,11 @@ pub fn run_attention_block_decode_step_shared_backend(
     };
     let layer_rope_base = crate::forward_overrides::effective_rope_base_for_layer(arch, layer);
     let rotary_frac = arch.rotary_fraction_for_layer(layer);
+    let rope_mode = arch.rope_freq_mode_for_layer(layer);
     let pos_divisor =
         crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
     let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
-    let q_rope = crate::attention::rope::apply_rope_partial_at_full(
+    let q_rope = crate::attention::rope::apply_rope_partial_at_full_with_mode(
         &q_normed,
         num_q,
         head_dim,
@@ -423,6 +427,7 @@ pub fn run_attention_block_decode_step_shared_backend(
         position,
         pos_divisor,
         llama3,
+        rope_mode,
     );
 
     // Apply the consumer's intrinsic local/global range to the shared K/V.
@@ -754,10 +759,11 @@ pub fn decode_step_project_q4k_direct(
     };
     let layer_rope_base = crate::forward_overrides::effective_rope_base_for_layer(arch, layer);
     let rotary_frac = arch.rotary_fraction_for_layer(layer);
+    let rope_mode = arch.rope_freq_mode_for_layer(layer);
     let pos_divisor =
         crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
     let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
-    let q_rope = crate::attention::rope::apply_rope_partial_at_full(
+    let q_rope = crate::attention::rope::apply_rope_partial_at_full_with_mode(
         &q_normed,
         num_q,
         head_dim,
@@ -766,6 +772,7 @@ pub fn decode_step_project_q4k_direct(
         position,
         pos_divisor,
         llama3,
+        rope_mode,
     );
 
     let mut k_full_new = direct_proj(backend, &wk, &h_norm, &mut h_norm_q8k, int8, kv_dim, hidden)?;
@@ -792,7 +799,7 @@ pub fn decode_step_project_q4k_direct(
         Some(norm_w) => rms_norm_heads(&k_full_new, norm_w, num_kv, head_dim, qk_norm_off),
         None => k_full_new,
     };
-    let k_new_rope = crate::attention::rope::apply_rope_partial_at_full(
+    let k_new_rope = crate::attention::rope::apply_rope_partial_at_full_with_mode(
         &k_normed,
         num_kv,
         head_dim,
@@ -801,6 +808,7 @@ pub fn decode_step_project_q4k_direct(
         position,
         pos_divisor,
         llama3,
+        rope_mode,
     );
 
     Some(Q4kDecodeProj {

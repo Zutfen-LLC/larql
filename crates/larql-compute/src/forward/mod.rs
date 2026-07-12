@@ -32,5 +32,6 @@ pub use layer::{
 pub use ops::{add_bias, apply_norm, dot_proj, softmax};
 pub use ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
 pub use predict::{
-    forward_from_layer, forward_raw_logits, forward_raw_logits_with_prefix, RawForward,
+    forward_from_layer, forward_raw_logits, forward_raw_logits_traced,
+    forward_raw_logits_with_prefix, RawForward, TracedTail,
 };

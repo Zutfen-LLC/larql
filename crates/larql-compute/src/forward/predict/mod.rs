@@ -6,7 +6,10 @@
 pub mod raw;
 pub mod types;
 
-pub use raw::{forward_from_layer, forward_raw_logits, forward_raw_logits_with_prefix, RawForward};
+pub use raw::{
+    forward_from_layer, forward_raw_logits, forward_raw_logits_traced,
+    forward_raw_logits_with_prefix, RawForward, TracedTail,
+};
 pub use types::{
     LayerAttentionCapture, LayerMode, PredictResult, PredictResultWithAttention,
     PredictResultWithResiduals, TraceResult,

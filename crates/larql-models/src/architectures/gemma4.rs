@@ -15,7 +15,7 @@
 //! 2. `sliding_window_pattern` field (every Nth layer is full)
 //! 3. Default pattern of 6 (every 6th layer is full)
 
-use crate::config::{Activation, ExpertFormat, ModelArchitecture, ModelConfig};
+use crate::config::{Activation, ExpertFormat, ModelArchitecture, ModelConfig, RopeFreqMode};
 
 /// Layer type string used in Gemma 4 `layer_types` config field.
 const LAYER_TYPE_FULL: &str = "full_attention";
@@ -157,6 +157,21 @@ impl ModelArchitecture for Gemma4Arch {
             self.config.partial_rotary_factor.unwrap_or(1.0)
         } else {
             1.0
+        }
+    }
+
+    fn rope_freq_mode_for_layer(&self, layer: usize) -> RopeFreqMode {
+        // Gemma 4 *global* (full-attention) layers ship `rope_type =
+        // "proportional"`: the RoPE inverse frequencies use exponent
+        // `2i/head_dim` (the full head_dim), not `2i/rotary_dim`. Sliding
+        // layers use the standard `rope_type = "default"` mode. This is the
+        // ST5 first-divergence fix — without it, global-layer Q/K rotation
+        // diverges from the Transformers oracle (cosine ~0.9997 drift at the
+        // first full-attention layer).
+        if self.is_global_layer(layer) {
+            RopeFreqMode::Proportional
+        } else {
+            RopeFreqMode::Standard
         }
     }
 

@@ -380,10 +380,11 @@ fn run_attention_block_core(
     // RoPE on Q
     let layer_rope_base = crate::forward_overrides::effective_rope_base_for_layer(arch, layer);
     let rotary_frac = arch.rotary_fraction_for_layer(layer);
+    let rope_mode = arch.rope_freq_mode_for_layer(layer);
     let pos_divisor =
         crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
     let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
-    let q_rope = crate::attention::rope::apply_rope_partial_at_full(
+    let q_rope = crate::attention::rope::apply_rope_partial_at_full_with_mode(
         &q_normed,
         num_q,
         head_dim,
@@ -392,6 +393,7 @@ fn run_attention_block_core(
         0,
         pos_divisor,
         llama3,
+        rope_mode,
     );
 
     // K/V: either from shared cache or computed fresh
@@ -448,7 +450,7 @@ fn run_attention_block_core(
             k_full.clone()
         };
 
-        let k_r = crate::attention::rope::apply_rope_partial_at_full(
+        let k_r = crate::attention::rope::apply_rope_partial_at_full_with_mode(
             &k_normed,
             num_kv,
             head_dim,
@@ -457,6 +459,7 @@ fn run_attention_block_core(
             0,
             pos_divisor,
             llama3,
+            rope_mode,
         );
         (k_r, v_full)
     };

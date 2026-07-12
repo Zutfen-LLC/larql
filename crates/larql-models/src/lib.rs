@@ -15,7 +15,7 @@ pub mod weights;
 
 pub use config::{
     Activation, ExpertFormat, FfnType, Llama3RopeScaling, ModelArchitecture, ModelConfig, NormType,
-    RopeScaling,
+    RopeFreqMode, RopeScaling,
 };
 pub use detect::{
     detect_architecture, detect_architecture_validated, detect_from_json,

@@ -1353,10 +1353,53 @@ fn test_detect_gemma4_26b_a4b() {
 }
 
 #[test]
+fn test_detect_gemma4_proportional_rope_mode_for_global_layers() {
+    // ST5 first-divergence fix: Gemma 4 global (full_attention) layers ship
+    // `rope_type = "proportional"` and must use the proportional RoPE
+    // frequency mode (exponents divided by head_dim, zero-padded to
+    // head_dim/2). Sliding layers use the standard mode. Pin so a regression
+    // is caught here, not only by the 18 GB oracle.
+    use crate::config::RopeFreqMode;
+    let layer_types: Vec<&str> = (0..10)
+        .map(|i| {
+            if i % 5 == 4 {
+                "full_attention"
+            } else {
+                "sliding_attention"
+            }
+        })
+        .collect();
+    let config = serde_json::json!({
+        "model_type": "gemma4",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 1536,
+            "num_hidden_layers": 10,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "partial_rotary_factor": 0.25,
+            "layer_types": layer_types,
+            "rope_parameters": {
+                "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+            }
+        }
+    });
+    let arch = detect_from_json(&config);
+    // Layer 4 is the first full_attention layer.
+    assert_eq!(arch.rope_freq_mode_for_layer(4), RopeFreqMode::Proportional);
+    assert_eq!(arch.rope_freq_mode_for_layer(9), RopeFreqMode::Proportional);
+    assert_eq!(arch.rope_freq_mode_for_layer(0), RopeFreqMode::Standard);
+    assert_eq!(arch.rotary_fraction_for_layer(4), 0.25);
+    assert_eq!(arch.head_dim_for_layer(4), 512);
+    assert_eq!(arch.rope_base_for_layer(4), 1_000_000.0);
+    assert_eq!(arch.rope_base_for_layer(0), 10_000.0);
+}
+
+#[test]
 fn test_detect_gemma4_dense_returns_none_for_moe_getters() {
-    // Non-MoE Gemma 4 must return None / non-MoE-specific values from
-    // every MoE-only getter — covers the `else` arms in
-    // architectures/gemma4.rs (lines 270-393 None branches).
     let config = serde_json::json!({
         "model_type": "gemma4",
         "text_config": {
