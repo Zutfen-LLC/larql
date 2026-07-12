@@ -434,6 +434,107 @@ pub fn make_starcoder2_test_weights() -> ModelWeights {
     }
 }
 
+// ── Qwen2 full-attention synthetic fixture (ST4A regression) ──
+
+/// Build a small synthetic `ModelWeights` configured as a Qwen2 dense arch.
+///
+/// Qwen2 is a conventional full-attention architecture (no intrinsic
+/// sliding window, no KV sharing). This fixture populates the Qwen2
+/// attention biases (Q/K/V) so the regression exercises the real Qwen2
+/// attention path, not a generic proxy. Dimensions mirror
+/// [`make_test_weights`] (hidden=16, 2 layers) so a 600+ token prefill
+/// stays cheap on CPU.
+pub fn make_qwen2_test_weights() -> ModelWeights {
+    const VOCAB: usize = 32;
+    const HIDDEN: usize = 16;
+    const INTER: usize = 32;
+    const NUM_Q: usize = 2;
+    const NUM_KV: usize = 1;
+    const HEAD_DIM: usize = 8;
+    const NUM_LAYERS: usize = 2;
+
+    let arch_json = serde_json::json!({
+        "model_type": "qwen2",
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": NUM_LAYERS,
+        "intermediate_size": INTER,
+        "head_dim": HEAD_DIM,
+        "num_attention_heads": NUM_Q,
+        "num_key_value_heads": NUM_KV,
+        "vocab_size": VOCAB,
+    });
+    let arch = detect_from_json(&arch_json);
+
+    let mut tensors: HashMap<String, WeightArray> = HashMap::new();
+    let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut rng_state = 0x51e2_b000_u64;
+    let mut rand_mat = |rows: usize, cols: usize, scale: f32| -> WeightArray {
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (rng_state as u32) as f32 / u32::MAX as f32 * 2.0 * scale - scale
+            })
+            .collect();
+        Array2::from_shape_vec((rows, cols), data)
+            .unwrap()
+            .into_shared()
+    };
+
+    let embed = rand_mat(VOCAB, HIDDEN, 0.1);
+    let lm_head = rand_mat(VOCAB, HIDDEN, 0.1);
+    tensors.insert(arch.embed_key().to_string(), embed.clone());
+    vectors.insert(arch.final_norm_key().to_string(), vec![1.0; HIDDEN]);
+
+    let q_dim = NUM_Q * HEAD_DIM;
+    let kv_dim = NUM_KV * HEAD_DIM;
+
+    for layer in 0..NUM_LAYERS {
+        tensors.insert(arch.attn_q_key(layer), rand_mat(q_dim, HIDDEN, 0.1));
+        tensors.insert(arch.attn_k_key(layer), rand_mat(kv_dim, HIDDEN, 0.1));
+        tensors.insert(arch.attn_v_key(layer), rand_mat(kv_dim, HIDDEN, 0.1));
+        tensors.insert(arch.attn_o_key(layer), rand_mat(HIDDEN, q_dim, 0.1));
+        // Qwen2 attention biases (Q/K/V) — the distinguishing Qwen2 path.
+        if let Some(k) = arch.attn_q_bias_key(layer) {
+            vectors.insert(k, vec![0.01; q_dim]);
+        }
+        if let Some(k) = arch.attn_k_bias_key(layer) {
+            vectors.insert(k, vec![0.01; kv_dim]);
+        }
+        if let Some(k) = arch.attn_v_bias_key(layer) {
+            vectors.insert(k, vec![0.01; kv_dim]);
+        }
+        tensors.insert(arch.ffn_gate_key(layer), rand_mat(INTER, HIDDEN, 0.1));
+        tensors.insert(arch.ffn_up_key(layer), rand_mat(INTER, HIDDEN, 0.1));
+        tensors.insert(arch.ffn_down_key(layer), rand_mat(HIDDEN, INTER, 0.1));
+        vectors.insert(arch.input_layernorm_key(layer), vec![1.0; HIDDEN]);
+        vectors.insert(arch.post_attention_layernorm_key(layer), vec![1.0; HIDDEN]);
+    }
+
+    ModelWeights {
+        tensors,
+        vectors,
+        raw_bytes: HashMap::new(),
+        packed_mmaps: HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_byte_ranges: HashMap::new(),
+        embed,
+        lm_head,
+        position_embed: None,
+        arch,
+        num_layers: NUM_LAYERS,
+        hidden_size: HIDDEN,
+        intermediate_size: INTER,
+        vocab_size: VOCAB,
+        logical_vocab_size: None,
+        head_dim: HEAD_DIM,
+        num_q_heads: NUM_Q,
+        num_kv_heads: NUM_KV,
+        rope_base: 10_000.0,
+    }
+}
+
 // ── Gemma 4 E2B-like synthetic fixture (PLE-aware) ──
 
 /// Tiny synthetic Gemma-4-E2B-shaped arch with PLE + KV sharing.
@@ -474,6 +575,17 @@ pub fn synthetic_e2b_like_arch_json() -> serde_json::Value {
             ]
         }
     })
+}
+
+/// ST4A canonical-loop fixture: identical E2B-like shape (4 layers
+/// S/G/S/G, PLE, KV-shared, QK-norm, V-norm) but with a **512-token
+/// intrinsic sliding window** instead of 4. Used by the canonical
+/// prefill/decode equivalence tests at boundary positions 511, 512,
+/// 513, 1024 — a 4-token window cannot exercise those positions.
+pub fn synthetic_e2b_like_arch_json_window512() -> serde_json::Value {
+    let mut json = synthetic_e2b_like_arch_json();
+    json["text_config"]["sliding_window"] = serde_json::json!(512);
+    json
 }
 
 /// Build minimal `ModelWeights` matching the synthetic E2B-like arch.
@@ -572,7 +684,20 @@ pub fn make_synthetic_e2b_like_weights() -> ModelWeights {
 /// Same 4-layer E2B-like shape: sliding_window=4, num_kv_shared_layers=2
 /// (layers 2/3 are shared consumers of 0/1), PLE + QK-norm + V-norm.
 pub fn make_synthetic_e2b_like_weights_random() -> ModelWeights {
-    let arch = detect_from_json(&synthetic_e2b_like_arch_json());
+    make_synthetic_e2b_like_weights_random_from_arch(synthetic_e2b_like_arch_json())
+}
+
+/// ST4A sibling of [`make_synthetic_e2b_like_weights_random`] using the
+/// 512-token intrinsic window ([`synthetic_e2b_like_arch_json_window512`]).
+/// Same 4-layer S/G/S/G shape with KV-shared consumers (2/3 ← 0/1), PLE,
+/// QK-norm, V-norm, and distinct random per-layer weights. Sized so a
+/// full 1025-token prefill through all four layers stays cheap on CPU.
+pub fn make_synthetic_e2b_like_weights_random_window512() -> ModelWeights {
+    make_synthetic_e2b_like_weights_random_from_arch(synthetic_e2b_like_arch_json_window512())
+}
+
+fn make_synthetic_e2b_like_weights_random_from_arch(arch_json: serde_json::Value) -> ModelWeights {
+    let arch = detect_from_json(&arch_json);
     let num_layers = 4;
     let hidden = 8;
     let intermediate = 16;

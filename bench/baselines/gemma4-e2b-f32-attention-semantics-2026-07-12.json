@@ -1,8 +1,10 @@
 {
   "slice_id": "LARQL-INFERENCE-TRUST-001A-ST4",
+  "closeout_slice": "LARQL-INFERENCE-TRUST-001A-ST4A",
   "work_start_sha": "15864226bd3ffb70a2cdc35ca3e52dafe76692c7",
-  "pr_base_sha": "15864226bd3ffb70a2cdc35ca3e52dafe76692c7",
-  "head_sha": "pending PR head",
+  "head_sha": "2889157f29ea85d690db5d08290bad41154a346f",
+  "merge_commit": "b2584c0acf7691d9963dff6a557ec7bac58755d9",
+  "ci": "all 11 triggered workflows completed successfully",
   "intrinsic_window": 512,
   "layer_pattern": "SSSSG x7, final layer global (34)",
   "shared_kv_map": {
@@ -27,16 +29,70 @@
   "observed_attention_ranges": "match expected (t1-t9 PASS)",
   "range_mismatch_count": 0,
   "prefill_decode_comparison_count": 4,
-  "maximum_absolute_error": 1e-5,
+  "prefill_decode_method": "canonical kv_prefill_run vs kv_prefill_run+kv_decode_step_run (window-512 E2B-like fixture)",
+  "prefill_decode_abs_tolerance": 1e-5,
+  "prefill_decode_per_position": {
+    "511": {
+      "hidden_max_abs": 1.073e-6,
+      "hidden_max_rel": 1.023e-6,
+      "local_kv_tail_max_abs": 0.0,
+      "local_cache_len_route_a": 512,
+      "local_cache_len_route_b": 512,
+      "global_cache_len_route_a": 512,
+      "global_cache_len_route_b": 512,
+      "local_absolute_range": "0..=511",
+      "next_position_after_decode": 512
+    },
+    "512": {
+      "hidden_max_abs": 0.0,
+      "hidden_max_rel": 0.0,
+      "local_kv_tail_max_abs": 0.0,
+      "local_cache_len_route_a": 512,
+      "local_cache_len_route_b": 512,
+      "global_cache_len_route_a": 513,
+      "global_cache_len_route_b": 513,
+      "local_absolute_range": "1..=512",
+      "next_position_after_decode": 513
+    },
+    "513": {
+      "hidden_max_abs": 0.0,
+      "hidden_max_rel": 0.0,
+      "local_kv_tail_max_abs": 0.0,
+      "local_cache_len_route_a": 512,
+      "local_cache_len_route_b": 512,
+      "global_cache_len_route_a": 514,
+      "global_cache_len_route_b": 514,
+      "local_absolute_range": "2..=513",
+      "next_position_after_decode": 514
+    },
+    "1024": {
+      "hidden_max_abs": 0.0,
+      "hidden_max_rel": 0.0,
+      "local_kv_tail_max_abs": 0.0,
+      "local_cache_len_route_a": 512,
+      "local_cache_len_route_b": 512,
+      "global_cache_len_route_a": 1025,
+      "global_cache_len_route_b": 1025,
+      "local_absolute_range": "513..=1024",
+      "next_position_after_decode": 1025
+    }
+  },
+  "prefill_decode_maximum_absolute_error": 1.073e-6,
   "cache_length_mismatch_count": 0,
   "absolute_position_mismatch_count": 0,
   "shared_consumer_count": 2,
   "independent_shared_cache_allocation_count": 0,
   "shared_consumer_kv_append_count": 0,
+  "source_append_deltas_per_decode_token": {
+    "local_source": "+1 (clipped to intrinsic window)",
+    "global_source": "+1 (unbounded)",
+    "local_consumer": 0,
+    "global_consumer": 0
+  },
   "poison_weight_test_result": "PASS",
   "incompatible_geometry_result": "fails loudly (panic)",
-  "qwen_regression_result": "N/A (no Qwen CPU F32 fixture; conventional full-attention retained)",
-  "q4k_regression_result": "PASS (regression-only, not claiming ST4 coverage)",
+  "qwen_regression_result": "PASS (Qwen2 full attention: intrinsic_window=None, 600-token prefill retains full prefix, decode grows cache +1, no shared-KV routing, old-key sensitivity abs=3.679e-4 rel=1.334e-2 at position 600 vs position 0 outside a 512-window)",
+  "q4k_regression_result": "PASS (regression-only, NOT part of the ST4/ST4A GREEN claim)",
   "semantic_official_model_run": false,
   "decision": "GREEN",
   "excluded_q4k_paths": [
@@ -47,9 +103,19 @@
     "coarse_prefill",
     "coarse_decode_step"
   ],
+  "st4a": {
+    "work_start_sha": "eb40807ef0c392cd34456406b936692c13741716",
+    "tested_implementation_sha": "97ff07bb28e36420e07a015af0e4b32ccc736ef0",
+    "new_fixtures": [
+      "make_synthetic_e2b_like_weights_random_window512",
+      "make_qwen2_test_weights"
+    ],
+    "boundary_positions_tested": [511, 512, 513, 1024],
+    "decision": "GREEN"
+  },
   "synthetic_tests": {
-    "st4_attention_semantics": 18,
-    "st4_shared_kv": 17,
+    "st4_attention_semantics": 26,
+    "st4_shared_kv": 28,
     "st4_e2b_mapping": 5
   }
 }
