@@ -18,4 +18,6 @@ pub enum InferenceError {
     Vindex(#[from] larql_vindex::VindexError),
     #[error("model error: {0}")]
     Model(#[from] larql_models::ModelError),
+    #[error("prompt render error: {0}")]
+    PromptRender(String),
 }

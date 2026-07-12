@@ -4,7 +4,7 @@
   "decision": "GREEN",
   "work_start_sha": "d5922116a1ea8967a427164365baa75b370baffc",
   "pr_base_sha": "d5922116a1ea8967a427164365baa75b370baffc",
-  "head_sha": null,
+  "head_sha": "62642e3da80a0a8a0f9ebd38cf26d8af7c53b13d",
   "source": {
     "repository": "google/gemma-4-E2B-it",
     "revision": "9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf",
@@ -63,6 +63,6 @@
     "physical_kv_tensors": "all 35 K and all 35 V projections compared exactly"
   },
   "semantic_inference_run": false,
-  "ci_status": "local verification passed; GitHub Actions pending PR",
+  "ci_status": "all triggered GitHub Actions workflows passed",
   "next_slice": "LARQL-INFERENCE-TRUST-001A-ST3"
 }

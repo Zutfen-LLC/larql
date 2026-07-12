@@ -66,6 +66,7 @@ pub mod layer_executor;
 pub mod layer_graph;
 pub mod model;
 pub mod prompt;
+pub mod prompt_render;
 pub mod residual;
 pub mod residual_diff;
 pub mod ternary;
@@ -651,6 +652,10 @@ pub use layer_graph::{
     WalkLayerGraph,
 };
 pub use model::{load_model_dir, resolve_model_path, DequantScratch, ModelWeights, WeightsView};
+pub use prompt_render::{
+    ChatMessage, ChatRole, PromptAssets, PromptEncoding, PromptInput, TemplateRevision,
+    ThinkingMode, TokenizerPolicy,
+};
 pub use tokenizer::{decode_token, decode_token_raw, encode_prompt, load_tokenizer};
 pub use trace::{
     trace as trace_decomposed, trace_residuals, AnswerWaypoint, BoundaryStore, BoundaryWriter,
