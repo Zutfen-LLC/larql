@@ -9,7 +9,7 @@ use larql_models::{
         FIELD_PARTIAL_ROTARY_FACTOR, FIELD_ROPE_BASE, FIELD_ROPE_SCALING_FACTOR,
         FIELD_ROPE_SCALING_TYPE,
     },
-    ExpertFormat, ModelArchitecture,
+    ExpertFormat, ModelArchitecture, RopeFreqMode,
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -248,6 +248,7 @@ fn generic_architecture_exercises_default_trait_contract() {
     assert_eq!(arch.num_q_heads_for_layer(1), 4);
     assert_eq!(arch.num_kv_heads_for_layer(1), 2);
     assert_eq!(arch.rotary_fraction_for_layer(1), 1.0);
+    assert_eq!(arch.rope_freq_mode_for_layer(1), RopeFreqMode::Standard);
     assert!(!arch.v_shares_k(1));
     assert!(!arch.has_v_norm());
     assert_eq!(arch.layer_scalar_key(1), None);
