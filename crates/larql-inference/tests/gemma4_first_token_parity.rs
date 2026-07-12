@@ -235,9 +235,9 @@ fn build_report(
                 std::collections::BTreeMap::new();
             for s in &p.stages {
                 if let Some(layer) = s.layer {
-                    let entry = by_layer
-                        .entry(layer)
-                        .or_insert_with(|| serde_json::json!({"max_nrmse": 0.0, "max_abs": 0.0, "min_cos": 1.0}));
+                    let entry = by_layer.entry(layer).or_insert_with(
+                        || serde_json::json!({"max_nrmse": 0.0, "max_abs": 0.0, "min_cos": 1.0}),
+                    );
                     if s.nrmse > entry["max_nrmse"].as_f64().unwrap_or(0.0) {
                         entry["max_nrmse"] = serde_json::json!(s.nrmse);
                     }
@@ -345,7 +345,13 @@ fn git_shas() -> (String, String) {
             .args(["rev-parse", "c023735f6afe3221e5989678918961e855cd2bda"])
             .output()
             .ok()
-            .and_then(|o| if o.status.success() { Some(o.stdout) } else { None })
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(o.stdout)
+                } else {
+                    None
+                }
+            })
             .unwrap_or_default(),
     )
     .unwrap_or_default()
@@ -356,7 +362,13 @@ fn git_shas() -> (String, String) {
             .args(["rev-parse", "HEAD"])
             .output()
             .ok()
-            .and_then(|o| if o.status.success() { Some(o.stdout) } else { None })
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(o.stdout)
+                } else {
+                    None
+                }
+            })
             .unwrap_or_default(),
     )
     .unwrap_or_default()
@@ -414,8 +426,10 @@ fn render_markdown(report: &Value) -> String {
     }
     out.push_str("\n## Corrections made\n\n");
     for c in report["corrections_made"].as_array().unwrap() {
-        out.push_str(&format!("### {}\n\n- **Root cause:** {}\n- **Fix:** {}\n\n",
-            c["defect"], c["root_cause"], c["fix"]));
+        out.push_str(&format!(
+            "### {}\n\n- **Root cause:** {}\n- **Fix:** {}\n\n",
+            c["defect"], c["root_cause"], c["fix"]
+        ));
     }
     out.push_str("\n## Scope exclusions\n\n");
     for s in report["scope_exclusions"].as_array().unwrap() {

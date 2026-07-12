@@ -74,26 +74,14 @@ pub fn capture_prompt(
 
     for layer in 0..num_layers {
         let cap = LayerCapture {
-            layer_input: hook
-                .pre_layer
-                .get(&layer)
-                .map(last_row)
-                .unwrap_or_default(),
+            layer_input: hook.pre_layer.get(&layer).map(last_row).unwrap_or_default(),
             post_attention: hook
                 .post_attention
                 .get(&layer)
                 .map(last_row)
                 .unwrap_or_default(),
-            post_ffn: hook
-                .post_ffn
-                .get(&layer)
-                .map(last_row)
-                .unwrap_or_default(),
-            post_ple: hook
-                .post_ple
-                .get(&layer)
-                .map(last_row)
-                .unwrap_or_default(),
+            post_ffn: hook.post_ffn.get(&layer).map(last_row).unwrap_or_default(),
+            post_ple: hook.post_ple.get(&layer).map(last_row).unwrap_or_default(),
             post_layer: hook
                 .post_layer
                 .get(&layer)

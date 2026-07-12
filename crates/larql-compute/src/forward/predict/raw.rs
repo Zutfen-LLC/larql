@@ -370,7 +370,10 @@ mod forward_from_layer_tests {
         // Per-layer boundary capture: every layer recorded pre/post stages.
         for layer in 0..n {
             assert!(hook.pre_layer.contains_key(&layer), "pre_layer {layer}");
-            assert!(hook.post_attention.contains_key(&layer), "post_attention {layer}");
+            assert!(
+                hook.post_attention.contains_key(&layer),
+                "post_attention {layer}"
+            );
             assert!(hook.post_ffn.contains_key(&layer), "post_ffn {layer}");
             assert!(hook.post_ple.contains_key(&layer), "post_ple {layer}");
             assert!(hook.post_layer.contains_key(&layer), "post_layer {layer}");
@@ -393,7 +396,10 @@ mod forward_from_layer_tests {
         }
         // final logits match the reference logits (same transform).
         for (i, v) in tail.final_logits.iter().enumerate() {
-            assert!((v - raw.logits[i]).abs() < 1e-4, "final_logits[{i}] mismatch");
+            assert!(
+                (v - raw.logits[i]).abs() < 1e-4,
+                "final_logits[{i}] mismatch"
+            );
         }
         assert!(
             tail.final_logits.iter().all(|v| v.is_finite()),
