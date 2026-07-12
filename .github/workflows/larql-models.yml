@@ -7,20 +7,7 @@
 name: larql-models
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/larql-models/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/larql-models.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/larql-models/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/larql-models.yml'
+  workflow_call: {}
   workflow_dispatch: {}
 
 env:

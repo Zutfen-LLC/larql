@@ -8,30 +8,7 @@
 name: larql-lql
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/larql-lql/**'
-      - 'crates/larql-core/**'
-      - 'crates/larql-vindex/**'
-      - 'crates/larql-models/**'
-      - 'crates/larql-inference/src/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Makefile'
-      - '.github/workflows/larql-lql.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/larql-lql/**'
-      - 'crates/larql-core/**'
-      - 'crates/larql-vindex/**'
-      - 'crates/larql-models/**'
-      - 'crates/larql-inference/src/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Makefile'
-      - '.github/workflows/larql-lql.yml'
+  workflow_call: {}
   workflow_dispatch: {}
 
 env:

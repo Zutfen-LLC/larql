@@ -20,30 +20,7 @@
 name: shannon-verify
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/larql-cli/**'
-      - 'crates/larql-inference/**'
-      - 'crates/larql-models/**'
-      - 'scripts/shannon_score_*.py'
-      - 'scripts/diagnose_models.py'
-      - 'tests/fixtures/shannon_frankenstein_2k.txt'
-      - '.github/workflows/shannon-verify.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/larql-cli/**'
-      - 'crates/larql-inference/**'
-      - 'crates/larql-models/**'
-      - 'scripts/shannon_score_*.py'
-      - 'scripts/diagnose_models.py'
-      - 'tests/fixtures/shannon_frankenstein_2k.txt'
-      - '.github/workflows/shannon-verify.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+  workflow_call: {}
   workflow_dispatch: {}
 
 env:

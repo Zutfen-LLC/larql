@@ -13,28 +13,7 @@
 name: larql-compute-cuda
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - crates/larql-compute-cuda/**
-      - crates/larql-compute/**
-      - crates/larql-models/**
-      - crates/larql-vindex/**
-      - crates/larql-inference/**
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/larql-compute-cuda.yml
-  pull_request:
-    branches: [main]
-    paths:
-      - crates/larql-compute-cuda/**
-      - crates/larql-compute/**
-      - crates/larql-models/**
-      - crates/larql-vindex/**
-      - crates/larql-inference/**
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/larql-compute-cuda.yml
+  workflow_call: {}
   workflow_dispatch: {}
 
 env:
