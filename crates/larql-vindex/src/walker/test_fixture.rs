@@ -163,7 +163,7 @@ pub fn create_with_dims(dir: &Path, dims: &ModelDims) {
             "model_type": "gemma3_text",
             "num_hidden_layers": dims.num_layers,
             "hidden_size": dims.hidden,
-            "intermediate_size": dims.inter,
+            "intermediate_size": dims.intermediate,
             "head_dim": dims.head_dim,
             "num_attention_heads": dims.num_q_heads,
             "num_key_value_heads": dims.num_kv_heads,
