@@ -99,6 +99,7 @@ impl<'a> BuildContext<'a> {
                 // write only norms + embed + lm_head.
                 skip_attn: self.dense_only,
                 skip_ffn: self.dense_only,
+                ple_storage: crate::format::weights::PleStoragePolicy::ProductionF16,
             };
             crate::format::weights::write_model_weights_with_opts(
                 self.weights,

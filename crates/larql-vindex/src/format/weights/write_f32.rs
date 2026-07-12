@@ -50,6 +50,16 @@ pub mod kind {
     pub const PACKED_BF16: &str = "packed_bf16";
 }
 
+/// Precision policy for Gemma 4 per-layer embedding sidecars.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PleStoragePolicy {
+    /// Production policy: compact F16 PLE tensors.
+    #[default]
+    ProductionF16,
+    /// Reference policy: exact BF16-widened F32 PLE tensors.
+    ReferenceF32,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct WeightEntry {
     pub key: String,
@@ -309,6 +319,9 @@ pub struct WriteWeightsOptions {
     /// `up_weights.bin` / `down_weights.bin`).  Companion to
     /// `skip_attn` for the dense-only BitNet build.
     pub skip_ffn: bool,
+
+    /// Storage policy for Gemma 4 PLE tensors.
+    pub ple_storage: PleStoragePolicy,
 }
 
 impl Default for WriteWeightsOptions {
@@ -318,6 +331,7 @@ impl Default for WriteWeightsOptions {
             ffn_compact: false,
             skip_attn: false,
             skip_ffn: false,
+            ple_storage: PleStoragePolicy::ProductionF16,
         }
     }
 }
@@ -806,7 +820,14 @@ pub fn write_model_weights_with_opts(
     // tensors the inference path expects in weights.tensors. Before
     // this, `larql extract --quant none` against E4B silently produced
     // a vindex with zero PLE entries → garbage INFER output (#49).
-    super::ple_sidecar::write_ple_weights(source, dir, num_layers, &mut entries, &rec)?;
+    super::ple_sidecar::write_ple_weights(
+        source,
+        dir,
+        num_layers,
+        &mut entries,
+        &rec,
+        opts.ple_storage,
+    )?;
 
     // ── LM Head ── (skipped when level < Inference)
     if write_lm_head {

@@ -992,6 +992,7 @@ fn streaming_extract_mixtral_with_drop_gate_vectors_removes_zero_byte_file() {
             ffn_compact: false,
             skip_attn: false,
             skip_ffn: false,
+            ple_storage: larql_vindex::PleStoragePolicy::ProductionF16,
         },
         KquantWriteOptions::default(),
         true, // drop_gate_vectors

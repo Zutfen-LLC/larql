@@ -297,7 +297,14 @@ pub fn write_model_weights_kquant_with_opts(
     let norms_start = rec.now();
     let mut entries = norms::write_norms_and_router(source, dir, num_layers, &rec)?;
     rec.manifest(norms_start, "norms_router", "norms_router");
-    super::ple_sidecar::write_ple_weights(source, dir, num_layers, &mut entries, &rec)?;
+    super::ple_sidecar::write_ple_weights(
+        source,
+        dir,
+        num_layers,
+        &mut entries,
+        &rec,
+        super::write_f32::PleStoragePolicy::ProductionF16,
+    )?;
 
     let lm_start = rec.now();
     lm_head::write_lm_head_kquant(source, dir, &mut entries, &rec)?;

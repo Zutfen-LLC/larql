@@ -7,6 +7,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use larql_inference::InferenceModel;
 use larql_vindex::IndexBuildCallbacks;
 
+const REFERENCE_REVISION: &str = "9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf";
+const REFERENCE_SHA256: &str = "2db5482b20d746879bb3ef79b5203e9075a2e2b98f54ec7c2f281c1477ddc550";
+const REFERENCE_BYTES: u64 = 10_246_621_918;
+const WORK_START_SHA: &str = "d5922116a1ea8967a427164365baa75b370baffc";
+
 #[derive(Args)]
 pub struct ExtractIndexArgs {
     /// Model path or HuggingFace model ID (extracts directly from weights).
@@ -56,6 +61,14 @@ pub struct ExtractIndexArgs {
     /// negligible accuracy gain. Rarely wanted.
     #[arg(long)]
     f32: bool,
+
+    /// Storage dtype (`f16` or `f32`). `--f32` remains as a compatibility alias.
+    #[arg(long, value_parser = parse_storage_dtype)]
+    dtype: Option<larql_vindex::StorageDtype>,
+
+    /// Build a lossless BF16-source to F32 reference vindex.
+    #[arg(long)]
+    reference_f32: bool,
 
     /// Quantise model forward-pass weights inline while extracting —
     /// skips any f32 intermediate. `q4k`: Q4_K for Q/K/O/gate/up, Q6_K
@@ -114,7 +127,7 @@ pub struct ExtractIndexArgs {
     /// a concise stderr hotspot summary. Opt-in; disabled by default (no
     /// output change, no profile file). Also enabled by
     /// `LARQL_EXTRACT_PROFILE=1`.
-    #[arg(long)]
+    #[arg(long, alias = "profile")]
     profile_extract: bool,
 
     /// Bounded worker count for attention + dense-FFN Q4_K/Q6_K layer
@@ -181,6 +194,14 @@ fn parse_extract_level(s: &str) -> Result<larql_vindex::ExtractLevel, String> {
     }
 }
 
+fn parse_storage_dtype(s: &str) -> Result<larql_vindex::StorageDtype, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "f32" => Ok(larql_vindex::StorageDtype::F32),
+        "f16" => Ok(larql_vindex::StorageDtype::F16),
+        _ => Err(format!("unknown storage dtype: {s} (expected: f16, f32)")),
+    }
+}
+
 struct CliBuildCallbacks {
     stage_start: Option<Instant>,
     feature_bar: ProgressBar,
@@ -241,7 +262,226 @@ impl IndexBuildCallbacks for CliBuildCallbacks {
     }
 }
 
-pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(mut args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.reference_f32 {
+        return run_inner(args);
+    }
+
+    validate_reference_args(&args)?;
+    let reference_start = Instant::now();
+    let source_dir = larql_models::resolve_model_path(
+        args.model
+            .as_deref()
+            .ok_or("--reference-f32 requires a model directory")?,
+    )?;
+    validate_reference_source(&source_dir, &args.output)?;
+    let final_output = args.output.clone();
+    if final_output.exists() {
+        return Err(format!(
+            "reference output already exists; refusing to replace {}",
+            final_output.display()
+        )
+        .into());
+    }
+    let name = final_output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("reference output must have a valid final component")?;
+    let staging = final_output.with_file_name(format!("{name}.tmp-{}", std::process::id()));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    args.output = staging.clone();
+    if let Err(error) = run_inner(args) {
+        let cleanup = std::fs::remove_dir_all(&staging);
+        eprintln!(
+            "reference extraction failed in {}; cleanup: {}",
+            staging.display(),
+            if cleanup.is_ok() {
+                "complete"
+            } else {
+                "failed"
+            }
+        );
+        return Err(error);
+    }
+    write_reference_provenance(&staging, reference_start.elapsed())?;
+    larql_vindex::load_vindex_config(&staging)
+        .map_err(|e| format!("reference structural validation failed: {e}"))?;
+    std::fs::rename(&staging, &final_output)?;
+    eprintln!(
+        "Reference artifact published atomically: {}",
+        final_output.display()
+    );
+    Ok(())
+}
+
+fn validate_reference_source(
+    source_dir: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let revision = std::env::var("LARQL_GEMMA4_ST_REVISION")
+        .map_err(|_| "LARQL_GEMMA4_ST_REVISION is required by --reference-f32")?;
+    if revision != REFERENCE_REVISION {
+        return Err(format!(
+            "unexpected source revision {revision}; expected {REFERENCE_REVISION}"
+        )
+        .into());
+    }
+    let shard = source_dir.join("model.safetensors");
+    let size = std::fs::metadata(&shard)?.len();
+    if size != REFERENCE_BYTES {
+        return Err(
+            format!("unexpected source shard size {size}; expected {REFERENCE_BYTES}").into(),
+        );
+    }
+    let hash = larql_vindex::format::checksums::sha256_file(&shard)?;
+    if hash != REFERENCE_SHA256 {
+        return Err(
+            format!("unexpected source shard SHA-256 {hash}; expected {REFERENCE_SHA256}").into(),
+        );
+    }
+
+    let parent = output.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let available = available_bytes(parent)?;
+    let estimated_output = REFERENCE_BYTES
+        .checked_mul(2)
+        .ok_or("output estimate overflow")?;
+    let required = estimated_output
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(1024 * 1024 * 1024))
+        .ok_or("capacity estimate overflow")?;
+    eprintln!(
+        "Reference disk preflight: source={REFERENCE_BYTES}, estimated_output={estimated_output}, available={available}, required={required}"
+    );
+    if available < required {
+        return Err(
+            format!("insufficient disk space: {available} available, {required} required").into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn available_bytes(path: &std::path::Path) -> Result<u64, Box<dyn std::error::Error>> {
+    use std::os::unix::ffi::OsStrExt;
+    let canonical = path.canonicalize()?;
+    let c_path = std::ffi::CString::new(canonical.as_os_str().as_bytes())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stats = unsafe { stats.assume_init() };
+    let available_blocks: u64 = stats.f_bavail;
+    let fragment_size: u64 = stats.f_frsize;
+    Ok(available_blocks.saturating_mul(fragment_size))
+}
+
+#[cfg(not(unix))]
+fn available_bytes(_path: &std::path::Path) -> Result<u64, Box<dyn std::error::Error>> {
+    Err("--reference-f32 disk preflight is currently supported only on Unix".into())
+}
+
+fn write_reference_provenance(
+    output: &std::path::Path,
+    duration: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(output)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let path = entry.path();
+            files.push(serde_json::json!({
+                "name": entry.file_name().to_string_lossy(),
+                "size_bytes": entry.metadata()?.len(),
+                "sha256": larql_vindex::format::checksums::sha256_file(&path)?,
+            }));
+        }
+    }
+    files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let provenance = serde_json::json!({
+        "schema_version": 1,
+        "slice_id": "LARQL-INFERENCE-TRUST-001A-ST2",
+        "larql_work_start_sha": WORK_START_SHA,
+        "larql_final_head_sha": option_env!("LARQL_GIT_SHA"),
+        "source_repository": "google/gemma-4-E2B-it",
+        "source_revision": REFERENCE_REVISION,
+        "source_safetensors_filename": "model.safetensors",
+        "source_safetensors_bytes": REFERENCE_BYTES,
+        "source_safetensors_sha256": REFERENCE_SHA256,
+        "source_dtype": "bf16",
+        "destination_dtype": "f32",
+        "conversion_contract": "Every required BF16 source value is widened exactly to F32. No required reference tensor is converted through F16 or quantized.",
+        "required_source_tensor_count": 600,
+        "excluded_multimodal_tensor_count": 1411,
+        "tied_head_contract": "embed_tokens.weight serialized once; lm_head derived by the production float loader",
+        "ple_storage_policy": "reference_f32",
+        "source_directory": "${LARQL_GEMMA4_ST_DIR}",
+        "extraction_command": "larql extract ${LARQL_GEMMA4_ST_DIR} -o ${LARQL_GEMMA4_REFERENCE_VINDEX} --level all --quant none --dtype f32 --reference-f32 --profile",
+        "extraction_duration_seconds": duration.as_secs_f64(),
+        "peak_rss_bytes": peak_rss_bytes(),
+        "output_files": files,
+    });
+    std::fs::write(
+        output.join("reference_provenance.json"),
+        serde_json::to_vec_pretty(&provenance)?,
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn peak_rss_bytes() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    #[cfg(target_os = "macos")]
+    {
+        usage.ru_maxrss as u64
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (usage.ru_maxrss as u64).saturating_mul(1024)
+    }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> u64 {
+    0
+}
+
+fn validate_reference_args(args: &ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let level = if args.include_weights {
+        larql_vindex::ExtractLevel::All
+    } else {
+        args.level
+    };
+    if level != larql_vindex::ExtractLevel::All {
+        return Err("--reference-f32 requires --level all".into());
+    }
+    if args.quant != larql_vindex::QuantFormat::None {
+        return Err("--reference-f32 requires --quant none".into());
+    }
+    if args.dtype == Some(larql_vindex::StorageDtype::F16) {
+        return Err("--reference-f32 conflicts with --dtype f16".into());
+    }
+    if args.compact {
+        return Err("--reference-f32 conflicts with --compact".into());
+    }
+    if args.resume {
+        return Err("--reference-f32 does not support --resume".into());
+    }
+    if args.from_vectors.is_some() {
+        return Err("--reference-f32 requires a safetensors source directory".into());
+    }
+    if args.drop_gate_vectors || args.down_q4k || args.feature_major_down {
+        return Err("--reference-f32 conflicts with Q4_K-only extraction options".into());
+    }
+    Ok(())
+}
+
+fn run_inner(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut callbacks = CliBuildCallbacks::new();
     let build_start = Instant::now();
 
@@ -273,7 +513,18 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     //   default              → F32
     // f16 is the default now; --f32 opts out. `--quant q4k` always
     // forces f16 on the side-channel tensors.
-    let dtype = if args.f32 && args.quant != larql_vindex::QuantFormat::Q4K {
+    let dtype = if args.reference_f32 {
+        larql_vindex::StorageDtype::F32
+    } else if let Some(dtype) = args.dtype {
+        if args.f32 && dtype != larql_vindex::StorageDtype::F32 {
+            return Err("--f32 conflicts with --dtype f16".into());
+        }
+        if args.quant == larql_vindex::QuantFormat::Q4K && dtype == larql_vindex::StorageDtype::F32
+        {
+            return Err("--dtype f32 conflicts with --quant q4k".into());
+        }
+        dtype
+    } else if args.f32 && args.quant != larql_vindex::QuantFormat::Q4K {
         larql_vindex::StorageDtype::F32
     } else {
         larql_vindex::StorageDtype::F16
@@ -300,6 +551,11 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 ffn_compact: args.compact,
                 skip_attn: false,
                 skip_ffn: false,
+                ple_storage: if args.reference_f32 {
+                    larql_vindex::PleStoragePolicy::ReferenceF32
+                } else {
+                    larql_vindex::PleStoragePolicy::ProductionF16
+                },
             };
             larql_vindex::write_model_weights_with_opts(
                 model.weights(),
@@ -398,6 +654,11 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
             ffn_compact: args.compact,
             skip_attn: false,
             skip_ffn: false,
+            ple_storage: if args.reference_f32 {
+                larql_vindex::PleStoragePolicy::ReferenceF32
+            } else {
+                larql_vindex::PleStoragePolicy::ProductionF16
+            },
         };
         if args.drop_gate_vectors && args.quant != larql_vindex::QuantFormat::Q4K {
             return Err(

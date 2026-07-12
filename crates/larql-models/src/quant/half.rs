@@ -149,6 +149,22 @@ mod tests {
     }
 
     #[test]
+    fn bf16_widening_preserves_every_tested_bit_pattern() {
+        for bits in [
+            0x0000, // positive zero
+            0x8000, // negative zero
+            0x0001, // smallest subnormal
+            0x7f7f, // largest finite
+            0x7f80, // infinity
+            0xff80, // negative infinity
+            0x7fc1, // NaN with payload
+            0x3f81, // arbitrary finite value
+        ] {
+            assert_eq!(bf16_to_f32(bits).to_bits(), (bits as u32) << 16);
+        }
+    }
+
+    #[test]
     fn f16_encode_decode_round_trip() {
         let data = vec![1.0f32, -2.0, 0.0, 0.5, 100.0];
         let encoded = encode_f16(&data);
