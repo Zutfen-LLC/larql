@@ -1866,7 +1866,7 @@ fn deepseek_v4_flash_config() -> serde_json::Value {
     ratios.push(0); // last layer
     cfg.insert(
         "compress_ratios".into(),
-        serde_json::Value::Array(ratios.into_iter().map(serde_json::json!).collect()),
+        serde_json::Value::Array(ratios.into_iter().map(|r| serde_json::json!(r)).collect()),
     );
 
     cfg.insert(
