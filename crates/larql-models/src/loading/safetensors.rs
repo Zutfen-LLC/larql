@@ -603,6 +603,7 @@ fn mxfp4_expert_key(layer_prefix: &str, expert_id: usize, projection: &str) -> S
 /// Detects the format by scanning for:
 /// - `*.experts.<digit>.w[123].weight` tensors with `I8` dtype
 /// - `*.shared_experts.w[123].weight` tensors with `I8` dtype
+///
 /// For each match, looks up the companion `.scale` (`F8_E8M0`)
 /// and dequantizes via `quant::mxfp4::dequantize_expert`.
 ///
