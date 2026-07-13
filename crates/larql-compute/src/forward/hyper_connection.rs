@@ -44,9 +44,11 @@ pub struct HcPreOutput {
 }
 
 /// Default Sinkhorn iterations (from config: hc_sinkhorn_iters = 20).
+#[cfg(test)]
 const DEFAULT_SINKHORN_ITERS: usize = 20;
 
 /// Default HC epsilon (from config: hc_eps = 1e-6).
+#[cfg(test)]
 const DEFAULT_HC_EPS: f64 = 1e-6;
 
 /// Expand a 2D hidden state `[seq, d]` into the 4-copy HC representation
@@ -153,11 +155,6 @@ pub fn hc_pre(
     for _ in 0..sinkhorn_iters {
         // Row normalization
         for s in 0..seq {
-            let mut row_sum = 0.0f32;
-            for j in 0..hc {
-                row_sum += comb_3d[[s, j, j]].abs(); // placeholder — actual row sum
-            }
-            // Actually compute per-row sum correctly
             for i in 0..hc {
                 let mut s_row = 0.0f32;
                 for j in 0..hc {
@@ -265,7 +262,6 @@ pub fn hc_head(
     eps: f64,
 ) -> Array2<f32> {
     let (seq, hc, d) = (x_hc.shape()[0], x_hc.shape()[1], x_hc.shape()[2]);
-    let mix_hc = (2 + hc) * hc;
 
     // Flatten + RMSNorm
     let mut x_flat = Array2::zeros((seq, hc * d));
