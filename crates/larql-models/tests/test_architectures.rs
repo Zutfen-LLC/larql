@@ -1813,3 +1813,210 @@ fn get_packed_bytes_mmap_range_missing_file_falls_through_to_raw() {
     let bytes = w.get_packed_bytes("tensor.key").unwrap();
     assert_eq!(bytes, &[9u8, 8]);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// DeepSeek-V4-Flash tests
+// ═══════════════════════════════════════════════════════════════
+
+fn deepseek_v4_flash_config() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "deepseek_v4",
+        "hidden_size": 4096,
+        "num_hidden_layers": 43,
+        "intermediate_size": 0,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "vocab_size": 129280,
+        "rope_theta": 10000,
+        "rms_norm_eps": 1e-6,
+        "sliding_window": 128,
+        "q_lora_rank": 1024,
+        "qk_rope_head_dim": 64,
+        "o_groups": 8,
+        "o_lora_rank": 1024,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 6,
+        "n_shared_experts": 1,
+        "moe_intermediate_size": 2048,
+        "expert_dtype": "fp4",
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "swiglu_limit": 10.0,
+        "routed_scaling_factor": 1.5,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1e-6,
+        "index_head_dim": 128,
+        "index_n_heads": 64,
+        "index_topk": 512,
+        "num_hash_layers": 3,
+        "compress_rope_theta": 160000,
+        "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0],
+        "rope_scaling": {"type": "yarn", "factor": 16, "original_max_position_embeddings": 65536, "beta_fast": 32, "beta_slow": 1},
+        "tie_word_embeddings": false,
+        "num_nextn_predict_layers": 1
+    })
+}
+
+fn deepseek_v4_arch() -> Box<dyn ModelArchitecture> {
+    detect_from_json(&deepseek_v4_flash_config())
+}
+
+#[test]
+fn deepseek_v4_detection() {
+    let arch = deepseek_v4_arch();
+    assert_eq!(arch.family(), "deepseek_v4");
+    assert_eq!(arch.config().model_type, "deepseek_v4");
+    assert_eq!(arch.config().num_layers, 43);
+    assert_eq!(arch.config().hidden_size, 4096);
+    assert_eq!(arch.config().head_dim, 512);
+    assert_eq!(arch.config().num_q_heads, 64);
+    assert_eq!(arch.config().num_kv_heads, 1);
+    assert_eq!(arch.config().vocab_size, Some(129280));
+}
+
+#[test]
+fn deepseek_v4_config_fields_parsed() {
+    let arch = deepseek_v4_arch();
+    let cfg = arch.config();
+
+    // Attention-specific fields
+    assert_eq!(cfg.q_lora_rank, Some(1024));
+    assert_eq!(cfg.qk_rope_head_dim, Some(64));
+    assert_eq!(cfg.sliding_window, Some(128));
+
+    // Output projection
+    assert_eq!(cfg.o_groups, Some(8));
+    assert_eq!(cfg.o_lora_rank, Some(1024));
+
+    // Indexer
+    assert_eq!(cfg.index_head_dim, Some(128));
+    assert_eq!(cfg.index_n_heads, Some(64));
+    assert_eq!(cfg.index_topk, Some(512));
+
+    // Hyper-Connections
+    assert_eq!(cfg.hc_mult, Some(4));
+    assert_eq!(cfg.hc_sinkhorn_iters, Some(20));
+    assert_eq!(cfg.hc_eps, Some(1e-6));
+
+    // Compression
+    assert_eq!(cfg.compress_rope_theta, Some(160000.0));
+    let cr = cfg.compress_ratios.as_ref().expect("compress_ratios");
+    assert_eq!(cr.len(), 44);
+    assert_eq!(cr[0], 0);   // layer 0: pure sliding
+    assert_eq!(cr[2], 4);   // layer 2: compress-4
+    assert_eq!(cr[3], 128); // layer 3: compress-128
+    assert_eq!(cr[43], 0);  // last layer: pure sliding
+
+    // MoE
+    assert_eq!(cfg.num_experts, Some(256));
+    assert_eq!(cfg.num_experts_per_token, Some(6));
+    assert_eq!(cfg.num_shared_experts, Some(1));
+    assert_eq!(cfg.moe_intermediate_size, Some(2048));
+    assert_eq!(cfg.expert_dtype.as_deref(), Some("fp4"));
+    assert_eq!(cfg.scoring_func.as_deref(), Some("sqrtsoftplus"));
+    assert_eq!(cfg.topk_method.as_deref(), Some("noaux_tc"));
+    assert_eq!(cfg.swiglu_limit, Some(10.0));
+    assert_eq!(cfg.routed_scaling_factor, Some(1.5));
+    assert_eq!(cfg.num_hash_layers, Some(3));
+
+    // MTP
+    assert_eq!(cfg.num_nextn_predict_layers, Some(1));
+}
+
+#[test]
+fn deepseek_v4_tensor_keys() {
+    let arch = deepseek_v4_arch();
+
+    // Embedding + final norm + lm_head
+    assert_eq!(arch.embed_key(), "embed.weight");
+    assert_eq!(arch.final_norm_key(), "norm.weight");
+
+    // Attention keys (low-rank Q + fused KV)
+    assert_eq!(arch.attn_q_key(0), "layers.0.attn.wq_a.weight");
+    assert_eq!(arch.attn_k_key(0), "layers.0.attn.wq_b.weight");
+    assert_eq!(arch.attn_v_key(0), "layers.0.attn.wkv.weight");
+    assert_eq!(arch.attn_o_key(0), "layers.0.attn.wo_a.weight");
+
+    // MLA key methods
+    assert_eq!(arch.mla_q_a_key(0).unwrap(), "layers.0.attn.wq_a.weight");
+    assert_eq!(arch.mla_q_b_key(0).unwrap(), "layers.0.attn.wq_b.weight");
+    assert_eq!(arch.mla_kv_a_key(0).unwrap(), "layers.0.attn.wkv.weight");
+    assert_eq!(arch.mla_kv_b_key(0), None); // fused into wkv
+
+    // Q/K norms
+    assert_eq!(arch.attn_q_norm_key(0).unwrap(), "layers.0.attn.q_norm.weight");
+    assert_eq!(arch.attn_k_norm_key(0).unwrap(), "layers.0.attn.kv_norm.weight");
+
+    // Layer norms
+    assert_eq!(arch.input_layernorm_key(0), "layers.0.attn_norm.weight");
+    assert_eq!(arch.post_attention_layernorm_key(0), "layers.0.ffn_norm.weight");
+
+    // MoE keys
+    assert_eq!(arch.moe_router_key(0).unwrap(), "layers.0.ffn.gate.weight");
+    assert_eq!(
+        arch.expert_ffn_gate_key(0, 5).unwrap(),
+        "layers.0.ffn.experts.5.w1.weight"
+    );
+    assert_eq!(
+        arch.expert_ffn_up_key(0, 5).unwrap(),
+        "layers.0.ffn.experts.5.w3.weight"
+    );
+    assert_eq!(
+        arch.expert_ffn_down_key(0, 5).unwrap(),
+        "layers.0.ffn.experts.5.w2.weight"
+    );
+
+    // Shared expert keys
+    assert_eq!(
+        arch.shared_expert_gate_key(0).unwrap(),
+        "layers.0.ffn.shared_experts.w1.weight"
+    );
+    assert_eq!(
+        arch.shared_expert_up_key(0).unwrap(),
+        "layers.0.ffn.shared_experts.w3.weight"
+    );
+    assert_eq!(
+        arch.shared_expert_down_key(0).unwrap(),
+        "layers.0.ffn.shared_experts.w2.weight"
+    );
+}
+
+#[test]
+fn deepseek_v4_moe() {
+    let arch = deepseek_v4_arch();
+    assert!(arch.is_moe());
+    assert_eq!(arch.num_experts(), 256);
+    assert_eq!(arch.num_experts_per_token(), 6);
+    assert_eq!(arch.num_shared_experts(), 1);
+    assert_eq!(arch.expert_format(), ExpertFormat::PerExpert);
+    assert_eq!(arch.moe_intermediate_size(), 2048);
+    assert_eq!(arch.moe_router_type(), "sqrtsoftplus_noaux_tc");
+}
+
+#[test]
+fn deepseek_v4_mla() {
+    let arch = deepseek_v4_arch();
+    assert!(arch.uses_mla());
+    assert_eq!(arch.q_lora_rank(), 1024);
+    assert_eq!(arch.mla_qk_nope_head_dim(), Some(448)); // 512 - 64
+    assert_eq!(arch.mla_qk_rope_head_dim(), Some(64));
+    assert_eq!(arch.mla_v_head_dim(), Some(512));
+}
+
+#[test]
+fn deepseek_v4_sliding_window() {
+    let arch = deepseek_v4_arch();
+    assert!(arch.is_sliding_window_layer(0));
+    assert!(arch.is_sliding_window_layer(42));
+    assert_eq!(arch.sliding_window_size(), Some(128));
+}
+
+#[test]
+fn deepseek_v4_rope_fraction() {
+    let arch = deepseek_v4_arch();
+    // Only the last 64 of 512 dims get RoPE
+    let frac = arch.rotary_fraction_for_layer(0);
+    assert!((frac - 64.0 / 512.0).abs() < 1e-10);
+}

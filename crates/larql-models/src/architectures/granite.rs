@@ -118,6 +118,23 @@ mod tests {
             num_kv_shared_layers: None,
             use_double_wide_mlp: false,
             has_vision_config: false,
+            o_groups: None,
+            o_lora_rank: None,
+            index_head_dim: None,
+            index_n_heads: None,
+            index_topk: None,
+            hc_mult: None,
+            hc_sinkhorn_iters: None,
+            hc_eps: None,
+            compress_ratios: None,
+            compress_rope_theta: None,
+            num_hash_layers: None,
+            scoring_func: None,
+            topk_method: None,
+            swiglu_limit: None,
+            expert_dtype: None,
+            routed_scaling_factor: None,
+            num_nextn_predict_layers: None,
         }
     }
 
