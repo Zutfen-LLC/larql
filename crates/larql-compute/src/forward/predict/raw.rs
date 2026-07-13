@@ -104,6 +104,46 @@ pub fn forward_raw_logits_traced(
     }
 }
 
+/// Compute the ST5/ST6 traced tail stages — pre-final-norm, final-norm,
+/// lm-head raw, final logits — from a post-layer residual `h` using the
+/// production final-norm + lm-head + logits transform.
+///
+/// This is the shared tail computation for both the F32 traced forward
+/// ([`forward_raw_logits_traced`]) and the Q4_K hooked forward
+/// (`predict_kquant_hidden_hooked` + this function), so the two capture
+/// paths use byte-identical tail math. `h` must have at least one row.
+pub fn traced_tail_from_hidden(weights: larql_models::WeightsView, h: &Array2<f32>) -> TracedTail {
+    traced_tail_with_lm_head(weights, h, &weights.lm_head)
+}
+
+/// Like [`traced_tail_from_hidden`] but projects through an explicit
+/// `lm_head` matrix instead of `weights.lm_head`. The final norm still uses
+/// `weights`' norm weights (F32 in both F32 and Q4_K vindexes, so identical).
+///
+/// Used by the ST6 §8 body-vs-lm-head error decomposition:
+///   - route B (Q4_K body + F32 lm-head) passes the F32 reference's lm-head,
+///   - route C (Q4_K body + production Q4_K lm-head) passes `weights.lm_head`.
+pub fn traced_tail_with_lm_head(
+    weights: larql_models::WeightsView,
+    h: &Array2<f32>,
+    lm_head: &ndarray::ArrayBase<impl ndarray::Data<Elem = f32>, ndarray::Ix2>,
+) -> TracedTail {
+    let total_len = h.nrows();
+    assert!(total_len > 0, "traced tail needs >= 1 row");
+    let last = total_len - 1;
+    let norm_offset = weights.arch.norm_weight_offset();
+    let h_final = apply_norm(&weights, h, weights.arch.final_norm_key(), norm_offset);
+    let last_2d = h_final.slice(ndarray::s![last..total_len, ..]);
+    let logits_raw = dot_proj(&last_2d, lm_head);
+    let logits = apply_logits_transform(weights.canonical(), logits_raw.row(0).as_slice().unwrap());
+    TracedTail {
+        pre_final_norm: h.row(last).to_vec(),
+        final_norm: h_final.row(last).to_vec(),
+        lm_head_raw: logits_raw.row(0).to_vec(),
+        final_logits: logits.to_vec(),
+    }
+}
+
 /// Apply the model's final logits transform: divide by `logits_scaling`
 /// then apply the optional `final_logit_softcapping` tanh.
 fn apply_logits_transform(weights: &ModelWeights, raw_row: &[f32]) -> ndarray::Array1<f32> {
@@ -504,5 +544,67 @@ mod forward_from_layer_tests {
         // prefix + 2 tokens = 3 positions
         assert_eq!(raw.h_pre_norm.shape(), &[3, weights.hidden_size]);
         assert_eq!(raw.logits.len(), weights.vocab_size);
+    }
+
+    /// `traced_tail_from_hidden` computes the same tail stages (pre-final-norm,
+    /// final-norm, lm-head raw, final logits) from a post-layer residual that
+    /// `forward_raw_logits` produces inline. They must agree at the last token.
+    #[test]
+    fn traced_tail_from_hidden_matches_forward_raw_logits() {
+        let weights = make_test_weights();
+        let view = larql_models::WeightsView::dense(&weights);
+        let ids = [0u32, 1, 2];
+        let raw = forward_raw_logits(view, &ids, None);
+        let tail = traced_tail_from_hidden(view, &raw.h_pre_norm);
+        let last = ids.len() - 1;
+        let hidden = weights.hidden_size;
+        let vocab = weights.vocab_size;
+        assert_eq!(tail.pre_final_norm.len(), hidden);
+        assert_eq!(tail.final_norm.len(), hidden);
+        assert_eq!(tail.lm_head_raw.len(), vocab);
+        assert_eq!(tail.final_logits.len(), vocab);
+        for i in 0..hidden {
+            assert!(
+                (tail.pre_final_norm[i] - raw.h_pre_norm[[last, i]]).abs() < 1e-5,
+                "pre_final_norm[{i}]"
+            );
+            assert!(
+                (tail.final_norm[i] - raw.h_final[[last, i]]).abs() < 1e-5,
+                "final_norm[{i}]"
+            );
+        }
+        for i in 0..vocab {
+            assert!(
+                (tail.final_logits[i] - raw.logits[i]).abs() < 1e-5,
+                "final_logits[{i}]"
+            );
+        }
+    }
+
+    /// `traced_tail_with_lm_head` projects through an explicit lm-head. Passing
+    /// the model's own lm-head must match `traced_tail_from_hidden`; passing a
+    /// zeroed lm-head must produce zero logits.
+    #[test]
+    fn traced_tail_with_lm_head_uses_explicit_matrix() {
+        let weights = make_test_weights();
+        let view = larql_models::WeightsView::dense(&weights);
+        let ids = [0u32, 1, 2];
+        let raw = forward_raw_logits(view, &ids, None);
+        // Own lm-head → same result as traced_tail_from_hidden.
+        let tail_own = traced_tail_with_lm_head(view, &raw.h_pre_norm, &weights.lm_head);
+        for i in 0..weights.vocab_size {
+            assert!(
+                (tail_own.final_logits[i] - raw.logits[i]).abs() < 1e-5,
+                "own lm-head final_logits[{i}]"
+            );
+        }
+        // Zeroed lm-head → zero raw logits (before the transform; with
+        // softcap absent on the test fixture the final logits are also zero).
+        let zero_lm = ndarray::Array2::zeros((weights.vocab_size, weights.hidden_size));
+        let tail_zero = traced_tail_with_lm_head(view, &raw.h_pre_norm, &zero_lm);
+        assert!(
+            tail_zero.lm_head_raw.iter().all(|v| v.abs() < 1e-6),
+            "zeroed lm-head must produce zero raw logits"
+        );
     }
 }

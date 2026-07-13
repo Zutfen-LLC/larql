@@ -18,18 +18,33 @@ use serde::{Deserialize, Serialize};
 
 use super::format::{
     coarse_stage_order, load_prompt_tensors, required_coarse_stages, StageId, TraceError,
-    TraceManifest, TracePrompt, STAGE_FINAL_LOGITS,
+    TraceManifest, TracePrompt, STAGE_FINAL_LOGITS, STAGE_POST_ATTENTION,
 };
 
 /// Committed numerical policy for a prompt's stages. Construct via
-/// [`Policy::st5_default`] — do NOT relax after seeing the result.
+/// [`Policy::st5_default`] or [`Policy::st6_default`] — do NOT relax after
+/// seeing the result.
 #[derive(Debug, Clone, Copy)]
 pub struct Policy {
-    // Coarse hidden/residual stages.
+    // Coarse hidden/residual stages (per-layer residual stream: post-attention
+    // + post-layer — the gated coarse budget per ST6 §5).
     pub coarse_nrmse: f64,
     pub coarse_cosine: f64,
     pub coarse_max_abs_offset: f64,
     pub coarse_max_abs_scale: f64,
+    // Diagnostic per-layer stages (layer-input, post-FFN, post-PLE). These are
+    // captured and reported in the drift curve but NOT NRMSE/cosine-gated
+    // (ST6 §5 names only post-attention + post-layer for the coarse budget).
+    // Integrity (finite, shape) still applies.
+    pub diagnostic_nrmse: f64,
+    pub diagnostic_cosine: f64,
+    pub diagnostic_max_abs_offset: f64,
+    pub diagnostic_max_abs_scale: f64,
+    // Final hidden stages (pre-final-norm, final-norm).
+    pub hidden_nrmse: f64,
+    pub hidden_cosine: f64,
+    pub hidden_max_abs_offset: f64,
+    pub hidden_max_abs_scale: f64,
     // Final logits.
     pub logits_nrmse: f64,
     pub logits_cosine: f64,
@@ -46,12 +61,26 @@ impl Policy {
     /// The committed ST5 initial parity policy (section 6). Hard-coded so
     /// it cannot be silently widened — change the source only with a new
     /// committed policy and a recorded rationale.
+    ///
+    /// ST5 does not distinguish a final-hidden tier from coarse (the F32
+    /// reference is near-exact everywhere), so the hidden thresholds mirror
+    /// coarse. ST6 widens them to quantization-realistic budgets.
     pub const fn st5_default() -> Self {
         Self {
             coarse_nrmse: 1e-4,
             coarse_cosine: 0.99999,
             coarse_max_abs_offset: 5e-4,
             coarse_max_abs_scale: 5e-4,
+            // ST5 gates every stage at the near-exact coarse threshold (F32 vs
+            // F32 is near-exact everywhere), so diagnostic == coarse.
+            diagnostic_nrmse: 1e-4,
+            diagnostic_cosine: 0.99999,
+            diagnostic_max_abs_offset: 5e-4,
+            diagnostic_max_abs_scale: 5e-4,
+            hidden_nrmse: 1e-4,
+            hidden_cosine: 0.99999,
+            hidden_max_abs_offset: 5e-4,
+            hidden_max_abs_scale: 5e-4,
             logits_nrmse: 1e-4,
             logits_cosine: 0.99999,
             logits_max_abs_offset: 1e-3,
@@ -63,9 +92,62 @@ impl Policy {
         }
     }
 
+    /// The committed ST6 Q4_K-vs-F32 quantization parity policy (ST6 §5).
+    /// Three tiers reflecting that quantization error is expected and grows
+    /// through the body:
+    ///
+    /// - **Coarse** (per-layer residuals): cosine ≥ 0.98, NRMSE ≤ 0.15.
+    /// - **Hidden** (final hidden): cosine ≥ 0.99, NRMSE ≤ 0.10.
+    /// - **Logits** (lm-head raw + final logits): cosine ≥ 0.995, NRMSE ≤
+    ///   0.05, top-10 overlap ≥ 8/10.
+    ///
+    /// Hard-coded so it cannot be silently widened.
+    pub const fn st6_default() -> Self {
+        Self {
+            coarse_nrmse: 0.15,
+            coarse_cosine: 0.98,
+            coarse_max_abs_offset: f64::INFINITY,
+            coarse_max_abs_scale: f64::INFINITY,
+            // Diagnostic stages (layer-input, post-FFN, post-PLE) are reported
+            // in the drift curve but not NRMSE/cosine-gated. Integrity (finite,
+            // shape) still applies.
+            diagnostic_nrmse: f64::INFINITY,
+            diagnostic_cosine: 0.0,
+            diagnostic_max_abs_offset: f64::INFINITY,
+            diagnostic_max_abs_scale: f64::INFINITY,
+            hidden_nrmse: 0.10,
+            hidden_cosine: 0.99,
+            hidden_max_abs_offset: f64::INFINITY,
+            hidden_max_abs_scale: f64::INFINITY,
+            logits_nrmse: 0.05,
+            logits_cosine: 0.995,
+            logits_max_abs_offset: f64::INFINITY,
+            logits_max_abs_scale: f64::INFINITY,
+            logits_top10_overlap_min: 8,
+            rel_denominator_floor: 1e-6,
+            nrmse_denominator_floor: 1e-12,
+            zero_norm_abs_tolerance: 0.0,
+        }
+    }
+
     fn stage_kind(&self, stage: &str) -> StageKind {
-        if stage == STAGE_FINAL_LOGITS {
+        use super::format::{STAGE_EMBEDDING, STAGE_LAYER_INPUT, STAGE_POST_FFN, STAGE_POST_PLE};
+        // Final hidden boundary (after the last layer, before/after final norm).
+        if stage == super::format::STAGE_PRE_FINAL_NORM || stage == super::format::STAGE_FINAL_NORM
+        {
+            StageKind::Hidden
+        } else if stage == STAGE_FINAL_LOGITS || stage == super::format::STAGE_LM_HEAD_RAW {
             StageKind::Logits
+        } else if stage == STAGE_POST_ATTENTION || stage == super::format::STAGE_POST_LAYER {
+            // The gated coarse residual stream (ST6 §5: post-attention +
+            // post-layer residual).
+            StageKind::Coarse
+        } else if matches!(
+            stage,
+            STAGE_EMBEDDING | STAGE_LAYER_INPUT | STAGE_POST_FFN | STAGE_POST_PLE
+        ) {
+            // Captured + reported in the drift curve, but not NRMSE-gated.
+            StageKind::Diagnostic
         } else {
             StageKind::Coarse
         }
@@ -75,7 +157,9 @@ impl Policy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageKind {
     Coarse,
+    Hidden,
     Logits,
+    Diagnostic,
 }
 
 /// Metrics for one compared tensor, plus the policy verdict.
@@ -109,6 +193,23 @@ pub struct LogitTopK {
     pub top10_overlap: usize,
     pub reference_top10: Vec<usize>,
     pub candidate_top10: Vec<usize>,
+    /// ST6 §5 ranking diagnostics. These are populated for ST6 runs and
+    /// `None`/zero for older reports.
+    #[serde(default)]
+    pub reference_top1_margin: Option<f64>,
+    #[serde(default)]
+    pub candidate_top1_margin: Option<f64>,
+    #[serde(default)]
+    pub reference_top10_scores: Option<Vec<f64>>,
+    #[serde(default)]
+    pub candidate_top10_scores: Option<Vec<f64>>,
+    /// Symmetric softmax KL divergence `0.5*(KL(ref||cand)+KL(cand||ref))`.
+    #[serde(default)]
+    pub softmax_kl: Option<f64>,
+    /// Maximum absolute difference between reference and candidate softmax
+    /// probability distributions.
+    #[serde(default)]
+    pub max_prob_diff: Option<f64>,
 }
 
 /// Where the first divergence was found in execution order.
@@ -153,6 +254,14 @@ pub struct PolicyView {
     pub coarse_cosine: f64,
     pub coarse_max_abs_offset: f64,
     pub coarse_max_abs_scale: f64,
+    pub diagnostic_nrmse: f64,
+    pub diagnostic_cosine: f64,
+    pub diagnostic_max_abs_offset: f64,
+    pub diagnostic_max_abs_scale: f64,
+    pub hidden_nrmse: f64,
+    pub hidden_cosine: f64,
+    pub hidden_max_abs_offset: f64,
+    pub hidden_max_abs_scale: f64,
     pub logits_nrmse: f64,
     pub logits_cosine: f64,
     pub logits_max_abs_offset: f64,
@@ -170,6 +279,14 @@ impl From<&Policy> for PolicyView {
             coarse_cosine: p.coarse_cosine,
             coarse_max_abs_offset: p.coarse_max_abs_offset,
             coarse_max_abs_scale: p.coarse_max_abs_scale,
+            diagnostic_nrmse: p.diagnostic_nrmse,
+            diagnostic_cosine: p.diagnostic_cosine,
+            diagnostic_max_abs_offset: p.diagnostic_max_abs_offset,
+            diagnostic_max_abs_scale: p.diagnostic_max_abs_scale,
+            hidden_nrmse: p.hidden_nrmse,
+            hidden_cosine: p.hidden_cosine,
+            hidden_max_abs_offset: p.hidden_max_abs_offset,
+            hidden_max_abs_scale: p.hidden_max_abs_scale,
             logits_nrmse: p.logits_nrmse,
             logits_cosine: p.logits_cosine,
             logits_max_abs_offset: p.logits_max_abs_offset,
@@ -532,6 +649,18 @@ pub fn compare_tensor(
             policy.coarse_max_abs_offset,
             policy.coarse_max_abs_scale,
         ),
+        StageKind::Diagnostic => (
+            policy.diagnostic_nrmse,
+            policy.diagnostic_cosine,
+            policy.diagnostic_max_abs_offset,
+            policy.diagnostic_max_abs_scale,
+        ),
+        StageKind::Hidden => (
+            policy.hidden_nrmse,
+            policy.hidden_cosine,
+            policy.hidden_max_abs_offset,
+            policy.hidden_max_abs_scale,
+        ),
         StageKind::Logits => (
             policy.logits_nrmse,
             policy.logits_cosine,
@@ -614,6 +743,26 @@ fn compute_topk(reference: &[f32], candidate: &[f32]) -> LogitTopK {
         .iter()
         .filter(|t| ref_set.contains(t))
         .count();
+
+    // ST6 §5 ranking diagnostics: margins, top-10 scores, softmax KL + max
+    // prob diff. Computed from the full logits distribution.
+    let n = reference.len().min(candidate.len());
+    let reference_top1_margin = top1_margin(reference);
+    let candidate_top1_margin = top1_margin(candidate);
+    let reference_top10_scores: Vec<f64> = reference_top10
+        .iter()
+        .map(|&i| reference[i] as f64)
+        .collect();
+    let candidate_top10_scores: Vec<f64> = candidate_top10
+        .iter()
+        .map(|&i| candidate[i] as f64)
+        .collect();
+    let (softmax_kl, max_prob_diff) = if n > 0 {
+        softmax_diagnostics(&reference[..n], &candidate[..n])
+    } else {
+        (0.0, 0.0)
+    };
+
     LogitTopK {
         reference_top1,
         candidate_top1,
@@ -621,7 +770,79 @@ fn compute_topk(reference: &[f32], candidate: &[f32]) -> LogitTopK {
         top10_overlap,
         reference_top10,
         candidate_top10,
+        reference_top1_margin: Some(reference_top1_margin),
+        candidate_top1_margin: Some(candidate_top1_margin),
+        reference_top10_scores: Some(reference_top10_scores),
+        candidate_top10_scores: Some(candidate_top10_scores),
+        softmax_kl: Some(softmax_kl),
+        max_prob_diff: Some(max_prob_diff),
     }
+}
+
+/// Top-1 margin: gap between the top and second-highest logit.
+fn top1_margin(logits: &[f32]) -> f64 {
+    if logits.len() < 2 {
+        return 0.0;
+    }
+    let mut max = f64::NEG_INFINITY;
+    let mut second = f64::NEG_INFINITY;
+    for &v in logits {
+        let v = v as f64;
+        if v > max {
+            second = max;
+            max = v;
+        } else if v > second {
+            second = v;
+        }
+    }
+    max - second
+}
+
+/// Symmetric softmax KL divergence + max probability difference between two
+/// equal-length logit vectors. KL is `0.5*(KL(p||q)+KL(q||p))` in nats.
+fn softmax_diagnostics(reference: &[f32], candidate: &[f32]) -> (f64, f64) {
+    let p = softmax(reference);
+    let q = softmax(candidate);
+    let mut kl_pq = 0.0f64;
+    let mut kl_qp = 0.0f64;
+    let mut max_prob_diff = 0.0f64;
+    for (pi, qi) in p.iter().zip(q.iter()) {
+        if max_prob_diff < (pi - qi).abs() {
+            max_prob_diff = (pi - qi).abs();
+        }
+        if *pi > 0.0 && *qi > 0.0 {
+            kl_pq += pi * (pi / qi).ln();
+            kl_qp += qi * (qi / pi).ln();
+        }
+    }
+    (0.5 * (kl_pq + kl_qp), max_prob_diff)
+}
+
+/// Numerically stable softmax in f64.
+fn softmax(logits: &[f32]) -> Vec<f64> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
+    let mut max = f64::NEG_INFINITY;
+    for &v in logits {
+        let v = v as f64;
+        if v > max {
+            max = v;
+        }
+    }
+    let mut sum = 0.0f64;
+    let mut exps = Vec::with_capacity(logits.len());
+    for &v in logits {
+        let e = ((v as f64) - max).exp();
+        exps.push(e);
+        sum += e;
+    }
+    if sum > 0.0 {
+        for e in &mut exps {
+            *e /= sum;
+        }
+    }
+    exps
 }
 
 fn candidate_first(a: f32, b: f32) -> std::cmp::Ordering {

@@ -22,6 +22,15 @@ env:
   AWS_SECRET_ACCESS_KEY: QurhTA4fSewUayZI7z5ovNmO
   SCCACHE_CACHE_SIZE: 20G
   SCCACHE_REGION: us-east-1
+  # Pin BLAS to a single thread. larql-kv's `_inplace_matches_owned_concat`
+  # decode-parity tests compare two mathematically-equivalent code paths that
+  # accumulate FP ops in different orders; under multi-threaded BLAS the
+  # accumulation order (and thus the result) is nondeterministic, making the
+  # comparison flake (divergences up to ~4× the tolerance). Matching the
+  # larql-inference workflow's pin keeps these numerical-comparison tests
+  # deterministic.
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
 
 jobs:
   test:
@@ -73,7 +82,15 @@ jobs:
         run: cargo clippy -p larql-kv --all-targets --no-deps -- -D warnings
 
       - name: Tests
-        run: cargo test -p larql-kv
+        # `--test-threads=1` serialises the runner. The kv decode engines
+        # (markov-residual, boundary-per-layer) mutate thread-local/global
+        # dispatch state and use BLAS-backed matmuls; under parallel execution
+        # that surfaces as (a) FP nondeterminism in the `_inplace_matches_
+        # owned_concat` decode-parity tests and (b) a teardown SIGSEGV from a
+        # background thread racing the harness exit. Single-threaded execution
+        # + the OPENBLAS/OMP pins above make both deterministic. Matches the
+        # larql-compute-metal and larql-server workflow patterns.
+        run: cargo test -p larql-kv -- --test-threads=1
 
       - name: Benchmark compile/tests
         run: cargo test -p larql-kv --benches
@@ -123,7 +140,10 @@ jobs:
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
       - name: Coverage summary
-        run: cargo llvm-cov --package larql-kv --summary-only --fail-under-lines "$LARQL_KV_COVERAGE_MIN"
+        # `-- --test-threads=1` mirrors the test step: the kv decode-parity
+        # tests flake under parallel execution (BLAS FP nondeterminism +
+        # teardown SIGSEGV race). See the test step comment for details.
+        run: cargo llvm-cov --package larql-kv --summary-only --fail-under-lines "$LARQL_KV_COVERAGE_MIN" -- --test-threads=1
 
       - name: Coverage policy
         run: |
