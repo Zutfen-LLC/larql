@@ -25,9 +25,9 @@
 //! - **Grouped low-rank output projection** (wo_a/wo_b with o_groups).
 //! - **MTP** (Multi-Token Prediction) head for speculative decoding.
 //!
-//! Currently scoped to **browse-tier extraction** — gate vectors + embeddings
-//! + down_meta. Inference forward pass is the subject of the DSV4 plan
-//! (`docs/dsv4-flash-implementation-plan.md`).
+//! Currently scoped to **browse-tier extraction** (gate vectors, embeddings,
+//! down_meta). Inference forward pass is the subject of the DSV4 plan
+//! ([`docs/dsv4-flash-implementation-plan.md`]).
 
 use crate::config::{ModelArchitecture, ModelConfig};
 
