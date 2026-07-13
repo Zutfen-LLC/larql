@@ -128,7 +128,8 @@ mod tests {
 
     #[test]
     fn dequant_zero_scale() {
-        let weights = vec![0xFFu8; 128 * 128];
+        // E8M0 byte 0 → 0.0 scale. Use 0x38 (1.0) weight, not 0xFF (NaN).
+        let weights = vec![0x38u8; 128 * 128];
         let scales = vec![0u8]; // E8M0 byte 0 → 0.0
         let result = dequantize(&weights, &scales, 128, 128).unwrap();
         for &v in &result {
