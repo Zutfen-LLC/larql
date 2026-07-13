@@ -1089,6 +1089,241 @@ fn f8_e8m0_bytes(n: usize) -> Vec<u8> {
 }
 
 #[test]
+fn load_deepseek_v4_dequantises_fp8_block_scaled_attention() {
+    let dir = TempDir::new().unwrap();
+    let config = serde_json::json!({
+        "model_type": "deepseek_v4",
+        "hidden_size": 256,
+        "num_hidden_layers": 1,
+        "intermediate_size": 256,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 256,
+        "vocab_size": 10,
+        "n_routed_experts": 1,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 0,
+        "kv_lora_rank": 256,
+        "q_lora_rank": 256,
+    });
+
+    // FP8 E4M3 attention weight [256, 256] = 2 blocks (2×1 scale grid).
+    let rows = 256usize;
+    let cols = 256usize;
+    let weight_bytes = vec![0x38u8; rows * cols]; // E4M3 1.0
+    let scale_rows = rows.div_ceil(128);
+    let scale_cols = cols.div_ceil(128);
+    let scale_bytes = vec![127u8; scale_rows * scale_cols]; // E8M0 1.0
+
+    write_model_dir_with_config(
+        dir.path(),
+        config,
+        &[
+            ("embed.weight", "F32", &[10, 256], f32_bytes(&[1.0f32; 2560])),
+            ("norm.weight", "F32", &[256], f32_bytes(&[1.0f32; 256])),
+            (
+                "layers.0.attn.wq_a.weight",
+                "F8_E4M3",
+                &[rows, cols],
+                weight_bytes.clone(),
+            ),
+            (
+                "layers.0.attn.wq_a.scale",
+                "F8_E8M0",
+                &[scale_rows, scale_cols],
+                scale_bytes.clone(),
+            ),
+            (
+                "layers.0.attn.wkv.weight",
+                "F8_E4M3",
+                &[rows, cols],
+                weight_bytes.clone(),
+            ),
+            (
+                "layers.0.attn.wkv.scale",
+                "F8_E8M0",
+                &[scale_rows, scale_cols],
+                scale_bytes,
+            ),
+        ],
+    );
+
+    let weights = load_model_dir(dir.path()).expect("V4 FP8 load");
+    // The FP8 block-scale dequantiser writes the dequantised weight
+    // under the original (prefix-stripped) tensor name.
+    let wq_a = weights
+        .tensors
+        .get("layers.0.attn.wq_a.weight")
+        .expect("wq_a must be dequantised");
+    assert_eq!(wq_a.shape(), &[rows, cols]);
+    // All values should be 1.0 × 1.0 = 1.0
+    for v in wq_a.iter() {
+        assert!((v - 1.0).abs() < 1e-6, "expected 1.0, got {v}");
+    }
+
+    let wkv = weights
+        .tensors
+        .get("layers.0.attn.wkv.weight")
+        .expect("wkv must be dequantised");
+    assert_eq!(wkv.shape(), &[rows, cols]);
+
+    // The .scale tensors must NOT appear in the output (consumed by dequantiser).
+    assert!(
+        !weights.tensors.contains_key("layers.0.attn.wq_a.scale"),
+        "scale tensor should be consumed"
+    );
+}
+
+#[test]
+fn load_deepseek_v4_dequantises_shared_experts_mxfp4() {
+    let dir = TempDir::new().unwrap();
+    let config = serde_json::json!({
+        "model_type": "deepseek_v4",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "intermediate_size": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 2,
+        "vocab_size": 10,
+        "n_routed_experts": 1,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 1,
+        "kv_lora_rank": 4,
+        "q_lora_rank": 4,
+    });
+
+    let out_features = 2usize;
+    let groups = 1usize;
+    let packed_cols = groups * 16;
+    let weight_bytes = vec![0u8; out_features * packed_cols];
+    let scale_bytes = f8_e8m0_bytes(out_features * groups);
+
+    write_model_dir_with_config(
+        dir.path(),
+        config,
+        &[
+            ("embed.weight", "F32", &[10, 4], f32_bytes(&[1.0f32; 40])),
+            ("norm.weight", "F32", &[4], f32_bytes(&[1.0f32; 4])),
+            // Shared expert weight + scale pair.
+            (
+                "layers.0.ffn.shared_experts.w1.weight",
+                "I8",
+                &[out_features, packed_cols],
+                weight_bytes.clone(),
+            ),
+            (
+                "layers.0.ffn.shared_experts.w1.scale",
+                "F8_E8M0",
+                &[out_features, groups],
+                scale_bytes.clone(),
+            ),
+            (
+                "layers.0.ffn.shared_experts.w2.weight",
+                "I8",
+                &[out_features, packed_cols],
+                weight_bytes.clone(),
+            ),
+            (
+                "layers.0.ffn.shared_experts.w2.scale",
+                "F8_E8M0",
+                &[out_features, groups],
+                scale_bytes.clone(),
+            ),
+            (
+                "layers.0.ffn.shared_experts.w3.weight",
+                "I8",
+                &[out_features, packed_cols],
+                weight_bytes,
+            ),
+            (
+                "layers.0.ffn.shared_experts.w3.scale",
+                "F8_E8M0",
+                &[out_features, groups],
+                scale_bytes,
+            ),
+        ],
+    );
+
+    let weights = load_model_dir(dir.path()).expect("V4 shared expert load");
+    assert!(
+        weights
+            .tensors
+            .contains_key("layers.0.ffn.shared_experts.w1.weight"),
+        "shared expert w1 must be dequantised; got: {:?}",
+        weights.tensors.keys().collect::<Vec<_>>()
+    );
+    let arr = weights
+        .tensors
+        .get("layers.0.ffn.shared_experts.w1.weight")
+        .unwrap();
+    assert_eq!(arr.shape(), &[out_features, packed_cols * 2]);
+}
+
+#[test]
+fn fp8_block_scaled_attention_applies_scale_correctly() {
+    let dir = TempDir::new().unwrap();
+    let config = serde_json::json!({
+        "model_type": "deepseek_v4",
+        "hidden_size": 256,
+        "num_hidden_layers": 1,
+        "intermediate_size": 256,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 256,
+        "vocab_size": 10,
+        "n_routed_experts": 1,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 0,
+        "kv_lora_rank": 256,
+        "q_lora_rank": 256,
+    });
+
+    // 256×256 weight = 2×2 scale grid. Set different scales per block.
+    let rows = 256usize;
+    let cols = 256usize;
+    let weight_bytes = vec![0x38u8; rows * cols]; // E4M3 1.0
+    // Scale grid: [[127, 128], [129, 130]] → blocks get [1.0, 2.0, 4.0, 8.0]
+    let scale_bytes = vec![127u8, 128u8, 129u8, 130u8];
+
+    write_model_dir_with_config(
+        dir.path(),
+        config,
+        &[
+            ("embed.weight", "F32", &[10, 256], f32_bytes(&[1.0f32; 2560])),
+            ("norm.weight", "F32", &[256], f32_bytes(&[1.0f32; 256])),
+            (
+                "layers.0.attn.wq_a.weight",
+                "F8_E4M3",
+                &[rows, cols],
+                weight_bytes,
+            ),
+            (
+                "layers.0.attn.wq_a.scale",
+                "F8_E8M0",
+                &[2, 2],
+                scale_bytes,
+            ),
+        ],
+    );
+
+    let weights = load_model_dir(dir.path()).expect("V4 FP8 scaled load");
+    let wq_a = weights
+        .tensors
+        .get("layers.0.attn.wq_a.weight")
+        .expect("wq_a must be dequantised");
+
+    // Block (0,0): scale 127 → 1.0. Element at (0,0).
+    assert!((wq_a[[0, 0]] - 1.0).abs() < 1e-6);
+    // Block (0,1): scale 128 → 2.0. Element at (0, 128).
+    assert!((wq_a[[0, 128]] - 2.0).abs() < 1e-6);
+    // Block (1,0): scale 129 → 4.0. Element at (128, 0).
+    assert!((wq_a[[128, 0]] - 4.0).abs() < 1e-6);
+    // Block (1,1): scale 130 → 8.0. Element at (128, 128).
+    assert!((wq_a[[128, 128]] - 8.0).abs() < 1e-6);
+}
+
+#[test]
 fn load_full_deepseek_v4_dequantises_per_expert_mxfp4() {
     let dir = TempDir::new().unwrap();
     // V4 detection in detect.rs requires `model_type = "deepseek_v4"`,
