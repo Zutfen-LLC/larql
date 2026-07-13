@@ -1819,44 +1819,62 @@ fn get_packed_bytes_mmap_range_missing_file_falls_through_to_raw() {
 // ═══════════════════════════════════════════════════════════════
 
 fn deepseek_v4_flash_config() -> serde_json::Value {
-    serde_json::json!({
-        "model_type": "deepseek_v4",
-        "hidden_size": 4096,
-        "num_hidden_layers": 43,
-        "intermediate_size": 0,
-        "num_attention_heads": 64,
-        "num_key_value_heads": 1,
-        "head_dim": 512,
-        "vocab_size": 129280,
-        "rope_theta": 10000,
-        "rms_norm_eps": 1e-6,
-        "sliding_window": 128,
-        "q_lora_rank": 1024,
-        "qk_rope_head_dim": 64,
-        "o_groups": 8,
-        "o_lora_rank": 1024,
-        "n_routed_experts": 256,
-        "num_experts_per_tok": 6,
-        "n_shared_experts": 1,
-        "moe_intermediate_size": 2048,
-        "expert_dtype": "fp4",
-        "scoring_func": "sqrtsoftplus",
-        "topk_method": "noaux_tc",
-        "swiglu_limit": 10.0,
-        "routed_scaling_factor": 1.5,
-        "hc_mult": 4,
-        "hc_sinkhorn_iters": 20,
-        "hc_eps": 1e-6,
-        "index_head_dim": 128,
-        "index_n_heads": 64,
-        "index_topk": 512,
-        "num_hash_layers": 3,
-        "compress_rope_theta": 160000,
-        "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0],
-        "rope_scaling": {"type": "yarn", "factor": 16, "original_max_position_embeddings": 65536, "beta_fast": 32, "beta_slow": 1},
-        "tie_word_embeddings": false,
-        "num_nextn_predict_layers": 1
-    })
+    // Built programmatically (not via json!) to avoid macro recursion limits
+    // from the large number of V4-Flash config fields.
+    let mut cfg = serde_json::Map::new();
+    cfg.insert("model_type".into(), serde_json::json!("deepseek_v4"));
+    cfg.insert("hidden_size".into(), serde_json::json!(4096));
+    cfg.insert("num_hidden_layers".into(), serde_json::json!(43));
+    cfg.insert("intermediate_size".into(), serde_json::json!(0));
+    cfg.insert("num_attention_heads".into(), serde_json::json!(64));
+    cfg.insert("num_key_value_heads".into(), serde_json::json!(1));
+    cfg.insert("head_dim".into(), serde_json::json!(512));
+    cfg.insert("vocab_size".into(), serde_json::json!(129280));
+    cfg.insert("rope_theta".into(), serde_json::json!(10000));
+    cfg.insert("rms_norm_eps".into(), serde_json::json!(1e-6));
+    cfg.insert("sliding_window".into(), serde_json::json!(128));
+    cfg.insert("q_lora_rank".into(), serde_json::json!(1024));
+    cfg.insert("qk_rope_head_dim".into(), serde_json::json!(64));
+    cfg.insert("o_groups".into(), serde_json::json!(8));
+    cfg.insert("o_lora_rank".into(), serde_json::json!(1024));
+    cfg.insert("n_routed_experts".into(), serde_json::json!(256));
+    cfg.insert("num_experts_per_tok".into(), serde_json::json!(6));
+    cfg.insert("n_shared_experts".into(), serde_json::json!(1));
+    cfg.insert("moe_intermediate_size".into(), serde_json::json!(2048));
+    cfg.insert("expert_dtype".into(), serde_json::json!("fp4"));
+    cfg.insert("scoring_func".into(), serde_json::json!("sqrtsoftplus"));
+    cfg.insert("topk_method".into(), serde_json::json!("noaux_tc"));
+    cfg.insert("swiglu_limit".into(), serde_json::json!(10.0));
+    cfg.insert("routed_scaling_factor".into(), serde_json::json!(1.5));
+    cfg.insert("hc_mult".into(), serde_json::json!(4));
+    cfg.insert("hc_sinkhorn_iters".into(), serde_json::json!(20));
+    cfg.insert("hc_eps".into(), serde_json::json!(1e-6));
+    cfg.insert("index_head_dim".into(), serde_json::json!(128));
+    cfg.insert("index_n_heads".into(), serde_json::json!(64));
+    cfg.insert("index_topk".into(), serde_json::json!(512));
+    cfg.insert("num_hash_layers".into(), serde_json::json!(3));
+    cfg.insert("compress_rope_theta".into(), serde_json::json!(160000));
+    cfg.insert("tie_word_embeddings".into(), serde_json::json!(false));
+    cfg.insert("num_nextn_predict_layers".into(), serde_json::json!(1));
+
+    // compress_ratios: [0, 0, 4, 128, 4, 128, ..., 4, 0]
+    let mut ratios = vec![0usize, 0];
+    for _ in 0..20 {
+        ratios.push(4);
+        ratios.push(128);
+    }
+    ratios.push(0); // last layer
+    cfg.insert(
+        "compress_ratios".into(),
+        serde_json::Value::Array(ratios.into_iter().map(serde_json::json!).collect()),
+    );
+
+    cfg.insert(
+        "rope_scaling".into(),
+        serde_json::json!({"type": "yarn", "factor": 16, "original_max_position_embeddings": 65536, "beta_fast": 32, "beta_slow": 1}),
+    );
+
+    serde_json::Value::Object(cfg)
 }
 
 fn deepseek_v4_arch() -> Box<dyn ModelArchitecture> {
