@@ -1684,11 +1684,11 @@ fn test_detect_deepseek_v4() {
     assert_eq!(arch.embed_key(), "embed.weight");
     assert_eq!(arch.final_norm_key(), "norm.weight");
 
-    // ── attention keys (V4 uses `attn`, not `self_attn`) ──────────
-    assert_eq!(arch.attn_q_key(7), "layers.7.attn.q_proj.weight");
-    assert_eq!(arch.attn_k_key(7), "layers.7.attn.k_proj.weight");
-    assert_eq!(arch.attn_v_key(7), "layers.7.attn.v_proj.weight");
-    assert_eq!(arch.attn_o_key(7), "layers.7.attn.o_proj.weight");
+    // ── attention keys (V4 uses low-rank Q: wq_a/wq_b + fused KV: wkv) ──
+    assert_eq!(arch.attn_q_key(7), "layers.7.attn.wq_a.weight");
+    assert_eq!(arch.attn_k_key(7), "layers.7.attn.wq_b.weight");
+    assert_eq!(arch.attn_v_key(7), "layers.7.attn.wkv.weight");
+    assert_eq!(arch.attn_o_key(7), "layers.7.attn.wo_a.weight");
 
     // ── layer-norm keys (V4 uses `attn_norm` / `ffn_norm`) ────────
     assert_eq!(arch.input_layernorm_key(3), "layers.3.attn_norm.weight");
@@ -1699,10 +1699,16 @@ fn test_detect_deepseek_v4() {
     assert_eq!(arch.pre_feedforward_layernorm_key(0), None);
     assert_eq!(arch.post_feedforward_layernorm_key(0), None);
 
-    // ── dense FFN keys (V4 uses `ffn.w1/w2/w3`) ───────────────────
-    assert_eq!(arch.ffn_gate_key(2), "layers.2.ffn.w1.weight");
-    assert_eq!(arch.ffn_up_key(2), "layers.2.ffn.w3.weight");
-    assert_eq!(arch.ffn_down_key(2), "layers.2.ffn.w2.weight");
+    // ── dense FFN keys (V4-Flash is fully MoE; these map to shared experts) ──
+    assert_eq!(
+        arch.ffn_gate_key(2),
+        "layers.2.ffn.shared_experts.w1.weight"
+    );
+    assert_eq!(arch.ffn_up_key(2), "layers.2.ffn.shared_experts.w3.weight");
+    assert_eq!(
+        arch.ffn_down_key(2),
+        "layers.2.ffn.shared_experts.w2.weight"
+    );
 
     // ── MoE ───────────────────────────────────────────────────────
     assert!(arch.is_moe());
@@ -1789,9 +1795,8 @@ fn test_detect_deepseek_v4_defaults_when_optional_fields_missing() {
 
     // No kv_lora_rank / q_lora_rank → uses_mla() returns false.
     assert!(!arch.uses_mla());
-    // Defaults still pin to 1024 even when MLA is off (callers may read
-    // them for arch-comparison purposes).
-    assert_eq!(arch.kv_lora_rank(), 1024);
+    // kv_lora_rank falls back to head_dim (0 when head_dim is also absent).
+    // q_lora_rank falls back to 1024 (V4-Flash default).
     assert_eq!(arch.q_lora_rank(), 1024);
 }
 

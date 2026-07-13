@@ -161,6 +161,43 @@ pub struct ModelConfig {
     pub use_double_wide_mlp: bool,
     /// Whether the model's config.json contains a `vision_config` section.
     pub has_vision_config: bool,
+    // ── DeepSeek-V4 fields ──────────────────────────────────────────────
+    /// DS-V4: grouped output projection groups (wo_a/wo_b). Default 8.
+    pub o_groups: Option<usize>,
+    /// DS-V4: output projection low-rank dimension.
+    pub o_lora_rank: Option<usize>,
+    /// DS-V4: Indexer head dimension for sparse KV selection.
+    pub index_head_dim: Option<usize>,
+    /// DS-V4: Number of indexer attention heads.
+    pub index_n_heads: Option<usize>,
+    /// DS-V4: Top-k compressed KV positions selected by the indexer.
+    pub index_topk: Option<usize>,
+    /// DS-V4: Hyper-Connection multiplier — number of hidden-state copies
+    /// maintained through each layer block.
+    pub hc_mult: Option<usize>,
+    /// DS-V4: Sinkhorn normalization iterations for the HC combination matrix.
+    pub hc_sinkhorn_iters: Option<usize>,
+    /// DS-V4: HC normalization epsilon.
+    pub hc_eps: Option<f64>,
+    /// DS-V4: Per-layer KV compression ratios. Length = num_layers.
+    /// 0 = pure sliding window, 4 = compress with indexer, 128 = heavy compress.
+    pub compress_ratios: Option<Vec<usize>>,
+    /// DS-V4: RoPE base frequency for compressed layers.
+    pub compress_rope_theta: Option<f64>,
+    /// DS-V4: Number of layers using hash-based expert routing (tid2eid lookup).
+    pub num_hash_layers: Option<usize>,
+    /// DS-V4: MoE scoring function ("sqrtsoftplus", "softmax", "sigmoid").
+    pub scoring_func: Option<String>,
+    /// DS-V4: Top-k selection method ("noaux_tc", "greedy").
+    pub topk_method: Option<String>,
+    /// DS-V4: SwiGLU clamp limit. 0.0 = disabled.
+    pub swiglu_limit: Option<f64>,
+    /// DS-V4: Expert weight storage format ("fp4", etc.).
+    pub expert_dtype: Option<String>,
+    /// DS-V4: Scaling factor applied to routed expert weights.
+    pub routed_scaling_factor: Option<f64>,
+    /// DS-V4: Number of Multi-Token Prediction (MTP) layers.
+    pub num_nextn_predict_layers: Option<usize>,
 }
 
 /// Architecture-specific behavior. Describes how a model is structured
