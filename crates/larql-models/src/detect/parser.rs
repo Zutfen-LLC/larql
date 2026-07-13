@@ -293,25 +293,23 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let index_n_heads = text_config["index_n_heads"].as_u64().map(|v| v as usize);
     let index_topk = text_config["index_topk"].as_u64().map(|v| v as usize);
     let hc_mult = text_config["hc_mult"].as_u64().map(|v| v as usize);
-    let hc_sinkhorn_iters = text_config["hc_sinkhorn_iters"].as_u64().map(|v| v as usize);
+    let hc_sinkhorn_iters = text_config["hc_sinkhorn_iters"]
+        .as_u64()
+        .map(|v| v as usize);
     let hc_eps = text_config["hc_eps"].as_f64();
     let compress_ratios = text_config.get("compress_ratios").and_then(|cr| {
         cr.as_array().map(|arr| {
-            arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect()
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect()
         })
     });
     let compress_rope_theta = text_config["compress_rope_theta"].as_f64();
     let num_hash_layers = text_config["num_hash_layers"].as_u64().map(|v| v as usize);
-    let scoring_func = text_config["scoring_func"]
-        .as_str()
-        .map(|s| s.to_string());
-    let topk_method = text_config["topk_method"]
-        .as_str()
-        .map(|s| s.to_string());
+    let scoring_func = text_config["scoring_func"].as_str().map(|s| s.to_string());
+    let topk_method = text_config["topk_method"].as_str().map(|s| s.to_string());
     let swiglu_limit = text_config["swiglu_limit"].as_f64();
-    let expert_dtype = text_config["expert_dtype"]
-        .as_str()
-        .map(|s| s.to_string());
+    let expert_dtype = text_config["expert_dtype"].as_str().map(|s| s.to_string());
     let routed_scaling_factor = text_config["routed_scaling_factor"].as_f64();
     let num_nextn_predict_layers = text_config["num_nextn_predict_layers"]
         .as_u64()

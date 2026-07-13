@@ -1923,11 +1923,11 @@ fn deepseek_v4_config_fields_parsed() {
     assert_eq!(cfg.compress_rope_theta, Some(160000.0));
     let cr = cfg.compress_ratios.as_ref().expect("compress_ratios");
     assert_eq!(cr.len(), 44);
-    assert_eq!(cr[0], 0);   // layer 0: pure sliding
-    assert_eq!(cr[2], 4);   // layer 2: compress-4
+    assert_eq!(cr[0], 0); // layer 0: pure sliding
+    assert_eq!(cr[2], 4); // layer 2: compress-4
     assert_eq!(cr[3], 128); // layer 3: compress-128
-    assert_eq!(cr[42], 4);  // layer 42: compress-4
-    assert_eq!(cr[43], 0);  // last entry: pure sliding
+    assert_eq!(cr[42], 4); // layer 42: compress-4
+    assert_eq!(cr[43], 0); // last entry: pure sliding
 
     // MoE
     assert_eq!(cfg.num_experts, Some(256));
@@ -1966,12 +1966,21 @@ fn deepseek_v4_tensor_keys() {
     assert_eq!(arch.mla_kv_b_key(0), None); // fused into wkv
 
     // Q/K norms
-    assert_eq!(arch.attn_q_norm_key(0).unwrap(), "layers.0.attn.q_norm.weight");
-    assert_eq!(arch.attn_k_norm_key(0).unwrap(), "layers.0.attn.kv_norm.weight");
+    assert_eq!(
+        arch.attn_q_norm_key(0).unwrap(),
+        "layers.0.attn.q_norm.weight"
+    );
+    assert_eq!(
+        arch.attn_k_norm_key(0).unwrap(),
+        "layers.0.attn.kv_norm.weight"
+    );
 
     // Layer norms
     assert_eq!(arch.input_layernorm_key(0), "layers.0.attn_norm.weight");
-    assert_eq!(arch.post_attention_layernorm_key(0), "layers.0.ffn_norm.weight");
+    assert_eq!(
+        arch.post_attention_layernorm_key(0),
+        "layers.0.ffn_norm.weight"
+    );
 
     // MoE keys
     assert_eq!(arch.moe_router_key(0).unwrap(), "layers.0.ffn.gate.weight");

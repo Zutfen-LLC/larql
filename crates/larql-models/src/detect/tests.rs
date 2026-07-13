@@ -1700,9 +1700,15 @@ fn test_detect_deepseek_v4() {
     assert_eq!(arch.post_feedforward_layernorm_key(0), None);
 
     // ── dense FFN keys (V4-Flash is fully MoE; these map to shared experts) ──
-    assert_eq!(arch.ffn_gate_key(2), "layers.2.ffn.shared_experts.w1.weight");
+    assert_eq!(
+        arch.ffn_gate_key(2),
+        "layers.2.ffn.shared_experts.w1.weight"
+    );
     assert_eq!(arch.ffn_up_key(2), "layers.2.ffn.shared_experts.w3.weight");
-    assert_eq!(arch.ffn_down_key(2), "layers.2.ffn.shared_experts.w2.weight");
+    assert_eq!(
+        arch.ffn_down_key(2),
+        "layers.2.ffn.shared_experts.w2.weight"
+    );
 
     // ── MoE ───────────────────────────────────────────────────────
     assert!(arch.is_moe());
