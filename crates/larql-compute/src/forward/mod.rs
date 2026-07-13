@@ -12,6 +12,7 @@ pub mod dump_config;
 pub mod embed;
 pub mod embedding_plan;
 pub mod hooks;
+pub mod hyper_connection;
 pub mod layer;
 pub mod lens;
 pub mod ops;
