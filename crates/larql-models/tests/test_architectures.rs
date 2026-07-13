@@ -1857,12 +1857,13 @@ fn deepseek_v4_flash_config() -> serde_json::Value {
     cfg.insert("tie_word_embeddings".into(), serde_json::json!(false));
     cfg.insert("num_nextn_predict_layers".into(), serde_json::json!(1));
 
-    // compress_ratios: [0, 0, 4, 128, 4, 128, ..., 4, 0]
+    // compress_ratios: [0, 0, (4, 128) × 20, 4, 0] = 44 entries (43 layers + 1 MTP)
     let mut ratios = vec![0usize, 0];
     for _ in 0..20 {
         ratios.push(4);
         ratios.push(128);
     }
+    ratios.push(4);
     ratios.push(0); // last layer
     cfg.insert(
         "compress_ratios".into(),
@@ -1925,7 +1926,8 @@ fn deepseek_v4_config_fields_parsed() {
     assert_eq!(cr[0], 0);   // layer 0: pure sliding
     assert_eq!(cr[2], 4);   // layer 2: compress-4
     assert_eq!(cr[3], 128); // layer 3: compress-128
-    assert_eq!(cr[43], 0);  // last layer: pure sliding
+    assert_eq!(cr[42], 4);  // layer 42: compress-4
+    assert_eq!(cr[43], 0);  // last entry: pure sliding
 
     // MoE
     assert_eq!(cfg.num_experts, Some(256));
