@@ -1119,7 +1119,12 @@ fn load_deepseek_v4_dequantises_fp8_block_scaled_attention() {
         dir.path(),
         config,
         &[
-            ("embed.weight", "F32", &[10, 256], f32_bytes(&[1.0f32; 2560])),
+            (
+                "embed.weight",
+                "F32",
+                &[10, 256],
+                f32_bytes(&[1.0f32; 2560]),
+            ),
             ("norm.weight", "F32", &[256], f32_bytes(&[1.0f32; 256])),
             (
                 "layers.0.attn.wq_a.weight",
@@ -1283,14 +1288,19 @@ fn fp8_block_scaled_attention_applies_scale_correctly() {
     let rows = 256usize;
     let cols = 256usize;
     let weight_bytes = vec![0x38u8; rows * cols]; // E4M3 1.0
-    // Scale grid: [[127, 128], [129, 130]] → blocks get [1.0, 2.0, 4.0, 8.0]
+                                                  // Scale grid: [[127, 128], [129, 130]] → blocks get [1.0, 2.0, 4.0, 8.0]
     let scale_bytes = vec![127u8, 128u8, 129u8, 130u8];
 
     write_model_dir_with_config(
         dir.path(),
         config,
         &[
-            ("embed.weight", "F32", &[10, 256], f32_bytes(&[1.0f32; 2560])),
+            (
+                "embed.weight",
+                "F32",
+                &[10, 256],
+                f32_bytes(&[1.0f32; 2560]),
+            ),
             ("norm.weight", "F32", &[256], f32_bytes(&[1.0f32; 256])),
             (
                 "layers.0.attn.wq_a.weight",
@@ -1298,12 +1308,7 @@ fn fp8_block_scaled_attention_applies_scale_correctly() {
                 &[rows, cols],
                 weight_bytes,
             ),
-            (
-                "layers.0.attn.wq_a.scale",
-                "F8_E8M0",
-                &[2, 2],
-                scale_bytes,
-            ),
+            ("layers.0.attn.wq_a.scale", "F8_E8M0", &[2, 2], scale_bytes),
         ],
     );
 
