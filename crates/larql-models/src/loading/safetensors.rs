@@ -253,6 +253,13 @@ fn load_model_dir_filtered_with_validation(
                 let v4_dequantized_keys =
                     dequantize_per_expert_mxfp4(&st, &tensor_names, prefixes, &mut tensors)?;
 
+                // FP8 E4M3 block-scaled attention weights (DeepSeek-V4-Flash):
+                // wq_a/wq_b/wkv/wo_a/wo_b are stored as (.weight=F8_E4M3, .scale=F8_E8M0)
+                // pairs with per-128×128 block scales. Dequantizes to f32 before the
+                // main loop sees them. No-op for architectures without this pattern.
+                let fp8_consumed_keys =
+                    dequantize_fp8_block_scaled(&st, &tensor_names, prefixes, &mut tensors)?;
+
                 for (name, view) in st.tensors() {
                     let key = normalize_key(&name, prefixes);
                     let shape = view.shape();
@@ -260,9 +267,11 @@ fn load_model_dir_filtered_with_validation(
                         continue;
                     }
 
-                    // Skip tensors consumed by the V4 dequantizer (both .weight
-                    // and the companion .scale).
-                    if v4_dequantized_keys.contains(&name) {
+                    // Skip tensors consumed by the V4 expert/shared-expert dequantizer
+                    // or the FP8 block-scale dequantizer (both .weight and .scale).
+                    if v4_dequantized_keys.contains(&name)
+                        || fp8_consumed_keys.contains(&name)
+                    {
                         continue;
                     }
 
@@ -583,16 +592,20 @@ fn mxfp4_expert_key(layer_prefix: &str, expert_id: usize, projection: &str) -> S
     format!("{layer_prefix}.{BLOCK_SPARSE_EXPERTS_PREFIX}.{expert_id}.{projection}.weight")
 }
 
-/// Per-expert MXFP4 dequantization (DeepSeek-V4 family).
+/// Per-expert and shared-expert MXFP4 dequantization (DeepSeek-V4 family).
 ///
 /// DeepSeek-V4 stores expert weights one (.weight, .scale) pair per
 /// (expert, projection) — `layers.X.ffn.experts.E.w1.weight` (I8 packed FP4) +
-/// `layers.X.ffn.experts.E.w1.scale` (F8_E8M0 scales), ditto w2/w3. This is
-/// distinct from GPT-OSS's fused `experts.gate_up_proj_blocks` layout that
+/// `layers.X.ffn.experts.E.w1.scale` (F8_E8M0 scales), ditto w2/w3.
+/// Shared experts use the same pattern: `layers.X.ffn.shared_experts.w1.weight`.
+///
+/// This is distinct from GPT-OSS's fused `experts.gate_up_proj_blocks` layout that
 /// `load_mxfp4_expert_tensors` handles.
 ///
-/// Detects the format by scanning for `*.experts.<digit>.w[123].weight` tensors
-/// with `I8` dtype. For each match, looks up the companion `.scale` (`F8_E8M0`)
+/// Detects the format by scanning for:
+/// - `*.experts.<digit>.w[123].weight` tensors with `I8` dtype
+/// - `*.shared_experts.w[123].weight` tensors with `I8` dtype
+/// For each match, looks up the companion `.scale` (`F8_E8M0`)
 /// and dequantizes via `quant::mxfp4::dequantize_expert`.
 ///
 /// Returns the set of tensor names that were consumed (both `.weight` and
@@ -606,10 +619,8 @@ fn dequantize_per_expert_mxfp4(
     use std::collections::HashSet;
     let mut consumed: HashSet<String> = HashSet::new();
 
-    // Match V4-style per-expert weights: any tensor name containing
-    // ".experts.<int>.w<1|2|3>.weight" — broad enough to catch both the
-    // full `model.layers.X.ffn.experts.E.wY.weight` (HF default) and any
-    // shortened variant (`layers.X.ffn.experts.E.wY.weight`).
+    // Match V4-style expert weights: `*.experts.<int>.w<1|2|3>.weight` or
+    // `*.shared_experts.w<1|2|3>.weight`.
     let is_v4_expert_weight = |name: &str| -> bool {
         if !name.ends_with(".w1.weight")
             && !name.ends_with(".w2.weight")
@@ -617,12 +628,18 @@ fn dequantize_per_expert_mxfp4(
         {
             return false;
         }
-        // Must have ".experts.<digit>" before the .wN.weight suffix
+        // Check for per-expert: ".experts.<digit>" before the .wN.weight suffix
         if let Some(idx) = name.rfind(".experts.") {
             let after = &name[idx + ".experts.".len()..];
             if let Some(dot) = after.find('.') {
-                return after[..dot].chars().all(|c| c.is_ascii_digit());
+                if after[..dot].chars().all(|c| c.is_ascii_digit()) {
+                    return true;
+                }
             }
+        }
+        // Check for shared expert: ".shared_experts." before the .wN.weight suffix
+        if name.rfind(".shared_experts.").is_some() {
+            return true;
         }
         false
     };
@@ -678,6 +695,99 @@ fn dequantize_per_expert_mxfp4(
 
         let key = normalize_key(name, prefixes);
         let arr = Array2::from_shape_vec((out_features, in_features), unpacked)
+            .map_err(|e| ModelError::Parse(e.to_string()))?;
+        tensors.insert(key, arr.into_shared());
+
+        consumed.insert(name.clone());
+        consumed.insert(scale_name);
+    }
+
+    Ok(consumed)
+}
+
+/// FP8 E4M3 + UE8M0 block-scale dequantization for attention weights
+/// (DeepSeek-V4-Flash).
+///
+/// V4-Flash attention weights (wq_a, wq_b, wkv, wo_a, wo_b) are stored as
+/// `.weight` (F8_E4M3, shape `[rows, cols]`) + `.scale` (F8_E8M0, shape
+/// `[ceil(rows/128), ceil(cols/128)]`). Each scale byte applies to a 128×128
+/// block of the weight matrix.
+///
+/// Detects the pattern: any `.weight` tensor with `F8_E4M3` dtype that has a
+/// companion `.scale` tensor with `F8_E8M0` dtype. Dequantizes via
+/// `quant::fp8_block::dequantize`.
+///
+/// Returns the set of tensor names consumed (both `.weight` and `.scale`).
+fn dequantize_fp8_block_scaled(
+    st: &safetensors::SafeTensors,
+    tensor_names: &[String],
+    prefixes: &[&str],
+    tensors: &mut HashMap<String, crate::WeightArray>,
+) -> Result<std::collections::HashSet<String>, ModelError> {
+    use std::collections::HashSet;
+    let mut consumed: HashSet<String> = HashSet::new();
+
+    for name in tensor_names {
+        // Only consider .weight tensors (not .scale, not norms, not other tensors)
+        if !name.ends_with(".weight") {
+            continue;
+        }
+
+        let weight_view = match st.tensor(name) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // V4-Flash attention weights are stored as F8_E4M3
+        if weight_view.dtype() != safetensors::Dtype::F8_E4M3 {
+            continue;
+        }
+
+        let scale_name = name.replacen(".weight", ".scale", 1);
+        let scale_view = match st.tensor(&scale_name) {
+            Ok(v) => v,
+            Err(_) => continue, // No scale companion → not block-scaled FP8
+        };
+        if scale_view.dtype() != safetensors::Dtype::F8_E8M0 {
+            continue;
+        }
+
+        // Shape validation: weight is 2-D [rows, cols]
+        let w_shape = weight_view.shape();
+        if w_shape.len() != 2 {
+            continue;
+        }
+        let rows = w_shape[0];
+        let cols = w_shape[1];
+
+        // Scale shape: [ceil(rows/128), ceil(cols/128)]
+        let s_shape = scale_view.shape();
+        let expected_scale_rows = rows.div_ceil(crate::quant::fp8_block::FP8_BLOCK_SIZE);
+        let expected_scale_cols = cols.div_ceil(crate::quant::fp8_block::FP8_BLOCK_SIZE);
+
+        // Accept both 2-D [sr, sc] and 1-D [sr*sc] scale layouts
+        let scale_bytes = scale_view.data();
+        let expected_scale_len = expected_scale_rows * expected_scale_cols;
+        if s_shape.len() == 2 {
+            if s_shape[0] != expected_scale_rows || s_shape[1] != expected_scale_cols {
+                continue;
+            }
+        } else if s_shape.len() == 1 {
+            if s_shape[0] != expected_scale_len {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        let unpacked = crate::quant::fp8_block::dequantize(
+            weight_view.data(),
+            scale_bytes,
+            rows,
+            cols,
+        )?;
+
+        let key = normalize_key(name, prefixes);
+        let arr = Array2::from_shape_vec((rows, cols), unpacked)
             .map_err(|e| ModelError::Parse(e.to_string()))?;
         tensors.insert(key, arr.into_shared());
 
