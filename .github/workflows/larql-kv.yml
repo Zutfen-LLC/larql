@@ -82,7 +82,15 @@ jobs:
         run: cargo clippy -p larql-kv --all-targets --no-deps -- -D warnings
 
       - name: Tests
-        run: cargo test -p larql-kv
+        # `--test-threads=1` serialises the runner. The kv decode engines
+        # (markov-residual, boundary-per-layer) mutate thread-local/global
+        # dispatch state and use BLAS-backed matmuls; under parallel execution
+        # that surfaces as (a) FP nondeterminism in the `_inplace_matches_
+        # owned_concat` decode-parity tests and (b) a teardown SIGSEGV from a
+        # background thread racing the harness exit. Single-threaded execution
+        # + the OPENBLAS/OMP pins above make both deterministic. Matches the
+        # larql-compute-metal and larql-server workflow patterns.
+        run: cargo test -p larql-kv -- --test-threads=1
 
       - name: Benchmark compile/tests
         run: cargo test -p larql-kv --benches
