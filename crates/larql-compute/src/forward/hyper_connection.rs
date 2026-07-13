@@ -205,7 +205,11 @@ pub fn hc_pre(
         }
     }
 
-    HcPreOutput { y, post, comb: comb_out }
+    HcPreOutput {
+        y,
+        post,
+        comb: comb_out,
+    }
 }
 
 /// hc_post: Expand a single hidden state back to hc_mult copies.
@@ -217,7 +221,7 @@ pub fn hc_pre(
 /// y = post[hc] * x[d] + sum(comb[hc, hc] * residual[hc, d], dim=hc)
 /// Output: [seq, hc, d]
 pub fn hc_post(
-    x: &Array2<f32>,       // [seq, d] — output of attn/ffn
+    x: &Array2<f32>,        // [seq, d] — output of attn/ffn
     residual: &Array3<f32>, // [seq, hc, d] — the input to hc_pre
     post: &Array2<f32>,     // [seq, hc]
     comb: &Array2<f32>,     // [seq, hc*hc]
@@ -359,7 +363,11 @@ mod tests {
         });
         let base = Array1::from_shape_fn(mix_hc, |i| (i as f32) * 0.01);
         let scale = Array1::from_shape_fn(3, |i| 1.0 + (i as f32) * 0.1);
-        HcParams { fn_weight, base, scale }
+        HcParams {
+            fn_weight,
+            base,
+            scale,
+        }
     }
 
     #[test]
@@ -397,12 +405,13 @@ mod tests {
     #[test]
     fn hc_pre_y_is_finite() {
         let (seq, hc, d) = (3, 4, 16);
-        let x_hc = Array3::from_shape_fn((seq, hc, d), |(s, h, j)| {
-            ((s + h + j) as f32) * 0.1
-        });
+        let x_hc = Array3::from_shape_fn((seq, hc, d), |(s, h, j)| ((s + h + j) as f32) * 0.1);
         let params = make_test_params(hc, d);
         let out = hc_pre(&x_hc, &params, DEFAULT_SINKHORN_ITERS, DEFAULT_HC_EPS);
-        assert!(out.y.iter().all(|v| v.is_finite()), "hc_pre y must be finite");
+        assert!(
+            out.y.iter().all(|v| v.is_finite()),
+            "hc_pre y must be finite"
+        );
     }
 
     #[test]
@@ -414,7 +423,10 @@ mod tests {
         let out = hc_pre(&x_hc, &params, DEFAULT_SINKHORN_ITERS, DEFAULT_HC_EPS);
         for s in 0..seq {
             for h in 0..hc {
-                assert!(out.post[[s, h]] >= 0.0, "post must be non-negative (2*sigmoid)");
+                assert!(
+                    out.post[[s, h]] >= 0.0,
+                    "post must be non-negative (2*sigmoid)"
+                );
             }
         }
     }
@@ -434,11 +446,16 @@ mod tests {
     fn hc_post_y_is_finite() {
         let (seq, hc, d) = (3, 4, 16);
         let x = Array2::from_shape_fn((seq, d), |(s, j)| (s as f32 + j as f32) * 0.1);
-        let residual = Array3::from_shape_fn((seq, hc, d), |(s, h, j)| (s as f32 + h as f32 + j as f32) * 0.05);
+        let residual = Array3::from_shape_fn((seq, hc, d), |(s, h, j)| {
+            (s as f32 + h as f32 + j as f32) * 0.05
+        });
         let post = Array2::from_shape_fn((seq, hc), |(s, h)| 0.5 + (s as f32 + h as f32) * 0.1);
-        let comb = Array2::from_shape_fn((seq, hc * hc), |(s, i)| 1.0 / (hc * hc) as f32);
+        let comb = Array2::from_shape_fn((seq, hc * hc), |(_, _)| 1.0 / (hc * hc) as f32);
         let out = hc_post(&x, &residual, &post, &comb);
-        assert!(out.iter().all(|v| v.is_finite()), "hc_post output must be finite");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "hc_post output must be finite"
+        );
     }
 
     #[test]
@@ -464,9 +481,7 @@ mod tests {
     #[test]
     fn hc_head_y_is_finite() {
         let (seq, hc, d) = (3, 4, 16);
-        let x_hc = Array3::from_shape_fn((seq, hc, d), |(s, h, j)| {
-            ((s + h + j) as f32) * 0.1
-        });
+        let x_hc = Array3::from_shape_fn((seq, hc, d), |(s, h, j)| ((s + h + j) as f32) * 0.1);
         let params = make_test_params(hc, d);
         let y = hc_head(&x_hc, &params, DEFAULT_HC_EPS);
         assert!(y.iter().all(|v| v.is_finite()), "hc_head y must be finite");
@@ -543,7 +558,7 @@ mod tests {
         let (seq, hc, d) = (3, 4, 32);
         let x = Array2::from_shape_fn((seq, d), |(s, j)| (s as f32 + j as f32) * 0.1);
         let residual = Array3::zeros((seq, hc, d));
-        let post = Array2::from_shape_fn((seq, hc), |(_, h)| 0.5);
+        let post = Array2::from_shape_fn((seq, hc), |(_, _)| 0.5);
         let comb = Array2::from_shape_fn((seq, hc * hc), |(_, _)| 1.0 / (hc * hc) as f32);
         let out = hc_post(&x, &residual, &post, &comb);
         assert_eq!(out.shape(), &[seq, hc, d]);
@@ -556,9 +571,7 @@ mod tests {
     fn hc_pre_v4_flash_dimensions() {
         // V4-Flash: hidden=4096, hc_mult=4, seq=1 (decode)
         let (seq, hc, d) = (1, 4, 4096);
-        let x_hc = Array3::from_shape_fn((seq, hc, d), |(_, h, j)| {
-            ((h * d + j) as f32) * 1e-4
-        });
+        let x_hc = Array3::from_shape_fn((seq, hc, d), |(_, h, j)| ((h * d + j) as f32) * 1e-4);
         let params = make_test_params(hc, d);
         let out = hc_pre(&x_hc, &params, DEFAULT_SINKHORN_ITERS, DEFAULT_HC_EPS);
         assert_eq!(out.y.shape(), &[1, 4096]);
@@ -568,9 +581,7 @@ mod tests {
     #[test]
     fn hc_head_v4_flash_dimensions() {
         let (seq, hc, d) = (1, 4, 4096);
-        let x_hc = Array3::from_shape_fn((seq, hc, d), |(_, h, j)| {
-            ((h * d + j) as f32) * 1e-4
-        });
+        let x_hc = Array3::from_shape_fn((seq, hc, d), |(_, h, j)| ((h * d + j) as f32) * 1e-4);
         let params = make_test_params(hc, d);
         let y = hc_head(&x_hc, &params, DEFAULT_HC_EPS);
         assert_eq!(y.shape(), &[1, 4096]);
@@ -589,7 +600,10 @@ mod tests {
         let out = hc_pre(&x_hc, &params, DEFAULT_SINKHORN_ITERS, DEFAULT_HC_EPS);
         // y = sum(pre * x) = sum(pre * 0) = 0
         for v in out.y.iter() {
-            assert!((v - 0.0).abs() < 1e-6, "zero input should produce zero y, got {v}");
+            assert!(
+                (v - 0.0).abs() < 1e-6,
+                "zero input should produce zero y, got {v}"
+            );
         }
     }
 
@@ -601,7 +615,10 @@ mod tests {
         let y = hc_head(&x_hc, &params, DEFAULT_HC_EPS);
         // y = sum(pre * x) = sum(pre * 0) = 0
         for v in y.iter() {
-            assert!((v - 0.0).abs() < 1e-6, "zero input should produce zero y, got {v}");
+            assert!(
+                (v - 0.0).abs() < 1e-6,
+                "zero input should produce zero y, got {v}"
+            );
         }
     }
 
@@ -623,7 +640,8 @@ mod tests {
 
     #[test]
     fn rms_norm_preserves_shape() {
-        let x = Array2::from_shape_vec((2, 4), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+        let x =
+            Array2::from_shape_vec((2, 4), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
         let out = rms_norm_flat(&x, 1e-6);
         assert_eq!(out.shape(), x.shape());
     }
