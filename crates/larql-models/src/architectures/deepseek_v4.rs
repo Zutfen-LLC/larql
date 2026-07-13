@@ -91,11 +91,10 @@ impl ModelArchitecture for DeepSeekV4Arch {
         format!("{}attn.wo_a.weight", self.layer_prefix(layer))
     }
 
-    /// Output projection up-projection: (groups * o_lora_rank) → hidden
     fn ffn_gate_key(&self, layer: usize) -> String {
-        // Override: we use this slot for wo_b since attn_o_key is wo_a.
-        // The forward pass handles this via the dedicated key methods below.
-        format!("{}attn.wo_b.weight", self.layer_prefix(layer))
+        // V4 has no dense FFN on MoE layers — this returns the shared
+        // expert gate for compatibility with code that reads dense FFN keys.
+        format!("{}ffn.shared_experts.w1.weight", self.layer_prefix(layer))
     }
 
     fn ffn_up_key(&self, layer: usize) -> String {
