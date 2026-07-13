@@ -22,6 +22,15 @@ env:
   AWS_SECRET_ACCESS_KEY: QurhTA4fSewUayZI7z5ovNmO
   SCCACHE_CACHE_SIZE: 20G
   SCCACHE_REGION: us-east-1
+  # Pin BLAS to a single thread. larql-kv's `_inplace_matches_owned_concat`
+  # decode-parity tests compare two mathematically-equivalent code paths that
+  # accumulate FP ops in different orders; under multi-threaded BLAS the
+  # accumulation order (and thus the result) is nondeterministic, making the
+  # comparison flake (divergences up to ~4× the tolerance). Matching the
+  # larql-inference workflow's pin keeps these numerical-comparison tests
+  # deterministic.
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
 
 jobs:
   test:
