@@ -14,9 +14,9 @@
 //! - LARQL's own FP4/FP8 block codec (`fp4_block.rs` — 137B/257B blocks with E4M3 sub-scales)
 //! - MXFP4 expert format (`mxfp4.rs` — E2M1 packed + E8M0 per-32)
 
-use crate::detect::ModelError;
 use super::fp8::e4m3_to_f32;
 use super::mxfp4::e8m0_to_f32;
+use crate::detect::ModelError;
 
 /// Block size for V4-Flash FP8 attention weights.
 pub const FP8_BLOCK_SIZE: usize = 128;
@@ -40,12 +40,14 @@ pub fn dequantize(
     let num_scale_rows = rows.div_ceil(FP8_BLOCK_SIZE);
     let num_scale_cols = cols.div_ceil(FP8_BLOCK_SIZE);
 
-    let need_weights = rows
-        .checked_mul(cols)
-        .ok_or_else(|| ModelError::Parse(format!("FP8 block: weights size overflow ({rows}×{cols})")))?;
-    let need_scales = num_scale_rows
-        .checked_mul(num_scale_cols)
-        .ok_or_else(|| ModelError::Parse(format!("FP8 block: scales size overflow ({num_scale_rows}×{num_scale_cols})")))?;
+    let need_weights = rows.checked_mul(cols).ok_or_else(|| {
+        ModelError::Parse(format!("FP8 block: weights size overflow ({rows}×{cols})"))
+    })?;
+    let need_scales = num_scale_rows.checked_mul(num_scale_cols).ok_or_else(|| {
+        ModelError::Parse(format!(
+            "FP8 block: scales size overflow ({num_scale_rows}×{num_scale_cols})"
+        ))
+    })?;
 
     if weights.len() < need_weights {
         return Err(ModelError::Parse(format!(
@@ -150,13 +152,19 @@ mod tests {
         // First 128 rows should be 1.0
         for r in 0..128 {
             for c in 0..128 {
-                assert!((result[r * 128 + c] - 1.0).abs() < 1e-6, "block 0 at ({r},{c})");
+                assert!(
+                    (result[r * 128 + c] - 1.0).abs() < 1e-6,
+                    "block 0 at ({r},{c})"
+                );
             }
         }
         // Next 128 rows should be 2.0
         for r in 128..256 {
             for c in 0..128 {
-                assert!((result[r * 128 + c] - 2.0).abs() < 1e-6, "block 1 at ({r},{c})");
+                assert!(
+                    (result[r * 128 + c] - 2.0).abs() < 1e-6,
+                    "block 1 at ({r},{c})"
+                );
             }
         }
     }
@@ -169,10 +177,16 @@ mod tests {
         let result = dequantize(&weights, &scales, 128, 256).unwrap();
         for r in 0..128 {
             for c in 0..128 {
-                assert!((result[r * 256 + c] - 1.0).abs() < 1e-6, "col block 0 at ({r},{c})");
+                assert!(
+                    (result[r * 256 + c] - 1.0).abs() < 1e-6,
+                    "col block 0 at ({r},{c})"
+                );
             }
             for c in 128..256 {
-                assert!((result[r * 256 + c] - 2.0).abs() < 1e-6, "col block 1 at ({r},{c})");
+                assert!(
+                    (result[r * 256 + c] - 2.0).abs() < 1e-6,
+                    "col block 1 at ({r},{c})"
+                );
             }
         }
     }

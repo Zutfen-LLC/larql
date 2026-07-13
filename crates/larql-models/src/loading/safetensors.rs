@@ -269,9 +269,7 @@ fn load_model_dir_filtered_with_validation(
 
                     // Skip tensors consumed by the V4 expert/shared-expert dequantizer
                     // or the FP8 block-scale dequantizer (both .weight and .scale).
-                    if v4_dequantized_keys.contains(&name)
-                        || fp8_consumed_keys.contains(&name)
-                    {
+                    if v4_dequantized_keys.contains(&name) || fp8_consumed_keys.contains(&name) {
                         continue;
                     }
 
@@ -779,12 +777,8 @@ fn dequantize_fp8_block_scaled(
             continue;
         }
 
-        let unpacked = crate::quant::fp8_block::dequantize(
-            weight_view.data(),
-            scale_bytes,
-            rows,
-            cols,
-        )?;
+        let unpacked =
+            crate::quant::fp8_block::dequantize(weight_view.data(), scale_bytes, rows, cols)?;
 
         let key = normalize_key(name, prefixes);
         let arr = Array2::from_shape_vec((rows, cols), unpacked)
