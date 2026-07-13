@@ -160,9 +160,10 @@ impl ModelArchitecture for DeepSeekV4Arch {
     }
 
     fn kv_lora_rank(&self) -> usize {
-        // V4 doesn't have kv_lora_rank in config — the fused wkv output
-        // IS the latent KV (head_dim=512). Return head_dim as the latent dim.
-        self.config.head_dim
+        // V4-Flash doesn't have kv_lora_rank in config — the fused wkv output
+        // IS the latent KV (head_dim=512). But if the config provides it
+        // explicitly, honour it. Otherwise return head_dim as the latent dim.
+        self.config.kv_lora_rank.unwrap_or(self.config.head_dim)
     }
 
     fn q_lora_rank(&self) -> usize {
